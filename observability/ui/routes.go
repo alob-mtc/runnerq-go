@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -198,6 +199,10 @@ func eventStreamHandler(inspector *observability.QueueInspector) http.HandlerFun
 			return
 		}
 
+		// Disable the server's WriteTimeout for this long-lived connection.
+		rc := http.NewResponseController(w)
+		_ = rc.SetWriteDeadline(time.Time{})
+
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -208,6 +213,9 @@ func eventStreamHandler(inspector *observability.QueueInspector) http.HandlerFun
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
+
+		heartbeat := time.NewTicker(15 * time.Second)
+		defer heartbeat.Stop()
 
 		for {
 			select {
@@ -220,6 +228,9 @@ func eventStreamHandler(inspector *observability.QueueInspector) http.HandlerFun
 					continue
 				}
 				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+			case <-heartbeat.C:
+				fmt.Fprintf(w, ": heartbeat\n\n")
 				flusher.Flush()
 			case <-r.Context().Done():
 				return
