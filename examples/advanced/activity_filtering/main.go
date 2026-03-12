@@ -40,7 +40,7 @@ func (h *EmailHandler) ActivityType() string { return "send_email" }
 func (h *EmailHandler) Handle(_ runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	slog.Info("[email-node] sending email", "payload", string(payload))
 	time.Sleep(500 * time.Millisecond)
-	result, _ := json.Marshal(map[string]interface{}{"sent": true})
+	result, _ := json.Marshal(map[string]any{"sent": true})
 	return result, nil
 }
 
@@ -53,7 +53,7 @@ func (h *SmsHandler) ActivityType() string { return "send_sms" }
 func (h *SmsHandler) Handle(_ runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	slog.Info("[sms] sending SMS", "payload", string(payload))
 	time.Sleep(300 * time.Millisecond)
-	result, _ := json.Marshal(map[string]interface{}{"sent": true})
+	result, _ := json.Marshal(map[string]any{"sent": true})
 	return result, nil
 }
 
@@ -66,7 +66,7 @@ func (h *TradeHandler) ActivityType() string { return "execute_trade" }
 func (h *TradeHandler) Handle(_ runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	slog.Info("[trade-node] executing trade", "payload", string(payload))
 	time.Sleep(200 * time.Millisecond)
-	result, _ := json.Marshal(map[string]interface{}{"executed": true})
+	result, _ := json.Marshal(map[string]any{"executed": true})
 	return result, nil
 }
 
@@ -79,7 +79,7 @@ func (h *ReportHandler) ActivityType() string { return "generate_report" }
 func (h *ReportHandler) Handle(_ runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	slog.Info("[catch-all] generating report", "payload", string(payload))
 	time.Sleep(1 * time.Second)
-	result, _ := json.Marshal(map[string]interface{}{"generated": true})
+	result, _ := json.Marshal(map[string]any{"generated": true})
 	return result, nil
 }
 
@@ -166,11 +166,11 @@ func main() {
 		time.Sleep(2 * time.Second)
 
 		types := []string{"send_email", "send_sms", "execute_trade", "generate_report"}
-		for i := 0; i < 12; i++ {
+		for i := range 12 {
 			activityType := types[i%len(types)]
 			slog.Info("Enqueueing", "type", activityType, "seq", i+1)
 
-			payload, _ := json.Marshal(map[string]interface{}{"seq": i + 1})
+			payload, _ := json.Marshal(map[string]any{"seq": i + 1})
 			_, err := executor.Activity(activityType).
 				Payload(payload).
 				Execute(ctx)

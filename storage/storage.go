@@ -32,7 +32,7 @@ const (
 type ResultState int
 
 const (
-	ResultOk  ResultState = iota
+	ResultOk ResultState = iota
 	ResultErr
 )
 

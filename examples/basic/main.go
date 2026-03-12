@@ -54,7 +54,7 @@ func (h *TestActivity) Handle(ctx runnerq.ActivityContext, payload json.RawMessa
 		return nil, runnerq.NewRetryError("Test activity failed")
 	}
 	fmt.Println("Completed test activity")
-	result, _ := json.Marshal(map[string]interface{}{"status": "completed"})
+	result, _ := json.Marshal(map[string]any{"status": "completed"})
 	return result, nil
 }
 
@@ -118,7 +118,7 @@ func main() {
 		for {
 			fmt.Printf("\nEnqueueing test activity #%d\n", counter)
 
-			payload, _ := json.Marshal(map[string]interface{}{
+			payload, _ := json.Marshal(map[string]any{
 				"test":      true,
 				"counter":   counter,
 				"timestamp": time.Now().UTC().Format(time.RFC3339),

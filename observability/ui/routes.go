@@ -43,7 +43,7 @@ func serveUI(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(ConsoleHTML))
 }
 
-func writeJSON(w http.ResponseWriter, status int, v interface{}) {
+func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)

@@ -105,18 +105,18 @@ type IdempotencyConfig struct {
 
 // activity is an internal representation of an activity to be processed.
 type activity struct {
-	ID                uuid.UUID         `json:"id"`
-	ActivityType      string            `json:"activity_type"`
-	Payload           json.RawMessage   `json:"payload"`
-	Priority          ActivityPriority  `json:"priority"`
-	Status            ActivityStatus    `json:"status"`
-	CreatedAt         time.Time         `json:"created_at"`
-	ScheduledAt       *time.Time        `json:"scheduled_at,omitempty"`
-	RetryCount        uint32            `json:"retry_count"`
-	MaxRetries        uint32            `json:"max_retries"`
-	TimeoutSeconds    uint64            `json:"timeout_seconds"`
-	RetryDelaySeconds uint64            `json:"retry_delay_seconds"`
-	Metadata          map[string]string `json:"metadata"`
+	ID                uuid.UUID          `json:"id"`
+	ActivityType      string             `json:"activity_type"`
+	Payload           json.RawMessage    `json:"payload"`
+	Priority          ActivityPriority   `json:"priority"`
+	Status            ActivityStatus     `json:"status"`
+	CreatedAt         time.Time          `json:"created_at"`
+	ScheduledAt       *time.Time         `json:"scheduled_at,omitempty"`
+	RetryCount        uint32             `json:"retry_count"`
+	MaxRetries        uint32             `json:"max_retries"`
+	TimeoutSeconds    uint64             `json:"timeout_seconds"`
+	RetryDelaySeconds uint64             `json:"retry_delay_seconds"`
+	Metadata          map[string]string  `json:"metadata"`
 	IdempotencyKey    *IdempotencyConfig `json:"idempotency_key,omitempty"`
 }
 

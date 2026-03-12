@@ -164,7 +164,7 @@ func (b *PostgresBackend) prepareNotifyPayload(event *storage.ActivityEvent) str
 		slog.Warn("NOTIFY payload truncated to avoid PostgreSQL limit",
 			"activity_id", event.ActivityID,
 			"len", len(payload))
-		truncated := map[string]interface{}{
+		truncated := map[string]any{
 			"activity_id": event.ActivityID,
 			"event_type":  event.EventType,
 			"truncated":   true,
@@ -197,7 +197,7 @@ func jsonString(s string) string {
 	return string(data)
 }
 
-func toDetail(kv map[string]interface{}) json.RawMessage {
+func toDetail(kv map[string]any) json.RawMessage {
 	data, _ := json.Marshal(kv)
 	return data
 }
@@ -249,10 +249,10 @@ func (b *PostgresBackend) Enqueue(ctx context.Context, a storage.QueuedActivity)
 	var detail json.RawMessage
 	if a.ScheduledAt != nil {
 		eventType = storage.EventScheduled
-		detail = toDetail(map[string]interface{}{"scheduled_at": a.ScheduledAt})
+		detail = toDetail(map[string]any{"scheduled_at": a.ScheduledAt})
 	} else {
 		eventType = storage.EventEnqueued
-		detail = toDetail(map[string]interface{}{
+		detail = toDetail(map[string]any{
 			"priority":     fmt.Sprintf("%d", a.Priority),
 			"scheduled_at": a.ScheduledAt,
 		})
@@ -325,7 +325,7 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, _ time.D
 
 	a := ar.toQueuedActivity()
 
-	detail := toDetail(map[string]interface{}{"lease_deadline_ms": deadline.UnixMilli()})
+	detail := toDetail(map[string]any{"lease_deadline_ms": deadline.UnixMilli()})
 	if err := b.recordEvent(ctx, tx, a.ID, storage.EventDequeued, &workerID, detail); err != nil {
 		return nil, err
 	}
@@ -395,7 +395,7 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 	if actType != nil {
 		actTypeStr = *actType
 	}
-	detailMap := map[string]interface{}{"activity_type": actTypeStr}
+	detailMap := map[string]any{"activity_type": actTypeStr}
 	if result != nil {
 		detailMap["result_stored"] = true
 	}
@@ -455,12 +455,12 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 			return false, storage.NewInternalError(fmt.Sprintf("Failed to mark as failed: %v", err))
 		}
 
-		res := &storage.ActivityResult{Data: toDetail(map[string]interface{}{"error": errorMessage}), State: storage.ResultErr}
+		res := &storage.ActivityResult{Data: toDetail(map[string]any{"error": errorMessage}), State: storage.ResultErr}
 		if err := b.storeResultTx(ctx, tx, activityID, res, now); err != nil {
 			return false, err
 		}
 		if err := b.recordEvent(ctx, tx, activityID, storage.EventFailed, &workerID,
-			toDetail(map[string]interface{}{"retryable": false, "error": errorMessage})); err != nil {
+			toDetail(map[string]any{"retryable": false, "error": errorMessage})); err != nil {
 			return false, err
 		}
 
@@ -497,7 +497,7 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		}
 
 		if err := b.recordEvent(ctx, tx, activityID, storage.EventRetrying, &workerID,
-			toDetail(map[string]interface{}{
+			toDetail(map[string]any{
 				"retry_count":  newRetryCount,
 				"scheduled_at": scheduledAt.Format(time.RFC3339),
 				"error":        errorMessage,
@@ -527,12 +527,12 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		return false, storage.NewInternalError(fmt.Sprintf("Failed to move to DLQ: %v", err))
 	}
 
-	res := &storage.ActivityResult{Data: toDetail(map[string]interface{}{"error": errorMessage}), State: storage.ResultErr}
+	res := &storage.ActivityResult{Data: toDetail(map[string]any{"error": errorMessage}), State: storage.ResultErr}
 	if err := b.storeResultTx(ctx, tx, activityID, res, now); err != nil {
 		return false, err
 	}
 	if err := b.recordEvent(ctx, tx, activityID, storage.EventDeadLetter, &workerID,
-		toDetail(map[string]interface{}{"error": errorMessage})); err != nil {
+		toDetail(map[string]any{"error": errorMessage})); err != nil {
 		return false, err
 	}
 
@@ -593,7 +593,7 @@ func (b *PostgresBackend) ExtendLease(ctx context.Context, activityID uuid.UUID,
 
 	if tag.RowsAffected() > 0 {
 		if err := b.recordEvent(ctx, tx, activityID, storage.EventLeaseExtended, nil,
-			toDetail(map[string]interface{}{
+			toDetail(map[string]any{
 				"new_deadline_ms": newDeadline.UnixMilli(),
 				"extend_by_ms":    extendBy.Milliseconds(),
 			})); err != nil {
@@ -630,7 +630,7 @@ func (b *PostgresBackend) StoreResult(ctx context.Context, activityID uuid.UUID,
 		return err
 	}
 	if err := b.recordEvent(ctx, tx, activityID, storage.EventResultStored, nil,
-		toDetail(map[string]interface{}{"result_stored": true, "state": stateStr})); err != nil {
+		toDetail(map[string]any{"result_stored": true, "state": stateStr})); err != nil {
 		return err
 	}
 

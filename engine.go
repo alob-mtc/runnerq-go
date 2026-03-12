@@ -32,10 +32,7 @@ func (b *backoff) reset() {
 
 func (b *backoff) next() time.Duration {
 	n := b.current
-	b.current = b.current * 2
-	if b.current > b.max {
-		b.current = b.max
-	}
+	b.current = min(b.current*2, b.max)
 	return n
 }
 
@@ -121,19 +118,15 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 
 	// Scheduled activities processor (skipped if backend handles it natively)
 	if !e.queue.SchedulesNatively() {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			e.runScheduledProcessor(engineCtx)
-		}()
+		})
 	}
 
 	// Reaper processor
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		e.runReaperProcessor(engineCtx)
-	}()
+	})
 
 	// Worker loops
 	for i := 0; i < e.config.MaxConcurrentActivities; i++ {
@@ -306,7 +299,7 @@ func (e *WorkerEngine) safeHandle(handler ActivityHandler, ctx ActivityContext, 
 	return handler.Handle(ctx, payload)
 }
 
-func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result json.RawMessage, workerLabel string, workerID int, activityID interface{}, activityType string) {
+func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result json.RawMessage, workerLabel string, workerID int, activityID any, activityType string) {
 	e.metrics.IncCounter("activity_completed", 1)
 	if err := e.queue.MarkCompleted(ctx, act, workerLabel); err != nil {
 		slog.Error("Failed to mark activity as completed", "worker_id", workerID, "activity_id", activityID, "error", err)
@@ -322,7 +315,7 @@ func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result 
 	}()
 }
 
-func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity, handler ActivityHandler, actCtx ActivityContext, payloadForDL json.RawMessage, reason string, workerLabel string, workerID int, activityID interface{}, activityType string) {
+func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity, handler ActivityHandler, actCtx ActivityContext, payloadForDL json.RawMessage, reason string, workerLabel string, workerID int, activityID any, activityType string) {
 	e.metrics.IncCounter("activity_retry", 1)
 	slog.Warn("Activity requesting retry", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "reason", reason)
 
@@ -344,7 +337,7 @@ func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity
 	}
 }
 
-func (e *WorkerEngine) handleNonRetryableFailure(ctx context.Context, act *activity, reason string, workerLabel string, workerID int, activityID interface{}, activityType string) {
+func (e *WorkerEngine) handleNonRetryableFailure(ctx context.Context, act *activity, reason string, workerLabel string, workerID int, activityID any, activityType string) {
 	e.metrics.IncCounter("activity_failed_non_retry", 1)
 	slog.Error("Activity failed", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "reason", reason)
 
@@ -354,7 +347,7 @@ func (e *WorkerEngine) handleNonRetryableFailure(ctx context.Context, act *activ
 
 	// Fire-and-forget result storage
 	go func() {
-		errorResult, _ := json.Marshal(map[string]interface{}{
+		errorResult, _ := json.Marshal(map[string]any{
 			"error":     reason,
 			"type":      "non_retryable",
 			"failed_at": time.Now().UTC().Format(time.RFC3339),
@@ -366,7 +359,7 @@ func (e *WorkerEngine) handleNonRetryableFailure(ctx context.Context, act *activ
 	}()
 }
 
-func (e *WorkerEngine) handleTimeout(ctx context.Context, act *activity, handler ActivityHandler, actCtx ActivityContext, payloadForDL json.RawMessage, workerLabel string, workerID int, activityID interface{}, activityType string, timeout time.Duration) {
+func (e *WorkerEngine) handleTimeout(ctx context.Context, act *activity, handler ActivityHandler, actCtx ActivityContext, payloadForDL json.RawMessage, workerLabel string, workerID int, activityID any, activityType string, timeout time.Duration) {
 	e.metrics.IncCounter("activity_timeout", 1)
 	errorMsg := "Activity execution timed out"
 	slog.Error("Activity timed out", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "timeout", timeout)
@@ -392,10 +385,7 @@ func (e *WorkerEngine) handleTimeout(ctx context.Context, act *activity, handler
 func (e *WorkerEngine) runScheduledProcessor(ctx context.Context) {
 	pollInterval := uint64(5)
 	if e.config.SchedulePollIntervalSeconds != nil {
-		pollInterval = *e.config.SchedulePollIntervalSeconds
-		if pollInterval < 1 {
-			pollInterval = 1
-		}
+		pollInterval = max(*e.config.SchedulePollIntervalSeconds, 1)
 	}
 	ticker := time.NewTicker(time.Duration(pollInterval) * time.Second)
 	defer ticker.Stop()
@@ -418,10 +408,7 @@ func (e *WorkerEngine) runScheduledProcessor(ctx context.Context) {
 func (e *WorkerEngine) runReaperProcessor(ctx context.Context) {
 	intervalSec := uint64(5)
 	if e.config.ReaperIntervalSeconds != nil {
-		intervalSec = *e.config.ReaperIntervalSeconds
-		if intervalSec < 1 {
-			intervalSec = 1
-		}
+		intervalSec = max(*e.config.ReaperIntervalSeconds, 1)
 	}
 	batchSize := 100
 	if e.config.ReaperBatchSize != nil {
