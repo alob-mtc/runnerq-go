@@ -861,6 +861,10 @@ func (b *PostgresBackend) ListScheduled(ctx context.Context, offset, limit int) 
 }
 
 func (b *PostgresBackend) ListCompleted(ctx context.Context, offset, limit int) ([]storage.ActivitySnapshot, error) {
+	return b.ListCompletedNonCron(ctx, offset, limit)
+}
+
+func (b *PostgresBackend) ListCompletedNonCron(ctx context.Context, offset, limit int) ([]storage.ActivitySnapshot, error) {
 	rows, err := b.pool.Query(ctx, `
 		SELECT id, activity_type, payload, priority, status, created_at,
 			scheduled_at, started_at, completed_at, current_worker_id,
@@ -869,11 +873,33 @@ func (b *PostgresBackend) ListCompleted(ctx context.Context, offset, limit int) 
 			idempotency_key, lease_deadline_ms
 		FROM runnerq_activities
 		WHERE queue_name = $1 AND status IN ('completed', 'failed')
+		  AND (metadata->>'source') IS DISTINCT FROM 'cron'
 		ORDER BY completed_at DESC NULLS LAST, created_at DESC
 		LIMIT $2 OFFSET $3`,
 		b.queueName, limit, offset)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list completed: %v", err))
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list completed non-cron: %v", err))
+	}
+	defer rows.Close()
+
+	return b.scanSnapshots(rows)
+}
+
+func (b *PostgresBackend) ListCompletedCron(ctx context.Context, offset, limit int) ([]storage.ActivitySnapshot, error) {
+	rows, err := b.pool.Query(ctx, `
+		SELECT id, activity_type, payload, priority, status, created_at,
+			scheduled_at, started_at, completed_at, current_worker_id,
+			last_worker_id, retry_count, max_retries, timeout_seconds,
+			retry_delay_seconds, last_error, last_error_at, metadata,
+			idempotency_key, lease_deadline_ms
+		FROM runnerq_activities
+		WHERE queue_name = $1 AND status IN ('completed', 'failed')
+		  AND metadata->>'source' = 'cron'
+		ORDER BY completed_at DESC NULLS LAST, created_at DESC
+		LIMIT $2 OFFSET $3`,
+		b.queueName, limit, offset)
+	if err != nil {
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list completed cron: %v", err))
 	}
 	defer rows.Close()
 

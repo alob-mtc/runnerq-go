@@ -128,6 +128,19 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Tag a cron-triggered activity (useful for observability filtering)
+	cronPayload, _ := json.Marshal(map[string]interface{}{
+		"job": "nightly_reconcile",
+	})
+	_, err = executor.Activity("reconcile_accounts").
+		Payload(cronPayload).
+		Metadata("source", "cron").
+		Metadata("cron_job", "nightly_reconcile").
+		Execute(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// Execute an activity with default options
 	simplePayload, _ := json.Marshal(map[string]interface{}{
 		"to": "admin@example.com",
@@ -218,6 +231,16 @@ scheduledPayload, _ := json.Marshal(map[string]interface{}{"user_id": 123})
 future, err := executor.Activity("send_reminder").
 	Payload(scheduledPayload).
 	Delay(1 * time.Hour).
+	Execute(ctx)
+
+// Attach metadata (for correlation, routing, or cron tagging)
+future, err := executor.Activity("reconcile_accounts").
+	Payload(payload).
+	Metadata("source", "cron").
+	MetadataMap(map[string]string{
+		"cron_job": "nightly_reconcile",
+		"tenant":   "acme",
+	}).
 	Execute(ctx)
 
 // Simple activity with defaults

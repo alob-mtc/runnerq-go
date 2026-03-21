@@ -2411,6 +2411,9 @@
                                 <button data-collection="completed">
                                     Completed
                                 </button>
+                                <button data-collection="cron">
+                                    Cron
+                                </button>
                                 <button data-collection="scheduled">
                                     Scheduled
                                 </button>
@@ -2807,6 +2810,9 @@
                     } else if (currentCollection === "completed") {
                         emptyMessage = "No completed activities found";
                         emptyIcon = "✅";
+                    } else if (currentCollection === "cron") {
+                        emptyMessage = "No cron activities found";
+                        emptyIcon = "⏰";
                     } else if (currentCollection === "scheduled") {
                         emptyMessage = "No scheduled activities";
                         emptyIcon = "📅";
@@ -2820,7 +2826,9 @@
                             ? "Try adjusting your search or filter criteria"
                             : currentCollection === "scheduled"
                               ? "Activities scheduled for future execution will appear here"
-                              : "Activities will appear here when they are enqueued";
+                              : currentCollection === "cron"
+                                ? "Completed and failed cron-triggered activities appear here"
+                                : "Activities will appear here when they are enqueued";
 
                     container.innerHTML = `
                     <div class="empty-state fade-in">
@@ -3595,7 +3603,10 @@
                         (event.event_type === "Retrying" &&
                             currentCollection === "processing") ||
                         (event.event_type === "Requeued" &&
-                            currentCollection === "dead_letter");
+                            currentCollection === "dead_letter") ||
+                        ((event.event_type === "Completed" ||
+                            event.event_type === "Failed") &&
+                            currentCollection === "cron");
 
                     if (shouldRefreshCurrent) {
                         debouncedReloadActivities();
@@ -3861,6 +3872,9 @@
                     succeeded: "completed",
                     failed: "completed",
                     error: "completed",
+                    cron: "cron",
+                    cron_completed: "cron",
+                    cron_failed: "cron",
                     dead_letter: "dead_letter",
                     deadletter: "dead_letter",
                     scheduled: "scheduled",
