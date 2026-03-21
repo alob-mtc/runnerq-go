@@ -205,6 +205,8 @@ type InspectionStorage interface {
 	ListPending(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
 	ListProcessing(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
 	ListScheduled(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
+	ListCompletedNonCron(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
+	ListCompletedCron(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
 	ListCompleted(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
 	ListDeadLetter(ctx context.Context, offset, limit int) ([]DeadLetterRecord, error)
 	GetActivity(ctx context.Context, activityID uuid.UUID) (*ActivitySnapshot, error)

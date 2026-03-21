@@ -127,6 +127,13 @@ func activityCollectionOrDetail(inspector *observability.QueueInspector) http.Ha
 				return
 			}
 			writeJSON(w, http.StatusOK, items)
+		case "cron":
+			items, err := inspector.ListCronCompleted(ctx, offset, limit)
+			if err != nil {
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+			writeJSON(w, http.StatusOK, items)
 		case "dead_letter":
 			items, err := inspector.ListDeadLetter(ctx, offset, limit)
 			if err != nil {

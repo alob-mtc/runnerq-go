@@ -56,6 +56,7 @@ type ActivityBuilder struct {
 	timeout        *time.Duration
 	delay          *time.Duration
 	idempotencyKey *IdempotencyConfig
+	metadata       map[string]string
 }
 
 // Payload sets the JSON payload for the activity.
@@ -94,13 +95,37 @@ func (b *ActivityBuilder) IdempotencyKeyOption(key string, behavior OnDuplicate)
 	return b
 }
 
+// Metadata sets a single metadata key/value pair on the activity.
+func (b *ActivityBuilder) Metadata(key, value string) *ActivityBuilder {
+	if b.metadata == nil {
+		b.metadata = make(map[string]string)
+	}
+	b.metadata[key] = value
+	return b
+}
+
+// MetadataMap sets multiple metadata fields on the activity.
+// Values are merged with existing metadata and overwrite duplicate keys.
+func (b *ActivityBuilder) MetadataMap(metadata map[string]string) *ActivityBuilder {
+	if len(metadata) == 0 {
+		return b
+	}
+	if b.metadata == nil {
+		b.metadata = make(map[string]string, len(metadata))
+	}
+	for k, v := range metadata {
+		b.metadata[k] = v
+	}
+	return b
+}
+
 // Execute enqueues the activity and returns an ActivityFuture.
 func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) {
 	if b.payload == nil {
 		return nil, &WorkerError{Kind: ErrQueue, Message: "Activity payload is required"}
 	}
 
-	hasOption := b.priority != nil || b.maxRetries != nil || b.timeout != nil || b.delay != nil || b.idempotencyKey != nil
+	hasOption := b.priority != nil || b.maxRetries != nil || b.timeout != nil || b.delay != nil || b.idempotencyKey != nil || len(b.metadata) > 0
 
 	var option *ActivityOption
 	if hasOption {
@@ -122,12 +147,17 @@ func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) 
 			prefixedKey := fmt.Sprintf("%s-%s", b.idempotencyKey.Key, b.activityType)
 			idempKey = &IdempotencyConfig{Key: prefixedKey, Behavior: b.idempotencyKey.Behavior}
 		}
+		metadata := make(map[string]string)
+		for k, v := range b.metadata {
+			metadata[k] = v
+		}
 		option = &ActivityOption{
 			Priority:       b.priority,
 			MaxRetries:     maxRetries,
 			TimeoutSeconds: timeoutSec,
 			DelaySeconds:   delaySec,
 			IdempotencyKey: idempKey,
+			Metadata:       metadata,
 		}
 	}
 

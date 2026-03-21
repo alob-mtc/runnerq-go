@@ -39,6 +39,14 @@ CREATE INDEX IF NOT EXISTS idx_runnerq_dequeue_effective
 CREATE INDEX IF NOT EXISTS idx_runnerq_activities_processing
     ON runnerq_activities(queue_name, lease_deadline_ms)
     WHERE status = 'processing';
+CREATE INDEX IF NOT EXISTS idx_runnerq_completed_non_cron
+    ON runnerq_activities(queue_name, completed_at DESC, created_at DESC)
+    WHERE status IN ('completed', 'failed')
+      AND (metadata->>'source') IS DISTINCT FROM 'cron';
+CREATE INDEX IF NOT EXISTS idx_runnerq_completed_cron
+    ON runnerq_activities(queue_name, completed_at DESC, created_at DESC)
+    WHERE status IN ('completed', 'failed')
+      AND metadata->>'source' = 'cron';
 
 -- Idempotency keys table
 CREATE TABLE IF NOT EXISTS runnerq_idempotency (

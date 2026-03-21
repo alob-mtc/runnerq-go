@@ -95,6 +95,7 @@ type ActivityOption struct {
 	TimeoutSeconds uint64
 	DelaySeconds   *uint64
 	IdempotencyKey *IdempotencyConfig
+	Metadata       map[string]string
 }
 
 // IdempotencyConfig holds idempotency key and its behavior.
@@ -140,6 +141,13 @@ func newActivity(activityType string, payload json.RawMessage, option *ActivityO
 		idempotencyKey = option.IdempotencyKey
 	}
 
+	metadata := make(map[string]string)
+	if option != nil && len(option.Metadata) > 0 {
+		for k, v := range option.Metadata {
+			metadata[k] = v
+		}
+	}
+
 	return &activity{
 		ID:                uuid.New(),
 		ActivityType:      activityType,
@@ -152,7 +160,7 @@ func newActivity(activityType string, payload json.RawMessage, option *ActivityO
 		MaxRetries:        maxRetries,
 		TimeoutSeconds:    timeoutSeconds,
 		RetryDelaySeconds: 1,
-		Metadata:          make(map[string]string),
+		Metadata:          metadata,
 		IdempotencyKey:    idempotencyKey,
 	}
 }

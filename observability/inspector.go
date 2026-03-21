@@ -90,7 +90,16 @@ func (q *QueueInspector) ListDeadLetter(ctx context.Context, offset, limit int) 
 
 // ListCompleted returns completed activities.
 func (q *QueueInspector) ListCompleted(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error) {
-	snapshots, err := q.backend.ListCompleted(ctx, offset, limit)
+	snapshots, err := q.backend.ListCompletedNonCron(ctx, offset, limit)
+	if err != nil {
+		return nil, err
+	}
+	return convertSnapshots(snapshots), nil
+}
+
+// ListCronCompleted returns cron-tagged completed activities.
+func (q *QueueInspector) ListCronCompleted(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error) {
+	snapshots, err := q.backend.ListCompletedCron(ctx, offset, limit)
 	if err != nil {
 		return nil, err
 	}
