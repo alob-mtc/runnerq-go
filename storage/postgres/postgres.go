@@ -66,6 +66,11 @@ func (b *PostgresBackend) Close() {
 	b.pool.Close()
 }
 
+// SetLeaseMS updates the default lease duration. Implements storage.LeaseConfigurer.
+func (b *PostgresBackend) SetLeaseMS(leaseMS int64) {
+	b.defaultLeaseMS = leaseMS
+}
+
 func validateQueueName(name string) error {
 	if name == "" {
 		return storage.NewConfigurationError("queue_name cannot be empty")
@@ -99,31 +104,14 @@ func (b *PostgresBackend) notificationChannel() string {
 }
 
 func priorityToInt(p storage.ActivityPriority) int32 {
-	switch p {
-	case storage.PriorityCritical:
-		return 3
-	case storage.PriorityHigh:
-		return 2
-	case storage.PriorityNormal:
-		return 1
-	case storage.PriorityLow:
-		return 0
-	default:
-		return 1
-	}
+	return int32(p)
 }
 
 func intToPriority(val int32) storage.ActivityPriority {
-	switch val {
-	case 3:
-		return storage.PriorityCritical
-	case 2:
-		return storage.PriorityHigh
-	case 1:
-		return storage.PriorityNormal
-	default:
-		return storage.PriorityLow
+	if val >= int32(storage.PriorityLow) && val <= int32(storage.PriorityCritical) {
+		return storage.ActivityPriority(val)
 	}
+	return storage.PriorityNormal
 }
 
 func (b *PostgresBackend) recordEvent(ctx context.Context, tx pgx.Tx, activityID uuid.UUID, eventType string, workerID *string, detail json.RawMessage) error {
@@ -139,7 +127,7 @@ func (b *PostgresBackend) recordEvent(ctx context.Context, tx pgx.Tx, activityID
 	_, err := tx.Exec(ctx, `
 		INSERT INTO runnerq_events (activity_id, queue_name, event_type, worker_id, detail, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6)`,
-		activityID, b.queueName, jsonString(eventType), workerID, detail, now)
+		activityID, b.queueName, eventType, workerID, detail, now)
 	if err != nil {
 		return storage.NewInternalError(fmt.Sprintf("Failed to record event: %v", err))
 	}
@@ -190,11 +178,6 @@ func (b *PostgresBackend) storeResultTx(ctx context.Context, tx pgx.Tx, activity
 		return storage.NewInternalError(fmt.Sprintf("Failed to store result: %v", err))
 	}
 	return nil
-}
-
-func jsonString(s string) string {
-	data, _ := json.Marshal(s)
-	return string(data)
 }
 
 func toDetail(kv map[string]any) json.RawMessage {
@@ -475,7 +458,8 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 
 	if canRetry {
 		baseDelay := int64(ar.retryDelaySeconds)
-		backoffMult := int64(1) << (ar.retryCount + 1)
+		shift := min(ar.retryCount+1, 62)
+		backoffMult := int64(1) << shift
 		retryDelay := baseDelay * backoffMult
 		scheduledAt := now.Add(time.Duration(retryDelay) * time.Second)
 		newRetryCount := ar.retryCount + 1
@@ -669,6 +653,27 @@ func (b *PostgresBackend) CheckIdempotency(ctx context.Context, a *storage.Queue
 	key := a.IdempotencyKey.Key
 	behavior := a.IdempotencyKey.Behavior
 
+	const maxRetries = 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		result, err := b.tryClaimIdempotencyKey(ctx, a, key)
+		if err != nil {
+			return nil, err
+		}
+		if result.claimed || result.existingID != nil || result.status != nil {
+			return b.resolveIdempotencyBehavior(ctx, a, key, behavior, result)
+		}
+		// Row disappeared between INSERT and SELECT — retry
+	}
+	return nil, storage.NewInternalError(fmt.Sprintf("Failed to resolve idempotency key '%s' after %d attempts", key, maxRetries))
+}
+
+type idempotencyResult struct {
+	claimed    bool
+	existingID *uuid.UUID
+	status     *string
+}
+
+func (b *PostgresBackend) tryClaimIdempotencyKey(ctx context.Context, a *storage.QueuedActivity, key string) (idempotencyResult, error) {
 	// Try to atomically claim the key
 	tag, err := b.pool.Exec(ctx, `
 		INSERT INTO runnerq_idempotency (queue_name, idempotency_key, activity_id, created_at, updated_at)
@@ -676,11 +681,11 @@ func (b *PostgresBackend) CheckIdempotency(ctx context.Context, a *storage.Queue
 		ON CONFLICT (queue_name, idempotency_key) DO NOTHING`,
 		b.queueName, key, a.ID)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to claim idempotency key: %v", err))
+		return idempotencyResult{}, storage.NewInternalError(fmt.Sprintf("Failed to claim idempotency key: %v", err))
 	}
 
 	if tag.RowsAffected() > 0 {
-		return nil, nil
+		return idempotencyResult{claimed: true}, nil
 	}
 
 	// Key exists - get existing activity
@@ -694,17 +699,29 @@ func (b *PostgresBackend) CheckIdempotency(ctx context.Context, a *storage.Queue
 		b.queueName, key).Scan(&existingID, &status)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return b.CheckIdempotency(ctx, a)
+			// Row disappeared between INSERT and SELECT
+			return idempotencyResult{}, nil
 		}
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to get existing key: %v", err))
+		return idempotencyResult{}, storage.NewInternalError(fmt.Sprintf("Failed to get existing key: %v", err))
 	}
+
+	return idempotencyResult{existingID: &existingID, status: status}, nil
+}
+
+func (b *PostgresBackend) resolveIdempotencyBehavior(ctx context.Context, a *storage.QueuedActivity, key string, behavior storage.IdempotencyBehavior, result idempotencyResult) (*uuid.UUID, error) {
+	if result.claimed {
+		return nil, nil
+	}
+
+	existingID := *result.existingID
+	status := result.status
 
 	switch behavior {
 	case storage.BehaviorReturnExisting:
 		return &existingID, nil
 
 	case storage.BehaviorAllowReuse:
-		_, err = b.pool.Exec(ctx, `
+		_, err := b.pool.Exec(ctx, `
 			UPDATE runnerq_idempotency
 			SET activity_id = $1, updated_at = NOW()
 			WHERE queue_name = $2 AND idempotency_key = $3`,
@@ -720,7 +737,7 @@ func (b *PostgresBackend) CheckIdempotency(ctx context.Context, a *storage.Queue
 			statusStr = *status
 		}
 		if statusStr == "dead_letter" || statusStr == "failed" {
-			tag, err = b.pool.Exec(ctx, `
+			tag, err := b.pool.Exec(ctx, `
 				UPDATE runnerq_idempotency i
 				SET activity_id = $1, updated_at = NOW()
 				FROM runnerq_activities a
@@ -797,14 +814,14 @@ func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error
 		if err := pRows.Scan(&priority, &count); err != nil {
 			return nil, storage.NewInternalError(fmt.Sprintf("Failed to scan priority stats: %v", err))
 		}
-		switch priority {
-		case 3:
+		switch storage.ActivityPriority(priority) {
+		case storage.PriorityCritical:
 			stats.ByPriority.Critical = uint64(count)
-		case 2:
+		case storage.PriorityHigh:
 			stats.ByPriority.High = uint64(count)
-		case 1:
+		case storage.PriorityNormal:
 			stats.ByPriority.Normal = uint64(count)
-		case 0:
+		case storage.PriorityLow:
 			stats.ByPriority.Low = uint64(count)
 		}
 	}
@@ -989,15 +1006,15 @@ func (b *PostgresBackend) GetActivityEvents(ctx context.Context, activityID uuid
 	var events []storage.ActivityEvent
 	for rows.Next() {
 		var e storage.ActivityEvent
-		var eventTypeJSON string
-		err := rows.Scan(&e.ActivityID, &eventTypeJSON, &e.WorkerID, &e.Detail, &e.Timestamp)
+		var eventTypeRaw string
+		err := rows.Scan(&e.ActivityID, &eventTypeRaw, &e.WorkerID, &e.Detail, &e.Timestamp)
 		if err != nil {
 			return nil, storage.NewInternalError(fmt.Sprintf("Failed to scan event: %v", err))
 		}
-		// event_type stored as JSON string like "\"Enqueued\""
+		// Handle both legacy JSON-encoded strings ("\"Enqueued\"") and plain strings ("Enqueued")
 		var et string
-		if err := json.Unmarshal([]byte(eventTypeJSON), &et); err != nil {
-			et = strings.Trim(eventTypeJSON, "\"")
+		if err := json.Unmarshal([]byte(eventTypeRaw), &et); err != nil {
+			et = strings.Trim(eventTypeRaw, "\"")
 		}
 		e.EventType = et
 		events = append(events, e)

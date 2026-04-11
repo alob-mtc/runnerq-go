@@ -220,3 +220,9 @@ type Storage interface {
 	QueueStorage
 	InspectionStorage
 }
+
+// LeaseConfigurer is an optional interface backends can implement to accept
+// the lease duration from the engine configuration at startup.
+type LeaseConfigurer interface {
+	SetLeaseMS(leaseMS int64)
+}
