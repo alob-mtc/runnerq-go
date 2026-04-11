@@ -3555,8 +3555,8 @@
             };
 
             const handleActivityEvent = (event) => {
-                // Always refresh stats on any event
-                loadStats();
+                // Refresh stats on any event (debounced to avoid hammering under high throughput)
+                debouncedLoadStats();
 
                 // If this is the selected activity, refresh its details
                 if (selectedActivityId === event.activity_id) {
@@ -3612,6 +3612,15 @@
                         debouncedReloadActivities();
                     }
                 }
+            };
+
+            // Debounced stats reload to prevent hammering under high throughput
+            let statsTimer = null;
+            const debouncedLoadStats = () => {
+                if (statsTimer) clearTimeout(statsTimer);
+                statsTimer = setTimeout(() => {
+                    loadStats();
+                }, 500);
             };
 
             // Debounced reload to prevent rapid successive reloads
