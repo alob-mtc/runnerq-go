@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"time"
 	"unicode"
@@ -457,10 +458,16 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 	canRetry := ar.maxRetries == 0 || (ar.retryCount+1) < ar.maxRetries
 
 	if canRetry {
+		const maxRetryDelaySec = int64(math.MaxInt64 / int64(time.Second))
 		baseDelay := int64(ar.retryDelaySeconds)
 		shift := min(ar.retryCount+1, 62)
 		backoffMult := int64(1) << shift
-		retryDelay := baseDelay * backoffMult
+		retryDelay := maxRetryDelaySec
+		if baseDelay > 0 && baseDelay <= maxRetryDelaySec/backoffMult {
+			retryDelay = baseDelay * backoffMult
+		} else if baseDelay <= 0 {
+			retryDelay = 0
+		}
 		scheduledAt := now.Add(time.Duration(retryDelay) * time.Second)
 		newRetryCount := ar.retryCount + 1
 

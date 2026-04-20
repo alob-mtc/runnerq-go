@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
 	"sync"
@@ -53,7 +54,11 @@ type WorkerEngine struct {
 func NewWorkerEngineWithBackend(backend storage.Storage, config WorkerConfig) *WorkerEngine {
 	// Propagate lease config to backends that support it.
 	if lc, ok := backend.(storage.LeaseConfigurer); ok && config.LeaseMS != nil {
-		lc.SetLeaseMS(int64(*config.LeaseMS))
+		leaseMS := *config.LeaseMS
+		if leaseMS > math.MaxInt64 {
+			leaseMS = math.MaxInt64
+		}
+		lc.SetLeaseMS(int64(leaseMS))
 	}
 
 	adapter := newBackendQueueAdapter(backend, config.ActivityTypes)
@@ -97,10 +102,6 @@ func (e *WorkerEngine) GetActivityExecutor() ActivityExecutor {
 
 // Start starts the worker engine and blocks until shutdown or error.
 func (e *WorkerEngine) Start(ctx context.Context) error {
-	if !e.running.CompareAndSwap(false, true) {
-		return &WorkerError{Kind: ErrAlreadyRunning}
-	}
-
 	if len(e.config.ActivityTypes) > 0 {
 		var missing []string
 		for _, t := range e.config.ActivityTypes {
@@ -111,6 +112,10 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		if len(missing) > 0 {
 			panic(fmt.Sprintf("activity_types filter contains types with no registered handler: %v", missing))
 		}
+	}
+
+	if !e.running.CompareAndSwap(false, true) {
+		return &WorkerError{Kind: ErrAlreadyRunning}
 	}
 
 	slog.Info("Starting worker engine", "max_concurrent_activities", e.config.MaxConcurrentActivities)
@@ -158,8 +163,17 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	cancel()
 	wg.Wait()
 
-	// Wait for any in-flight result storage goroutines to finish
-	e.resultWg.Wait()
+	// Wait for any in-flight result storage goroutines to finish (bounded)
+	resultDone := make(chan struct{})
+	go func() {
+		e.resultWg.Wait()
+		close(resultDone)
+	}()
+	select {
+	case <-resultDone:
+	case <-time.After(10 * time.Second):
+		slog.Warn("Timed out waiting for result storage goroutines to drain")
+	}
 
 	signal.Stop(sigCh)
 	slog.Info("Worker engine stopped")
