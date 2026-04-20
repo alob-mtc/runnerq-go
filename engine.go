@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
 	"sync"
@@ -46,10 +47,20 @@ type WorkerEngine struct {
 	cancelFunc context.CancelFunc
 	shutdownCh chan struct{}
 	metrics    MetricsSink
+	resultWg   sync.WaitGroup // tracks in-flight result storage goroutines
 }
 
 // NewWorkerEngineWithBackend creates a WorkerEngine from a custom backend.
 func NewWorkerEngineWithBackend(backend storage.Storage, config WorkerConfig) *WorkerEngine {
+	// Propagate lease config to backends that support it.
+	if lc, ok := backend.(storage.LeaseConfigurer); ok && config.LeaseMS != nil {
+		leaseMS := *config.LeaseMS
+		if leaseMS > math.MaxInt64 {
+			leaseMS = math.MaxInt64
+		}
+		lc.SetLeaseMS(int64(leaseMS))
+	}
+
 	adapter := newBackendQueueAdapter(backend, config.ActivityTypes)
 	shutdownCh := make(chan struct{})
 	return &WorkerEngine{
@@ -91,11 +102,6 @@ func (e *WorkerEngine) GetActivityExecutor() ActivityExecutor {
 
 // Start starts the worker engine and blocks until shutdown or error.
 func (e *WorkerEngine) Start(ctx context.Context) error {
-	if e.running.Load() {
-		return &WorkerError{Kind: ErrAlreadyRunning}
-	}
-	e.running.Store(true)
-
 	if len(e.config.ActivityTypes) > 0 {
 		var missing []string
 		for _, t := range e.config.ActivityTypes {
@@ -106,6 +112,10 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		if len(missing) > 0 {
 			panic(fmt.Sprintf("activity_types filter contains types with no registered handler: %v", missing))
 		}
+	}
+
+	if !e.running.CompareAndSwap(false, true) {
+		return &WorkerError{Kind: ErrAlreadyRunning}
 	}
 
 	slog.Info("Starting worker engine", "max_concurrent_activities", e.config.MaxConcurrentActivities)
@@ -130,12 +140,10 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 
 	// Worker loops
 	for i := 0; i < e.config.MaxConcurrentActivities; i++ {
-		wg.Add(1)
 		workerID := i
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			e.runWorkerLoop(engineCtx, workerID)
-		}()
+		})
 	}
 
 	// Wait for shutdown signal or context cancellation
@@ -154,6 +162,18 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	e.stop()
 	cancel()
 	wg.Wait()
+
+	// Wait for any in-flight result storage goroutines to finish (bounded)
+	resultDone := make(chan struct{})
+	go func() {
+		e.resultWg.Wait()
+		close(resultDone)
+	}()
+	select {
+	case <-resultDone:
+	case <-time.After(10 * time.Second):
+		slog.Warn("Timed out waiting for result storage goroutines to drain")
+	}
 
 	signal.Stop(sigCh)
 	slog.Info("Worker engine stopped")
@@ -266,17 +286,15 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 		return
 	}
 
-	var actErr *ActivityError
-	if ae, ok := handlerErr.(*ActivityError); ok {
-		actErr = ae
-	} else {
-		actErr = &ActivityError{Retryable: true, Message: handlerErr.Error()}
+	retryable := true // default: unknown errors are retryable
+	if re, ok := handlerErr.(RetryableError); ok {
+		retryable = re.IsRetryable()
 	}
 
-	if actErr.Retryable {
-		e.handleRetryableFailure(ctx, act, handler, actCtx, payloadForDL, actErr.Message, workerLabel, workerID, activityID, activityType)
+	if retryable {
+		e.handleRetryableFailure(ctx, act, handler, actCtx, payloadForDL, handlerErr.Error(), workerLabel, workerID, activityID, activityType)
 	} else {
-		e.handleNonRetryableFailure(ctx, act, actErr.Message, workerLabel, workerID, activityID, activityType)
+		e.handleNonRetryableFailure(ctx, act, handlerErr.Error(), workerLabel, workerID, activityID, activityType)
 	}
 }
 
@@ -306,10 +324,14 @@ func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result 
 	}
 	slog.Info("Activity completed successfully", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType)
 
-	// Fire-and-forget result storage
+	// Async result storage — tracked for graceful shutdown
+	e.resultWg.Add(1)
 	go func() {
+		defer e.resultWg.Done()
+		storeCtx, storeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer storeCancel()
 		res := activityResult{Data: result, State: ResultOk}
-		if err := e.queue.StoreResult(context.Background(), act.ID, res); err != nil {
+		if err := e.queue.StoreResult(storeCtx, act.ID, res); err != nil {
 			slog.Error("Failed to store activity result", "activity_id", activityID, "error", err)
 		}
 	}()
@@ -345,15 +367,19 @@ func (e *WorkerEngine) handleNonRetryableFailure(ctx context.Context, act *activ
 		slog.Error("Failed to mark activity as failed", "worker_id", workerID, "activity_id", activityID, "error", err)
 	}
 
-	// Fire-and-forget result storage
+	// Async result storage — tracked for graceful shutdown
+	e.resultWg.Add(1)
 	go func() {
+		defer e.resultWg.Done()
+		storeCtx, storeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer storeCancel()
 		errorResult, _ := json.Marshal(map[string]any{
 			"error":     reason,
 			"type":      "non_retryable",
 			"failed_at": time.Now().UTC().Format(time.RFC3339),
 		})
 		res := activityResult{Data: errorResult, State: ResultErr}
-		if err := e.queue.StoreResult(context.Background(), act.ID, res); err != nil {
+		if err := e.queue.StoreResult(storeCtx, act.ID, res); err != nil {
 			slog.Error("Failed to store activity result", "activity_id", activityID, "error", err)
 		}
 	}()

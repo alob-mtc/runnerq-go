@@ -59,7 +59,7 @@ func parsePagination(r *http.Request) (offset, limit int) {
 	}
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			limit = n
+			limit = min(n, 1000)
 		}
 	}
 	return

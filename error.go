@@ -35,7 +35,13 @@ func NewNonRetryError(msg string) *ActivityError {
 	return &ActivityError{Retryable: false, Message: msg}
 }
 
+// IsRetryable implements the RetryableError interface.
+func (e *ActivityError) IsRetryable() bool {
+	return e.Retryable
+}
+
 // RetryableError is an interface for errors that know if they are retryable.
+// Handlers can return any error implementing this interface to control retry behavior.
 type RetryableError interface {
 	IsRetryable() bool
 }
@@ -56,7 +62,6 @@ const (
 	ErrHandlerNotFound
 	ErrBackend
 	ErrDatabase
-	ErrConfig
 	ErrConfiguration
 	ErrShutdown
 	ErrAlreadyRunning
@@ -92,8 +97,6 @@ func (e *WorkerError) Error() string {
 		prefix = "Backend error"
 	case ErrDatabase:
 		prefix = "Database error"
-	case ErrConfig:
-		prefix = "Configuration error"
 	case ErrConfiguration:
 		prefix = "Configuration error"
 	case ErrShutdown:
@@ -144,7 +147,7 @@ func WorkerErrorFromStorage(err error) *WorkerError {
 	case storage.ErrSerialization:
 		return &WorkerError{Kind: ErrQueue, Message: se.Message, Cause: err}
 	case storage.ErrConfiguration:
-		return &WorkerError{Kind: ErrConfig, Message: se.Message, Cause: err}
+		return &WorkerError{Kind: ErrConfiguration, Message: se.Message, Cause: err}
 	case storage.ErrTimeout:
 		return &WorkerError{Kind: ErrExecution, Message: se.Message, Cause: err}
 	case storage.ErrDuplicateActivity:
