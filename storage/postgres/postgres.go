@@ -109,6 +109,9 @@ func priorityToInt(p storage.ActivityPriority) int32 {
 }
 
 func intToPriority(val int32) storage.ActivityPriority {
+	if val <= int32(storage.PriorityLow) {
+		return storage.PriorityLow
+	}
 	if val >= int32(storage.PriorityLow) && val <= int32(storage.PriorityCritical) {
 		return storage.ActivityPriority(val)
 	}
