@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 
 	"github.com/google/uuid"
 
@@ -61,7 +60,7 @@ type notifyHub struct {
 	mu          sync.Mutex
 	subscribers map[uint64]subscriber
 	nextID      uint64
-	running     atomic.Bool
+	running     bool
 	cancel      context.CancelFunc
 }
 
@@ -85,7 +84,7 @@ func (h *notifyHub) subscribe(ctx context.Context) (<-chan ActivityEvent, error)
 	}()
 
 	// Start the shared listener if not already running.
-	if !h.running.Load() {
+	if !h.running {
 		if err := h.startLocked(); err != nil {
 			delete(h.subscribers, id)
 			close(ch)
@@ -124,15 +123,14 @@ func (h *notifyHub) startLocked() error {
 	}
 
 	h.cancel = cancel
-	h.running.Store(true)
+	h.running = true
 
 	go h.broadcast(ctx, backendCh)
 	return nil
 }
 
 func (h *notifyHub) broadcast(ctx context.Context, backendCh <-chan storage.ActivityEvent) {
-	defer h.running.Store(false)
-	defer h.closeAll()
+	defer h.shutdown()
 
 	for {
 		select {
@@ -160,10 +158,13 @@ func (h *notifyHub) broadcast(ctx context.Context, backendCh <-chan storage.Acti
 	}
 }
 
-// closeAll closes every subscriber channel — used when the backend stream ends.
-func (h *notifyHub) closeAll() {
+// shutdown transitions the hub to stopped under the lock, then closes all
+// subscriber channels. This prevents a race where subscribe sees running==true
+// and attaches to a dying generation.
+func (h *notifyHub) shutdown() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.running = false
 	for id, sub := range h.subscribers {
 		close(sub.ch)
 		delete(h.subscribers, id)

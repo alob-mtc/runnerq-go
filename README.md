@@ -934,7 +934,7 @@ The real-time event stream uses a fan-out hub inside `QueueInspector` so that **
 subscribers share a single backend connection**, regardless of how many clients are
 connected.
 
-```
+```text
                         ┌──────────────┐
   Backend.EventStream() │  notifyHub   │──► SSE client 1
   (1 connection)  ─────►│  (inspector) │──► SSE client 2
