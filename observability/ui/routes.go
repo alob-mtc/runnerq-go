@@ -12,9 +12,12 @@ import (
 	"github.com/alob-mtc/runnerq-go/observability"
 )
 
+const defaultMaxSSEConns = 64
+
 // RunnerQUI creates an http.Handler that serves the console UI and API.
 // Mount it on any path, e.g. http.Handle("/console/", http.StripPrefix("/console", RunnerQUI(inspector)))
 func RunnerQUI(inspector *observability.QueueInspector) http.Handler {
+	sseSema := make(chan struct{}, defaultMaxSSEConns)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", serveUI)
 	mux.HandleFunc("GET /api/observability/stats", statsHandler(inspector))
@@ -22,19 +25,20 @@ func RunnerQUI(inspector *observability.QueueInspector) http.Handler {
 	mux.HandleFunc("GET /api/observability/activities/{id}/events", activityEventsHandler(inspector))
 	mux.HandleFunc("GET /api/observability/activities/{id}/result", activityResultHandler(inspector))
 	mux.HandleFunc("GET /api/observability/dead-letter", deadLettersHandler(inspector))
-	mux.HandleFunc("GET /api/observability/stream", eventStreamHandler(inspector))
+	mux.HandleFunc("GET /api/observability/stream", eventStreamHandler(inspector, sseSema))
 	return mux
 }
 
 // ObservabilityAPI creates an http.Handler with just the API routes.
 func ObservabilityAPI(inspector *observability.QueueInspector) http.Handler {
+	sseSema := make(chan struct{}, defaultMaxSSEConns)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /stats", statsHandler(inspector))
 	mux.HandleFunc("GET /activities/{key}", activityCollectionOrDetail(inspector))
 	mux.HandleFunc("GET /activities/{id}/events", activityEventsHandler(inspector))
 	mux.HandleFunc("GET /activities/{id}/result", activityResultHandler(inspector))
 	mux.HandleFunc("GET /dead-letter", deadLettersHandler(inspector))
-	mux.HandleFunc("GET /stream", eventStreamHandler(inspector))
+	mux.HandleFunc("GET /stream", eventStreamHandler(inspector, sseSema))
 	return mux
 }
 
@@ -198,8 +202,17 @@ func deadLettersHandler(inspector *observability.QueueInspector) http.HandlerFun
 	}
 }
 
-func eventStreamHandler(inspector *observability.QueueInspector) http.HandlerFunc {
+func eventStreamHandler(inspector *observability.QueueInspector, sseSema chan struct{}) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Limit concurrent SSE connections.
+		select {
+		case sseSema <- struct{}{}:
+			defer func() { <-sseSema }()
+		default:
+			http.Error(w, "Too Many SSE Connections", http.StatusServiceUnavailable)
+			return
+		}
+
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
@@ -215,7 +228,7 @@ func eventStreamHandler(inspector *observability.QueueInspector) http.HandlerFun
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 
-		ch, err := inspector.EventStream(r.Context())
+		ch, err := inspector.SubscribeEvents(r.Context())
 		if err != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
