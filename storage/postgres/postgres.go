@@ -779,35 +779,47 @@ func (b *PostgresBackend) resolveIdempotencyBehavior(ctx context.Context, a *sto
 // ============================================================================
 
 func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error) {
-	rows, err := b.pool.Query(ctx, `
-		SELECT status, COUNT(*) as count
-		FROM runnerq_activities
-		WHERE queue_name = $1
-		GROUP BY status`, b.queueName)
-	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to get stats: %v", err))
-	}
-	defer rows.Close()
-
+	// Use targeted counts against partial indexes instead of a full-table
+	// GROUP BY, which degrades linearly as completed rows accumulate.
 	stats := &storage.QueueStats{}
-	for rows.Next() {
-		var status string
-		var count int64
-		if err := rows.Scan(&status, &count); err != nil {
-			return nil, storage.NewInternalError(fmt.Sprintf("Failed to scan stats: %v", err))
-		}
-		switch status {
-		case "pending":
-			stats.Pending = uint64(count)
-		case "processing":
-			stats.Processing = uint64(count)
-		case "scheduled", "retrying":
-			stats.Scheduled += uint64(count)
-		case "dead_letter":
-			stats.DeadLetter = uint64(count)
-		}
+
+	err := b.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM runnerq_activities
+		WHERE queue_name = $1 AND status IN ('pending', 'scheduled', 'retrying')`,
+		b.queueName).Scan(&stats.Pending)
+	if err != nil {
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count pending: %v", err))
 	}
 
+	// Separate scheduled (scheduled + retrying) from pure pending.
+	var scheduledCount uint64
+	err = b.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM runnerq_activities
+		WHERE queue_name = $1 AND status IN ('scheduled', 'retrying')`,
+		b.queueName).Scan(&scheduledCount)
+	if err != nil {
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count scheduled: %v", err))
+	}
+	stats.Pending -= scheduledCount
+	stats.Scheduled = scheduledCount
+
+	err = b.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM runnerq_activities
+		WHERE queue_name = $1 AND status = 'processing'`,
+		b.queueName).Scan(&stats.Processing)
+	if err != nil {
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count processing: %v", err))
+	}
+
+	err = b.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM runnerq_activities
+		WHERE queue_name = $1 AND status = 'dead_letter'`,
+		b.queueName).Scan(&stats.DeadLetter)
+	if err != nil {
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count dead_letter: %v", err))
+	}
+
+	// Priority breakdown for pending activities — hits the dequeue partial index.
 	pRows, err := b.pool.Query(ctx, `
 		SELECT priority, COUNT(*) as count
 		FROM runnerq_activities
@@ -901,7 +913,7 @@ func (b *PostgresBackend) ListCompletedNonCron(ctx context.Context, offset, limi
 		FROM runnerq_activities
 		WHERE queue_name = $1 AND status IN ('completed', 'failed')
 		  AND (metadata->>'source') IS DISTINCT FROM 'cron'
-		ORDER BY completed_at DESC NULLS LAST, created_at DESC
+		ORDER BY completed_at DESC, created_at DESC
 		LIMIT $2 OFFSET $3`,
 		b.queueName, limit, offset)
 	if err != nil {
@@ -922,7 +934,7 @@ func (b *PostgresBackend) ListCompletedCron(ctx context.Context, offset, limit i
 		FROM runnerq_activities
 		WHERE queue_name = $1 AND status IN ('completed', 'failed')
 		  AND metadata->>'source' = 'cron'
-		ORDER BY completed_at DESC NULLS LAST, created_at DESC
+		ORDER BY completed_at DESC, created_at DESC
 		LIMIT $2 OFFSET $3`,
 		b.queueName, limit, offset)
 	if err != nil {
