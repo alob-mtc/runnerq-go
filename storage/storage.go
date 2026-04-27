@@ -38,18 +38,19 @@ const (
 
 // QueuedActivity represents an activity ready to be enqueued.
 type QueuedActivity struct {
-	ID                uuid.UUID
-	ActivityType      string
-	Payload           json.RawMessage
-	Priority          ActivityPriority
-	MaxRetries        uint32
-	RetryCount        uint32
-	TimeoutSeconds    uint64
-	RetryDelaySeconds uint64
-	ScheduledAt       *time.Time
-	Metadata          map[string]string
-	IdempotencyKey    *IdempotencyKeyConfig
-	CreatedAt         time.Time
+	ID                   uuid.UUID
+	ActivityType         string
+	Payload              json.RawMessage
+	Priority             ActivityPriority
+	MaxRetries           uint32
+	RetryCount           uint32
+	TimeoutSeconds       uint64
+	RetryDelaySeconds    uint64
+	MaxRetryDelaySeconds uint64
+	ScheduledAt          *time.Time
+	Metadata             map[string]string
+	IdempotencyKey       *IdempotencyKeyConfig
+	CreatedAt            time.Time
 }
 
 // IdempotencyKeyConfig holds a key and its behavior.

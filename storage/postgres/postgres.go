@@ -221,12 +221,14 @@ func (b *PostgresBackend) Enqueue(ctx context.Context, a storage.QueuedActivity)
 		INSERT INTO runnerq_activities (
 			id, queue_name, activity_type, payload, priority, status,
 			created_at, scheduled_at, retry_count, max_retries,
-			timeout_seconds, retry_delay_seconds, metadata, idempotency_key
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+			timeout_seconds, retry_delay_seconds, max_retry_delay_seconds,
+			metadata, idempotency_key
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
 		a.ID, b.queueName, a.ActivityType, a.Payload,
 		priorityToInt(a.Priority), status, a.CreatedAt, a.ScheduledAt,
 		int32(a.RetryCount), int32(a.MaxRetries),
 		int64(a.TimeoutSeconds), int64(a.RetryDelaySeconds),
+		int64(a.MaxRetryDelaySeconds),
 		metadataJSON, idempotencyKey)
 	if err != nil {
 		return storage.NewInternalError(fmt.Sprintf("Failed to enqueue activity: %v", err))
@@ -293,15 +295,16 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, _ time.D
 			FOR UPDATE SKIP LOCKED
 		)
 		RETURNING id, activity_type, payload, priority, retry_count, max_retries,
-			timeout_seconds, retry_delay_seconds, scheduled_at, metadata,
-			idempotency_key, created_at`,
+			timeout_seconds, retry_delay_seconds, max_retry_delay_seconds,
+			scheduled_at, metadata, idempotency_key, created_at`,
 		workerID, deadline.UnixMilli(), now, b.queueName, now, types)
 
 	var ar activityRow
 	err = row.Scan(
 		&ar.id, &ar.activityType, &ar.payload, &ar.priority,
 		&ar.retryCount, &ar.maxRetries, &ar.timeoutSeconds,
-		&ar.retryDelaySeconds, &ar.scheduledAt, &ar.metadata,
+		&ar.retryDelaySeconds, &ar.maxRetryDelaySeconds,
+		&ar.scheduledAt, &ar.metadata,
 		&ar.idempotencyKey, &ar.createdAt)
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -410,12 +413,12 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 	// Lock the activity row
 	var ar activityRow
 	err = tx.QueryRow(ctx, `
-		SELECT id, retry_count, max_retries, retry_delay_seconds
+		SELECT id, retry_count, max_retries, retry_delay_seconds, max_retry_delay_seconds
 		FROM runnerq_activities
 		WHERE id = $1 AND queue_name = $2 AND status = 'processing' AND current_worker_id = $3
 		FOR UPDATE`,
 		activityID, b.queueName, workerID).Scan(
-		&ar.id, &ar.retryCount, &ar.maxRetries, &ar.retryDelaySeconds)
+		&ar.id, &ar.retryCount, &ar.maxRetries, &ar.retryDelaySeconds, &ar.maxRetryDelaySeconds)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return false, storage.NewNotFoundError(fmt.Sprintf("Activity %s not found or not claimed by this worker", activityID))
@@ -461,15 +464,19 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 	canRetry := ar.maxRetries == 0 || (ar.retryCount+1) < ar.maxRetries
 
 	if canRetry {
-		const maxRetryDelaySec = int64(math.MaxInt64 / int64(time.Second))
+		const overflowCap = int64(math.MaxInt64 / int64(time.Second))
 		baseDelay := int64(ar.retryDelaySeconds)
 		shift := min(ar.retryCount+1, 62)
 		backoffMult := int64(1) << shift
-		retryDelay := maxRetryDelaySec
-		if baseDelay > 0 && baseDelay <= maxRetryDelaySec/backoffMult {
+		retryDelay := overflowCap
+		if baseDelay > 0 && baseDelay <= overflowCap/backoffMult {
 			retryDelay = baseDelay * backoffMult
 		} else if baseDelay <= 0 {
 			retryDelay = 0
+		}
+		// Apply per-activity max retry delay cap.
+		if ar.maxRetryDelaySeconds > 0 && retryDelay > ar.maxRetryDelaySeconds {
+			retryDelay = ar.maxRetryDelaySeconds
 		}
 		scheduledAt := now.Add(time.Duration(retryDelay) * time.Second)
 		newRetryCount := ar.retryCount + 1
@@ -1097,11 +1104,12 @@ type activityRow struct {
 	completedAt       *time.Time
 	currentWorkerID   *string
 	lastWorkerID      *string
-	retryCount        int32
-	maxRetries        int32
-	timeoutSeconds    int64
-	retryDelaySeconds int64
-	lastError         *string
+	retryCount           int32
+	maxRetries           int32
+	timeoutSeconds       int64
+	retryDelaySeconds    int64
+	maxRetryDelaySeconds int64
+	lastError            *string
 	lastErrorAt       *time.Time
 	metadata          json.RawMessage
 	idempotencyKey    *string
@@ -1123,18 +1131,19 @@ func (r *activityRow) toQueuedActivity() *storage.QueuedActivity {
 	}
 
 	return &storage.QueuedActivity{
-		ID:                r.id,
-		ActivityType:      r.activityType,
-		Payload:           r.payload,
-		Priority:          intToPriority(r.priority),
-		MaxRetries:        uint32(r.maxRetries),
-		RetryCount:        uint32(r.retryCount),
-		TimeoutSeconds:    uint64(r.timeoutSeconds),
-		RetryDelaySeconds: uint64(r.retryDelaySeconds),
-		ScheduledAt:       r.scheduledAt,
-		Metadata:          meta,
-		IdempotencyKey:    idempKey,
-		CreatedAt:         r.createdAt,
+		ID:                   r.id,
+		ActivityType:         r.activityType,
+		Payload:              r.payload,
+		Priority:             intToPriority(r.priority),
+		MaxRetries:           uint32(r.maxRetries),
+		RetryCount:           uint32(r.retryCount),
+		TimeoutSeconds:       uint64(r.timeoutSeconds),
+		RetryDelaySeconds:    uint64(r.retryDelaySeconds),
+		MaxRetryDelaySeconds: uint64(r.maxRetryDelaySeconds),
+		ScheduledAt:          r.scheduledAt,
+		Metadata:             meta,
+		IdempotencyKey:       idempKey,
+		CreatedAt:            r.createdAt,
 	}
 }
 

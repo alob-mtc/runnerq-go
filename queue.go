@@ -72,18 +72,19 @@ func activityToQueued(a *activity) storage.QueuedActivity {
 		}
 	}
 	return storage.QueuedActivity{
-		ID:                a.ID,
-		ActivityType:      a.ActivityType,
-		Payload:           a.Payload,
-		Priority:          storage.ActivityPriority(a.Priority),
-		MaxRetries:        a.MaxRetries,
-		RetryCount:        a.RetryCount,
-		TimeoutSeconds:    a.TimeoutSeconds,
-		RetryDelaySeconds: a.RetryDelaySeconds,
-		ScheduledAt:       a.ScheduledAt,
-		Metadata:          a.Metadata,
-		IdempotencyKey:    idempKey,
-		CreatedAt:         a.CreatedAt,
+		ID:                   a.ID,
+		ActivityType:         a.ActivityType,
+		Payload:              a.Payload,
+		Priority:             storage.ActivityPriority(a.Priority),
+		MaxRetries:           a.MaxRetries,
+		RetryCount:           a.RetryCount,
+		TimeoutSeconds:       a.TimeoutSeconds,
+		RetryDelaySeconds:    a.RetryDelaySeconds,
+		MaxRetryDelaySeconds: a.MaxRetryDelaySeconds,
+		ScheduledAt:          a.ScheduledAt,
+		Metadata:             a.Metadata,
+		IdempotencyKey:       idempKey,
+		CreatedAt:            a.CreatedAt,
 	}
 }
 
@@ -96,19 +97,20 @@ func queuedToActivity(q *storage.QueuedActivity) *activity {
 		}
 	}
 	return &activity{
-		ID:                q.ID,
-		ActivityType:      q.ActivityType,
-		Payload:           q.Payload,
-		Priority:          ActivityPriority(q.Priority),
-		Status:            StatusPending,
-		CreatedAt:         q.CreatedAt,
-		ScheduledAt:       q.ScheduledAt,
-		RetryCount:        q.RetryCount,
-		MaxRetries:        q.MaxRetries,
-		TimeoutSeconds:    q.TimeoutSeconds,
-		RetryDelaySeconds: q.RetryDelaySeconds,
-		Metadata:          q.Metadata,
-		IdempotencyKey:    idempKey,
+		ID:                   q.ID,
+		ActivityType:         q.ActivityType,
+		Payload:              q.Payload,
+		Priority:             ActivityPriority(q.Priority),
+		Status:               StatusPending,
+		CreatedAt:            q.CreatedAt,
+		ScheduledAt:          q.ScheduledAt,
+		RetryCount:           q.RetryCount,
+		MaxRetries:           q.MaxRetries,
+		TimeoutSeconds:       q.TimeoutSeconds,
+		RetryDelaySeconds:    q.RetryDelaySeconds,
+		MaxRetryDelaySeconds: q.MaxRetryDelaySeconds,
+		Metadata:             q.Metadata,
+		IdempotencyKey:       idempKey,
 	}
 }
 

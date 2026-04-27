@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS runnerq_activities (
     max_retries INTEGER NOT NULL DEFAULT 3,
     timeout_seconds BIGINT NOT NULL DEFAULT 300,
     retry_delay_seconds BIGINT NOT NULL DEFAULT 60,
+    max_retry_delay_seconds BIGINT NOT NULL DEFAULT 3600,
     last_error TEXT,
     last_error_at TIMESTAMPTZ,
     metadata JSONB,

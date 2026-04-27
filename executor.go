@@ -54,6 +54,7 @@ type ActivityBuilder struct {
 	priority       *ActivityPriority
 	maxRetries     *uint32
 	timeout        *time.Duration
+	maxRetryDelay  *time.Duration
 	delay          *time.Duration
 	idempotencyKey *IdempotencyConfig
 	metadata       map[string]string
@@ -80,6 +81,13 @@ func (b *ActivityBuilder) MaxRetries(retries uint32) *ActivityBuilder {
 // Timeout sets the maximum execution time.
 func (b *ActivityBuilder) Timeout(d time.Duration) *ActivityBuilder {
 	b.timeout = &d
+	return b
+}
+
+// MaxRetryDelay caps the exponential backoff delay between retries.
+// Defaults to 1 hour if not set.
+func (b *ActivityBuilder) MaxRetryDelay(d time.Duration) *ActivityBuilder {
+	b.maxRetryDelay = &d
 	return b
 }
 
@@ -125,7 +133,7 @@ func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) 
 		return nil, &WorkerError{Kind: ErrQueue, Message: "Activity payload is required"}
 	}
 
-	hasOption := b.priority != nil || b.maxRetries != nil || b.timeout != nil || b.delay != nil || b.idempotencyKey != nil || len(b.metadata) > 0
+	hasOption := b.priority != nil || b.maxRetries != nil || b.timeout != nil || b.maxRetryDelay != nil || b.delay != nil || b.idempotencyKey != nil || len(b.metadata) > 0
 
 	var option *ActivityOption
 	if hasOption {
@@ -136,6 +144,11 @@ func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) 
 		timeoutSec := uint64(300)
 		if b.timeout != nil {
 			timeoutSec = uint64(b.timeout.Seconds())
+		}
+		var maxRetryDelaySec *uint64
+		if b.maxRetryDelay != nil {
+			d := uint64(b.maxRetryDelay.Seconds())
+			maxRetryDelaySec = &d
 		}
 		var delaySec *uint64
 		if b.delay != nil {
@@ -152,12 +165,13 @@ func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) 
 			metadata[k] = v
 		}
 		option = &ActivityOption{
-			Priority:       b.priority,
-			MaxRetries:     maxRetries,
-			TimeoutSeconds: timeoutSec,
-			DelaySeconds:   delaySec,
-			IdempotencyKey: idempKey,
-			Metadata:       metadata,
+			Priority:             b.priority,
+			MaxRetries:           maxRetries,
+			TimeoutSeconds:       timeoutSec,
+			MaxRetryDelaySeconds: maxRetryDelaySec,
+			DelaySeconds:         delaySec,
+			IdempotencyKey:       idempKey,
+			Metadata:             metadata,
 		}
 	}
 
