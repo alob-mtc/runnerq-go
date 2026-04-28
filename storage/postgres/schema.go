@@ -49,6 +49,10 @@ CREATE INDEX IF NOT EXISTS idx_runnerq_completed_cron
     WHERE status IN ('completed', 'failed')
       AND metadata->>'source' = 'cron';
 
+-- Migration: add column for existing deployments (idempotent, metadata-only on PG 11+).
+ALTER TABLE runnerq_activities
+    ADD COLUMN IF NOT EXISTS max_retry_delay_seconds BIGINT NOT NULL DEFAULT 3600;
+
 -- Idempotency keys table
 CREATE TABLE IF NOT EXISTS runnerq_idempotency (
     queue_name TEXT NOT NULL,

@@ -85,8 +85,12 @@ func (b *ActivityBuilder) Timeout(d time.Duration) *ActivityBuilder {
 }
 
 // MaxRetryDelay caps the exponential backoff delay between retries.
-// Defaults to 1 hour if not set.
+// Defaults to 1 hour if not set. Non-positive durations are ignored.
+// Values below 1 second are rounded up to 1 second.
 func (b *ActivityBuilder) MaxRetryDelay(d time.Duration) *ActivityBuilder {
+	if d <= 0 {
+		return b
+	}
 	b.maxRetryDelay = &d
 	return b
 }
@@ -147,8 +151,11 @@ func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) 
 		}
 		var maxRetryDelaySec *uint64
 		if b.maxRetryDelay != nil {
-			d := uint64(b.maxRetryDelay.Seconds())
-			maxRetryDelaySec = &d
+			secs := uint64(b.maxRetryDelay.Seconds())
+			if secs == 0 {
+				secs = 1
+			}
+			maxRetryDelaySec = &secs
 		}
 		var delaySec *uint64
 		if b.delay != nil {
