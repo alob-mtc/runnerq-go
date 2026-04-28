@@ -474,9 +474,13 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		} else if baseDelay <= 0 {
 			retryDelay = 0
 		}
-		// Apply per-activity max retry delay cap.
-		if ar.maxRetryDelaySeconds > 0 && retryDelay > ar.maxRetryDelaySeconds {
-			retryDelay = ar.maxRetryDelaySeconds
+		// Apply per-activity max retry delay cap (0 = use default 3600s).
+		maxCap := ar.maxRetryDelaySeconds
+		if maxCap <= 0 {
+			maxCap = 3600
+		}
+		if retryDelay > maxCap {
+			retryDelay = maxCap
 		}
 		scheduledAt := now.Add(time.Duration(retryDelay) * time.Second)
 		newRetryCount := ar.retryCount + 1
