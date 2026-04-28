@@ -90,12 +90,13 @@ const (
 
 // ActivityOption configures an activity's execution parameters.
 type ActivityOption struct {
-	Priority       *ActivityPriority
-	MaxRetries     uint32
-	TimeoutSeconds uint64
-	DelaySeconds   *uint64
-	IdempotencyKey *IdempotencyConfig
-	Metadata       map[string]string
+	Priority             *ActivityPriority
+	MaxRetries           uint32
+	TimeoutSeconds       uint64
+	MaxRetryDelaySeconds *uint64
+	DelaySeconds         *uint64
+	IdempotencyKey       *IdempotencyConfig
+	Metadata             map[string]string
 }
 
 // IdempotencyConfig holds idempotency key and its behavior.
@@ -106,25 +107,27 @@ type IdempotencyConfig struct {
 
 // activity is an internal representation of an activity to be processed.
 type activity struct {
-	ID                uuid.UUID          `json:"id"`
-	ActivityType      string             `json:"activity_type"`
-	Payload           json.RawMessage    `json:"payload"`
-	Priority          ActivityPriority   `json:"priority"`
-	Status            ActivityStatus     `json:"status"`
-	CreatedAt         time.Time          `json:"created_at"`
-	ScheduledAt       *time.Time         `json:"scheduled_at,omitempty"`
-	RetryCount        uint32             `json:"retry_count"`
-	MaxRetries        uint32             `json:"max_retries"`
-	TimeoutSeconds    uint64             `json:"timeout_seconds"`
-	RetryDelaySeconds uint64             `json:"retry_delay_seconds"`
-	Metadata          map[string]string  `json:"metadata"`
-	IdempotencyKey    *IdempotencyConfig `json:"idempotency_key,omitempty"`
+	ID                   uuid.UUID          `json:"id"`
+	ActivityType         string             `json:"activity_type"`
+	Payload              json.RawMessage    `json:"payload"`
+	Priority             ActivityPriority   `json:"priority"`
+	Status               ActivityStatus     `json:"status"`
+	CreatedAt            time.Time          `json:"created_at"`
+	ScheduledAt          *time.Time         `json:"scheduled_at,omitempty"`
+	RetryCount           uint32             `json:"retry_count"`
+	MaxRetries           uint32             `json:"max_retries"`
+	TimeoutSeconds       uint64             `json:"timeout_seconds"`
+	RetryDelaySeconds    uint64             `json:"retry_delay_seconds"`
+	MaxRetryDelaySeconds uint64             `json:"max_retry_delay_seconds"`
+	Metadata             map[string]string  `json:"metadata"`
+	IdempotencyKey       *IdempotencyConfig `json:"idempotency_key,omitempty"`
 }
 
 func newActivity(activityType string, payload json.RawMessage, option *ActivityOption) *activity {
 	priority := PriorityNormal
 	maxRetries := uint32(3)
 	timeoutSeconds := uint64(300)
+	maxRetryDelaySeconds := uint64(3600) // default: 1 hour cap
 	var scheduledAt *time.Time
 	var idempotencyKey *IdempotencyConfig
 
@@ -134,6 +137,9 @@ func newActivity(activityType string, payload json.RawMessage, option *ActivityO
 		}
 		maxRetries = option.MaxRetries
 		timeoutSeconds = option.TimeoutSeconds
+		if option.MaxRetryDelaySeconds != nil {
+			maxRetryDelaySeconds = *option.MaxRetryDelaySeconds
+		}
 		if option.DelaySeconds != nil {
 			t := time.Now().UTC().Add(time.Duration(*option.DelaySeconds) * time.Second)
 			scheduledAt = &t
@@ -149,18 +155,19 @@ func newActivity(activityType string, payload json.RawMessage, option *ActivityO
 	}
 
 	return &activity{
-		ID:                uuid.New(),
-		ActivityType:      activityType,
-		Payload:           payload,
-		Priority:          priority,
-		Status:            StatusPending,
-		CreatedAt:         time.Now().UTC(),
-		ScheduledAt:       scheduledAt,
-		RetryCount:        0,
-		MaxRetries:        maxRetries,
-		TimeoutSeconds:    timeoutSeconds,
-		RetryDelaySeconds: 1,
-		Metadata:          metadata,
-		IdempotencyKey:    idempotencyKey,
+		ID:                   uuid.New(),
+		ActivityType:         activityType,
+		Payload:              payload,
+		Priority:             priority,
+		Status:               StatusPending,
+		CreatedAt:            time.Now().UTC(),
+		ScheduledAt:          scheduledAt,
+		RetryCount:           0,
+		MaxRetries:           maxRetries,
+		TimeoutSeconds:       timeoutSeconds,
+		RetryDelaySeconds:    1,
+		MaxRetryDelaySeconds: maxRetryDelaySeconds,
+		Metadata:             metadata,
+		IdempotencyKey:       idempotencyKey,
 	}
 }

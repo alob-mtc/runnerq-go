@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS runnerq_activities (
     max_retries INTEGER NOT NULL DEFAULT 3,
     timeout_seconds BIGINT NOT NULL DEFAULT 300,
     retry_delay_seconds BIGINT NOT NULL DEFAULT 60,
+    max_retry_delay_seconds BIGINT NOT NULL DEFAULT 0,
     last_error TEXT,
     last_error_at TIMESTAMPTZ,
     metadata JSONB,
@@ -50,6 +51,10 @@ CREATE INDEX IF NOT EXISTS idx_runnerq_completed_cron
 CREATE INDEX IF NOT EXISTS idx_runnerq_dead_letter
     ON runnerq_activities(queue_name, completed_at DESC)
     WHERE status = 'dead_letter';
+
+-- Migration: add column for existing deployments (idempotent, metadata-only on PG 11+).
+ALTER TABLE runnerq_activities
+    ADD COLUMN IF NOT EXISTS max_retry_delay_seconds BIGINT NOT NULL DEFAULT 0;
 
 -- Idempotency keys table
 CREATE TABLE IF NOT EXISTS runnerq_idempotency (
