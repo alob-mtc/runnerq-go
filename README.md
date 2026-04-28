@@ -701,7 +701,7 @@ The storage abstraction consists of two interfaces:
 - `ListDeadLetter()` - List dead-lettered activities
 - `GetActivity()` - Get specific activity details
 - `GetActivityEvents()` - Get activity lifecycle events
-- `EventStream()` - Stream real-time events (for SSE)
+- `EventStream()` - Stream real-time events (multiplexed via fan-out hub in `QueueInspector` — one connection serves all SSE subscribers)
 
 ### Graceful Shutdown
 
@@ -927,6 +927,39 @@ RunnerQ includes a built-in web-based observability console for monitoring and m
 - **Activity Results** - View execution results and outputs for completed activities
 - **Event Timeline** - Detailed activity lifecycle events with multiple view modes
 - **Zero Setup** - Embedded HTML, no build tools or npm required
+
+### SSE Fan-Out Architecture
+
+The real-time event stream uses a fan-out hub inside `QueueInspector` so that **all SSE
+subscribers share a single backend connection**, regardless of how many clients are
+connected.
+
+```text
+                        ┌──────────────┐
+  Backend.EventStream() │  notifyHub   │──► SSE client 1
+  (1 connection)  ─────►│  (inspector) │──► SSE client 2
+                        │   broadcast  │──► SSE client 3
+                        └──────────────┘
+                         lazy start/stop
+```
+
+**How it works:**
+
+- The first call to `SubscribeEvents()` lazily starts a single backend `EventStream`
+  listener (e.g. one PostgreSQL `LISTEN` connection).
+- Each additional subscriber gets its own buffered channel fed by non-blocking broadcast.
+  If a subscriber's channel is full (slow client), events are dropped for that subscriber
+  only — other subscribers are unaffected.
+- When the last subscriber disconnects, the backend connection is released automatically.
+- The HTTP layer enforces a concurrent SSE connection limit (default: 64). Requests beyond
+  this limit receive `503 Service Unavailable`.
+
+This design means 100 SSE clients consume 1 database connection instead of 100, eliminating
+connection pool exhaustion as a denial-of-service vector.
+
+**Custom backends** get fan-out for free — the hub operates on the `EventStream()` channel
+returned by any `InspectionStorage` implementation, so there is nothing backend-specific to
+implement.
 
 ### Quick Start
 

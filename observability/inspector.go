@@ -3,6 +3,8 @@ package observability
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
+	"sync"
 
 	"github.com/google/uuid"
 
@@ -13,11 +15,14 @@ import (
 type QueueInspector struct {
 	maxWorkers *int
 	backend    storage.InspectionStorage
+	hub        notifyHub
 }
 
 // NewQueueInspector creates a new inspector from an InspectionStorage backend.
 func NewQueueInspector(backend storage.InspectionStorage) *QueueInspector {
-	return &QueueInspector{backend: backend}
+	qi := &QueueInspector{backend: backend}
+	qi.hub.backend = backend
+	return qi
 }
 
 // WithMaxWorkers sets the max workers count for stats reporting.
@@ -27,21 +32,147 @@ func (q *QueueInspector) WithMaxWorkers(max int) *QueueInspector {
 }
 
 // EventStream returns a channel of real-time activity events.
+// Deprecated: Use SubscribeEvents for fan-out multiplexed access.
 func (q *QueueInspector) EventStream(ctx context.Context) (<-chan ActivityEvent, error) {
-	backendCh, err := q.backend.EventStream(ctx)
-	if err != nil {
-		return nil, err
+	return q.SubscribeEvents(ctx)
+}
+
+// SubscribeEvents returns a channel of real-time activity events backed by a
+// shared fan-out hub. Only one backend connection is used regardless of how
+// many subscribers are active. The returned channel is closed when ctx is
+// cancelled or the hub shuts down.
+func (q *QueueInspector) SubscribeEvents(ctx context.Context) (<-chan ActivityEvent, error) {
+	return q.hub.subscribe(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// notifyHub — single-connection fan-out broadcaster
+// ---------------------------------------------------------------------------
+
+type subscriber struct {
+	ch  chan ActivityEvent
+	ctx context.Context
+}
+
+type notifyHub struct {
+	backend storage.InspectionStorage
+
+	mu          sync.Mutex
+	subscribers map[uint64]subscriber
+	nextID      uint64
+	running     bool
+	cancel      context.CancelFunc
+}
+
+func (h *notifyHub) subscribe(ctx context.Context) (<-chan ActivityEvent, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.subscribers == nil {
+		h.subscribers = make(map[uint64]subscriber)
 	}
 
+	id := h.nextID
+	h.nextID++
 	ch := make(chan ActivityEvent, 100)
+	h.subscribers[id] = subscriber{ch: ch, ctx: ctx}
+
+	// Auto-unsubscribe when context cancels.
 	go func() {
-		defer close(ch)
-		for evt := range backendCh {
-			ch <- convertBackendEvent(evt)
-		}
+		<-ctx.Done()
+		h.unsubscribe(id)
 	}()
 
+	// Start the shared listener if not already running.
+	if !h.running {
+		if err := h.startLocked(); err != nil {
+			delete(h.subscribers, id)
+			close(ch)
+			return nil, err
+		}
+	}
+
 	return ch, nil
+}
+
+func (h *notifyHub) unsubscribe(id uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	sub, ok := h.subscribers[id]
+	if !ok {
+		return
+	}
+	close(sub.ch)
+	delete(h.subscribers, id)
+
+	// Stop the listener when no subscribers remain.
+	if len(h.subscribers) == 0 && h.cancel != nil {
+		h.cancel()
+		h.cancel = nil
+	}
+}
+
+// startLocked starts the backend listener goroutine. Caller must hold h.mu.
+func (h *notifyHub) startLocked() error {
+	ctx, cancel := context.WithCancel(context.Background())
+	backendCh, err := h.backend.EventStream(ctx)
+	if err != nil {
+		cancel()
+		return err
+	}
+
+	h.cancel = cancel
+	h.running = true
+
+	go h.broadcast(ctx, backendCh)
+	return nil
+}
+
+func (h *notifyHub) broadcast(ctx context.Context, backendCh <-chan storage.ActivityEvent) {
+	defer h.shutdown()
+
+	for {
+		select {
+		case evt, ok := <-backendCh:
+			if !ok {
+				return
+			}
+			converted := convertBackendEvent(evt)
+			h.mu.Lock()
+			for id, sub := range h.subscribers {
+				// Skip subscribers whose context has already cancelled.
+				if sub.ctx.Err() != nil {
+					continue
+				}
+				select {
+				case sub.ch <- converted:
+				default:
+					slog.Debug("Dropping event for slow subscriber", "subscriber_id", id)
+				}
+			}
+			h.mu.Unlock()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// shutdown transitions the hub to stopped under the lock, then closes all
+// subscriber channels. This prevents a race where subscribe sees running==true
+// and attaches to a dying generation.
+func (h *notifyHub) shutdown() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.running = false
+	for id, sub := range h.subscribers {
+		close(sub.ch)
+		delete(h.subscribers, id)
+	}
+	if h.cancel != nil {
+		h.cancel()
+		h.cancel = nil
+	}
 }
 
 // ListPending returns pending activities.
