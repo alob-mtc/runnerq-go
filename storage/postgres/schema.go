@@ -47,6 +47,9 @@ CREATE INDEX IF NOT EXISTS idx_runnerq_completed_cron
     ON runnerq_activities(queue_name, completed_at DESC, created_at DESC)
     WHERE status IN ('completed', 'failed')
       AND metadata->>'source' = 'cron';
+CREATE INDEX IF NOT EXISTS idx_runnerq_dead_letter
+    ON runnerq_activities(queue_name, completed_at DESC)
+    WHERE status = 'dead_letter';
 
 -- Idempotency keys table
 CREATE TABLE IF NOT EXISTS runnerq_idempotency (
