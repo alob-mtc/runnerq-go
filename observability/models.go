@@ -74,6 +74,9 @@ const (
 	EventRequeued      ActivityEventType = "Requeued"
 	EventLeaseExtended ActivityEventType = "LeaseExtended"
 	EventResultStored  ActivityEventType = "ResultStored"
+	// EventSpawnLinked records a secondary parent linking to an existing
+	// activity via idempotency reuse.
+	EventSpawnLinked ActivityEventType = "SpawnLinked"
 )
 
 // ActivityEvent records a lifecycle event for an activity.

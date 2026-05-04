@@ -163,6 +163,9 @@ const (
 	EventRequeued      ActivityEventType = "Requeued"
 	EventLeaseExtended ActivityEventType = "LeaseExtended"
 	EventResultStored  ActivityEventType = "ResultStored"
+	// EventSpawnLinked records a secondary parent's link to an existing activity
+	// when an idempotency reuse causes a different parent to claim ownership.
+	EventSpawnLinked ActivityEventType = "SpawnLinked"
 )
 
 // ActivityEvent records a lifecycle event.
@@ -200,6 +203,10 @@ type QueueStorage interface {
 	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
 	StoreResult(ctx context.Context, activityID uuid.UUID, result ActivityResult) error
 	CheckIdempotency(ctx context.Context, activity *QueuedActivity) (*uuid.UUID, error)
+	// RecordSpawnLinked records that parentID logically spawned childID, even
+	// though no new activity row was created (idempotency reuse). Best-effort:
+	// callers should log but not fail on errors.
+	RecordSpawnLinked(ctx context.Context, childID, parentID uuid.UUID) error
 	// SchedulesNatively returns true if dequeue handles scheduled activities natively.
 	SchedulesNatively() bool
 }

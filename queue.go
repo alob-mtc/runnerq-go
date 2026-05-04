@@ -43,6 +43,7 @@ type activityQueue interface {
 	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
 	StoreResult(ctx context.Context, activityID uuid.UUID, result activityResult) error
 	GetResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error)
+	RecordSpawnLinked(ctx context.Context, childID, parentID uuid.UUID) error
 	SchedulesNatively() bool
 }
 
@@ -244,6 +245,10 @@ func (a *backendQueueAdapter) GetResult(ctx context.Context, activityID uuid.UUI
 		Data:  data,
 		State: ResultState(backendResult.State),
 	}, nil
+}
+
+func (a *backendQueueAdapter) RecordSpawnLinked(ctx context.Context, childID, parentID uuid.UUID) error {
+	return a.backend.RecordSpawnLinked(ctx, childID, parentID)
 }
 
 func (a *backendQueueAdapter) SchedulesNatively() bool {

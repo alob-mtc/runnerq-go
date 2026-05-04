@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -269,6 +270,17 @@ func (w *WorkerEngineWrapper) executeActivity(ctx context.Context, activityType 
 		return nil, WorkerErrorFromStorage(err)
 	}
 	if existingID != nil {
+		// Idempotency reuse: a different parent is logically spawning the same
+		// child. The row's parent_activity_id stays as the original spawner;
+		// we record this secondary link as an event for full audit attribution.
+		if w.lineage != nil && !asRoot && *existingID != w.lineage.parentID {
+			if err := w.queue.RecordSpawnLinked(ctx, *existingID, w.lineage.parentID); err != nil {
+				slog.Warn("Failed to record spawn link",
+					"child_id", *existingID,
+					"parent_id", w.lineage.parentID,
+					"error", err)
+			}
+		}
 		return &ActivityFuture{queue: w.queue, activityID: *existingID}, nil
 	}
 

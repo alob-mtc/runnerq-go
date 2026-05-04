@@ -622,6 +622,24 @@ func (b *PostgresBackend) ExtendLease(ctx context.Context, activityID uuid.UUID,
 	return false, nil
 }
 
+func (b *PostgresBackend) RecordSpawnLinked(ctx context.Context, childID, parentID uuid.UUID) error {
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+	}
+	defer tx.Rollback(ctx)
+
+	detail := toDetail(map[string]any{"parent_activity_id": parentID})
+	if err := b.recordEvent(ctx, tx, childID, storage.EventSpawnLinked, nil, detail); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to commit spawn_linked: %v", err))
+	}
+	return nil
+}
+
 func (b *PostgresBackend) StoreResult(ctx context.Context, activityID uuid.UUID, result storage.ActivityResult) error {
 	stateStr := "Ok"
 	if result.State == storage.ResultErr {
