@@ -217,19 +217,26 @@ func (b *PostgresBackend) Enqueue(ctx context.Context, a storage.QueuedActivity)
 	}
 	defer tx.Rollback(ctx)
 
+	rootID := a.RootActivityID
+	if rootID == (uuid.UUID{}) {
+		rootID = a.ID
+	}
+
 	_, err = tx.Exec(ctx, `
 		INSERT INTO runnerq_activities (
 			id, queue_name, activity_type, payload, priority, status,
 			created_at, scheduled_at, retry_count, max_retries,
 			timeout_seconds, retry_delay_seconds, max_retry_delay_seconds,
-			metadata, idempotency_key
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+			metadata, idempotency_key,
+			parent_activity_id, root_activity_id, depth
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
 		a.ID, b.queueName, a.ActivityType, a.Payload,
 		priorityToInt(a.Priority), status, a.CreatedAt, a.ScheduledAt,
 		int32(a.RetryCount), int32(a.MaxRetries),
 		int64(a.TimeoutSeconds), int64(a.RetryDelaySeconds),
 		int64(a.MaxRetryDelaySeconds),
-		metadataJSON, idempotencyKey)
+		metadataJSON, idempotencyKey,
+		a.ParentActivityID, rootID, int16(a.Depth))
 	if err != nil {
 		return storage.NewInternalError(fmt.Sprintf("Failed to enqueue activity: %v", err))
 	}
@@ -296,7 +303,8 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, _ time.D
 		)
 		RETURNING id, activity_type, payload, priority, retry_count, max_retries,
 			timeout_seconds, retry_delay_seconds, max_retry_delay_seconds,
-			scheduled_at, metadata, idempotency_key, created_at`,
+			scheduled_at, metadata, idempotency_key, created_at,
+			parent_activity_id, root_activity_id, depth`,
 		workerID, deadline.UnixMilli(), now, b.queueName, now, types)
 
 	var ar activityRow
@@ -305,7 +313,8 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, _ time.D
 		&ar.retryCount, &ar.maxRetries, &ar.timeoutSeconds,
 		&ar.retryDelaySeconds, &ar.maxRetryDelaySeconds,
 		&ar.scheduledAt, &ar.metadata,
-		&ar.idempotencyKey, &ar.createdAt)
+		&ar.idempotencyKey, &ar.createdAt,
+		&ar.parentActivityID, &ar.rootActivityID, &ar.depth)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, nil
@@ -868,7 +877,8 @@ func (b *PostgresBackend) listByStatus(ctx context.Context, status string, offse
 			scheduled_at, started_at, completed_at, current_worker_id,
 			last_worker_id, retry_count, max_retries, timeout_seconds,
 			retry_delay_seconds, last_error, last_error_at, metadata,
-			idempotency_key, lease_deadline_ms
+			idempotency_key, lease_deadline_ms,
+			parent_activity_id, root_activity_id, depth
 		FROM runnerq_activities
 		WHERE queue_name = $1 AND status = $2
 		ORDER BY priority DESC, retry_count DESC, created_at ASC
@@ -896,7 +906,8 @@ func (b *PostgresBackend) ListScheduled(ctx context.Context, offset, limit int) 
 			scheduled_at, started_at, completed_at, current_worker_id,
 			last_worker_id, retry_count, max_retries, timeout_seconds,
 			retry_delay_seconds, last_error, last_error_at, metadata,
-			idempotency_key, lease_deadline_ms
+			idempotency_key, lease_deadline_ms,
+			parent_activity_id, root_activity_id, depth
 		FROM runnerq_activities
 		WHERE queue_name = $1 AND status IN ('scheduled', 'retrying')
 		ORDER BY scheduled_at ASC, created_at ASC
@@ -920,7 +931,8 @@ func (b *PostgresBackend) ListCompletedNonCron(ctx context.Context, offset, limi
 			scheduled_at, started_at, completed_at, current_worker_id,
 			last_worker_id, retry_count, max_retries, timeout_seconds,
 			retry_delay_seconds, last_error, last_error_at, metadata,
-			idempotency_key, lease_deadline_ms
+			idempotency_key, lease_deadline_ms,
+			parent_activity_id, root_activity_id, depth
 		FROM runnerq_activities
 		WHERE queue_name = $1 AND status IN ('completed', 'failed')
 		  AND (metadata->>'source') IS DISTINCT FROM 'cron'
@@ -941,7 +953,8 @@ func (b *PostgresBackend) ListCompletedCron(ctx context.Context, offset, limit i
 			scheduled_at, started_at, completed_at, current_worker_id,
 			last_worker_id, retry_count, max_retries, timeout_seconds,
 			retry_delay_seconds, last_error, last_error_at, metadata,
-			idempotency_key, lease_deadline_ms
+			idempotency_key, lease_deadline_ms,
+			parent_activity_id, root_activity_id, depth
 		FROM runnerq_activities
 		WHERE queue_name = $1 AND status IN ('completed', 'failed')
 		  AND metadata->>'source' = 'cron'
@@ -962,7 +975,8 @@ func (b *PostgresBackend) ListDeadLetter(ctx context.Context, offset, limit int)
 			scheduled_at, started_at, completed_at, current_worker_id,
 			last_worker_id, retry_count, max_retries, timeout_seconds,
 			retry_delay_seconds, last_error, last_error_at, metadata,
-			idempotency_key, lease_deadline_ms
+			idempotency_key, lease_deadline_ms,
+			parent_activity_id, root_activity_id, depth
 		FROM runnerq_activities
 		WHERE queue_name = $1 AND status = 'dead_letter'
 		ORDER BY completed_at DESC
@@ -1004,7 +1018,8 @@ func (b *PostgresBackend) GetActivity(ctx context.Context, activityID uuid.UUID)
 			scheduled_at, started_at, completed_at, current_worker_id,
 			last_worker_id, retry_count, max_retries, timeout_seconds,
 			retry_delay_seconds, last_error, last_error_at, metadata,
-			idempotency_key, lease_deadline_ms
+			idempotency_key, lease_deadline_ms,
+			parent_activity_id, root_activity_id, depth
 		FROM runnerq_activities
 		WHERE id = $1 AND queue_name = $2`,
 		activityID, b.queueName)
@@ -1054,6 +1069,47 @@ func (b *PostgresBackend) GetActivityEvents(ctx context.Context, activityID uuid
 	}
 
 	return events, nil
+}
+
+func (b *PostgresBackend) GetChildren(ctx context.Context, parentID uuid.UUID, offset, limit int) ([]storage.ActivitySnapshot, error) {
+	rows, err := b.pool.Query(ctx, `
+		SELECT id, activity_type, payload, priority, status, created_at,
+			scheduled_at, started_at, completed_at, current_worker_id,
+			last_worker_id, retry_count, max_retries, timeout_seconds,
+			retry_delay_seconds, last_error, last_error_at, metadata,
+			idempotency_key, lease_deadline_ms,
+			parent_activity_id, root_activity_id, depth
+		FROM runnerq_activities
+		WHERE queue_name = $1 AND parent_activity_id = $2
+		ORDER BY created_at ASC
+		LIMIT $3 OFFSET $4`,
+		b.queueName, parentID, limit, offset)
+	if err != nil {
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list children: %v", err))
+	}
+	defer rows.Close()
+
+	return b.scanSnapshots(rows)
+}
+
+func (b *PostgresBackend) GetSubtree(ctx context.Context, rootID uuid.UUID) ([]storage.ActivitySnapshot, error) {
+	rows, err := b.pool.Query(ctx, `
+		SELECT id, activity_type, payload, priority, status, created_at,
+			scheduled_at, started_at, completed_at, current_worker_id,
+			last_worker_id, retry_count, max_retries, timeout_seconds,
+			retry_delay_seconds, last_error, last_error_at, metadata,
+			idempotency_key, lease_deadline_ms,
+			parent_activity_id, root_activity_id, depth
+		FROM runnerq_activities
+		WHERE queue_name = $1 AND root_activity_id = $2
+		ORDER BY depth ASC, created_at ASC`,
+		b.queueName, rootID)
+	if err != nil {
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to get subtree: %v", err))
+	}
+	defer rows.Close()
+
+	return b.scanSnapshots(rows)
 }
 
 func (b *PostgresBackend) EventStream(ctx context.Context) (<-chan storage.ActivityEvent, error) {
@@ -1130,6 +1186,9 @@ type activityRow struct {
 	metadata          json.RawMessage
 	idempotencyKey    *string
 	leaseDeadlineMS   *int64
+	parentActivityID  *uuid.UUID
+	rootActivityID    *uuid.UUID
+	depth             int16
 }
 
 func (r *activityRow) toQueuedActivity() *storage.QueuedActivity {
@@ -1146,6 +1205,10 @@ func (r *activityRow) toQueuedActivity() *storage.QueuedActivity {
 		}
 	}
 
+	rootID := r.id
+	if r.rootActivityID != nil {
+		rootID = *r.rootActivityID
+	}
 	return &storage.QueuedActivity{
 		ID:                   r.id,
 		ActivityType:         r.activityType,
@@ -1160,6 +1223,9 @@ func (r *activityRow) toQueuedActivity() *storage.QueuedActivity {
 		Metadata:             meta,
 		IdempotencyKey:       idempKey,
 		CreatedAt:            r.createdAt,
+		ParentActivityID:     r.parentActivityID,
+		RootActivityID:       rootID,
+		Depth:                uint16(r.depth),
 	}
 }
 
@@ -1219,6 +1285,9 @@ func (r *activityRow) toSnapshot() storage.ActivitySnapshot {
 		LeaseDeadlineMS:   r.leaseDeadlineMS,
 		ProcessingMember:  r.currentWorkerID,
 		IdempotencyKey:    r.idempotencyKey,
+		ParentActivityID:  r.parentActivityID,
+		RootActivityID:    r.rootActivityID,
+		Depth:             uint16(r.depth),
 	}
 }
 
@@ -1231,7 +1300,8 @@ func (b *PostgresBackend) scanSnapshots(rows pgx.Rows) ([]storage.ActivitySnapsh
 			&r.createdAt, &r.scheduledAt, &r.startedAt, &r.completedAt,
 			&r.currentWorkerID, &r.lastWorkerID, &r.retryCount, &r.maxRetries,
 			&r.timeoutSeconds, &r.retryDelaySeconds, &r.lastError, &r.lastErrorAt,
-			&r.metadata, &r.idempotencyKey, &r.leaseDeadlineMS)
+			&r.metadata, &r.idempotencyKey, &r.leaseDeadlineMS,
+			&r.parentActivityID, &r.rootActivityID, &r.depth)
 		if err != nil {
 			return nil, storage.NewInternalError(fmt.Sprintf("Failed to scan row: %v", err))
 		}

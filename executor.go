@@ -188,11 +188,44 @@ func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) 
 // WorkerEngineWrapper provides activity execution capabilities.
 // It implements ActivityExecutor.
 type WorkerEngineWrapper struct {
-	queue activityQueue
+	queue    activityQueue
+	maxDepth uint16
+	lineage  *lineageScope // nil at engine level; set when scoped to a running parent
+}
+
+// lineageScope captures the parent context that this wrapper applies to spawns.
+type lineageScope struct {
+	parentID  uuid.UUID
+	rootID    uuid.UUID
+	childDepth uint16 // depth of the CHILD being spawned (parent.Depth + 1)
 }
 
 func newWorkerEngineWrapper(queue activityQueue) *WorkerEngineWrapper {
-	return &WorkerEngineWrapper{queue: queue}
+	return &WorkerEngineWrapper{queue: queue, maxDepth: DefaultMaxActivityDepth}
+}
+
+func newWorkerEngineWrapperWithDepth(queue activityQueue, maxDepth uint16) *WorkerEngineWrapper {
+	if maxDepth == 0 {
+		maxDepth = DefaultMaxActivityDepth
+	}
+	return &WorkerEngineWrapper{queue: queue, maxDepth: maxDepth}
+}
+
+// scopedForChild returns a wrapper whose spawns will be tagged as children of parent.
+func (w *WorkerEngineWrapper) scopedForChild(parent *activity) *WorkerEngineWrapper {
+	rootID := parent.RootActivityID
+	if rootID == (uuid.UUID{}) {
+		rootID = parent.ID
+	}
+	return &WorkerEngineWrapper{
+		queue:    w.queue,
+		maxDepth: w.maxDepth,
+		lineage: &lineageScope{
+			parentID:   parent.ID,
+			rootID:     rootID,
+			childDepth: parent.Depth + 1,
+		},
+	}
 }
 
 // Activity creates a fluent activity builder.
@@ -205,6 +238,20 @@ func (w *WorkerEngineWrapper) Activity(activityType string) *ActivityBuilder {
 
 func (w *WorkerEngineWrapper) executeActivity(ctx context.Context, activityType string, payload json.RawMessage, option *ActivityOption) (*ActivityFuture, error) {
 	a := newActivity(activityType, payload, option)
+
+	if w.lineage != nil {
+		if w.lineage.childDepth > w.maxDepth {
+			return nil, &WorkerError{
+				Kind:    ErrDepthExceeded,
+				Message: fmt.Sprintf("activity depth %d exceeds max %d", w.lineage.childDepth, w.maxDepth),
+			}
+		}
+		p := w.lineage.parentID
+		a.ParentActivityID = &p
+		a.RootActivityID = w.lineage.rootID
+		a.Depth = w.lineage.childDepth
+	}
+
 	activityID := a.ID
 
 	existingID, err := w.queue.EvaluateIdempotencyRule(ctx, a)

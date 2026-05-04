@@ -54,6 +54,9 @@ type ActivitySnapshot struct {
 	LeaseDeadlineMS   *int64            `json:"lease_deadline_ms,omitempty"`
 	ProcessingMember  *string           `json:"processing_member,omitempty"`
 	IdempotencyKey    *string           `json:"idempotency_key,omitempty"`
+	ParentActivityID  *uuid.UUID        `json:"parent_activity_id,omitempty"`
+	RootActivityID    *uuid.UUID        `json:"root_activity_id,omitempty"`
+	Depth             uint16            `json:"depth"`
 }
 
 // ActivityEventType classifies lifecycle events.

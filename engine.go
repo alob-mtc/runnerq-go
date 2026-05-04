@@ -96,8 +96,9 @@ func (e *WorkerEngine) RegisterActivity(activityType string, handler ActivityHan
 }
 
 // GetActivityExecutor returns an ActivityExecutor for orchestrating activities.
+// Spawns made through the returned executor are roots (no parent lineage).
 func (e *WorkerEngine) GetActivityExecutor() ActivityExecutor {
-	return newWorkerEngineWrapper(e.queue)
+	return newWorkerEngineWrapperWithDepth(e.queue, e.config.MaxActivityDepth)
 }
 
 // Start starts the worker engine and blocks until shutdown or error.
@@ -261,13 +262,18 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, activityTimeout)
 	defer timeoutCancel()
 
+	scopedExecutor := newWorkerEngineWrapperWithDepth(e.queue, e.config.MaxActivityDepth).scopedForChild(act)
+
 	actCtx := ActivityContext{
 		ActivityID:       activityID,
 		ActivityType:     activityType,
 		RetryCount:       act.RetryCount,
 		Metadata:         act.Metadata,
 		Ctx:              timeoutCtx,
-		ActivityExecutor: newWorkerEngineWrapper(e.queue),
+		ActivityExecutor: scopedExecutor,
+		ParentActivityID: act.ParentActivityID,
+		RootActivityID:   act.RootActivityID,
+		Depth:            act.Depth,
 	}
 
 	payloadForDL := make(json.RawMessage, len(act.Payload))
@@ -353,7 +359,10 @@ func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity
 			RetryCount:       0,
 			Metadata:         make(map[string]string),
 			Ctx:              ctx,
-			ActivityExecutor: newWorkerEngineWrapper(e.queue),
+			ActivityExecutor: newWorkerEngineWrapperWithDepth(e.queue, e.config.MaxActivityDepth).scopedForChild(act),
+			ParentActivityID: act.ParentActivityID,
+			RootActivityID:   act.RootActivityID,
+			Depth:            act.Depth,
 		}
 		handler.OnDeadLetter(dlCtx, payloadForDL, reason)
 	}
@@ -402,7 +411,10 @@ func (e *WorkerEngine) handleTimeout(ctx context.Context, act *activity, handler
 			RetryCount:       0,
 			Metadata:         make(map[string]string),
 			Ctx:              ctx,
-			ActivityExecutor: newWorkerEngineWrapper(e.queue),
+			ActivityExecutor: newWorkerEngineWrapperWithDepth(e.queue, e.config.MaxActivityDepth).scopedForChild(act),
+			ParentActivityID: act.ParentActivityID,
+			RootActivityID:   act.RootActivityID,
+			Depth:            act.Depth,
 		}
 		handler.OnDeadLetter(dlCtx, payloadForDL, errorMsg)
 	}

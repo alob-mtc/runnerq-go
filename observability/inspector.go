@@ -262,6 +262,24 @@ func (q *QueueInspector) GetResult(ctx context.Context, activityID uuid.UUID) (j
 	return r.Data, nil
 }
 
+// GetChildren returns direct children of a parent activity.
+func (q *QueueInspector) GetChildren(ctx context.Context, parentID uuid.UUID, offset, limit int) ([]ActivitySnapshot, error) {
+	snapshots, err := q.backend.GetChildren(ctx, parentID, offset, limit)
+	if err != nil {
+		return nil, err
+	}
+	return convertSnapshots(snapshots), nil
+}
+
+// GetSubtree returns all activities in the lineage tree rooted at rootID.
+func (q *QueueInspector) GetSubtree(ctx context.Context, rootID uuid.UUID) ([]ActivitySnapshot, error) {
+	snapshots, err := q.backend.GetSubtree(ctx, rootID)
+	if err != nil {
+		return nil, err
+	}
+	return convertSnapshots(snapshots), nil
+}
+
 // RecentEvents returns recent events for a specific activity.
 func (q *QueueInspector) RecentEvents(ctx context.Context, activityID uuid.UUID, limit int) ([]ActivityEvent, error) {
 	events, err := q.backend.GetActivityEvents(ctx, activityID, limit)
@@ -322,6 +340,9 @@ func convertSnapshot(s storage.ActivitySnapshot) ActivitySnapshot {
 		LastErrorAt:       s.LastErrorAt,
 		StatusUpdatedAt:   s.StatusUpdatedAt,
 		IdempotencyKey:    s.IdempotencyKey,
+		ParentActivityID:  s.ParentActivityID,
+		RootActivityID:    s.RootActivityID,
+		Depth:             s.Depth,
 	}
 }
 

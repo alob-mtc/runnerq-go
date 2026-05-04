@@ -121,6 +121,9 @@ type activity struct {
 	MaxRetryDelaySeconds uint64             `json:"max_retry_delay_seconds"`
 	Metadata             map[string]string  `json:"metadata"`
 	IdempotencyKey       *IdempotencyConfig `json:"idempotency_key,omitempty"`
+	ParentActivityID     *uuid.UUID         `json:"parent_activity_id,omitempty"`
+	RootActivityID       uuid.UUID          `json:"root_activity_id"`
+	Depth                uint16             `json:"depth"`
 }
 
 func newActivity(activityType string, payload json.RawMessage, option *ActivityOption) *activity {
@@ -154,8 +157,9 @@ func newActivity(activityType string, payload json.RawMessage, option *ActivityO
 		}
 	}
 
+	id := uuid.New()
 	return &activity{
-		ID:                   uuid.New(),
+		ID:                   id,
 		ActivityType:         activityType,
 		Payload:              payload,
 		Priority:             priority,
@@ -169,5 +173,7 @@ func newActivity(activityType string, payload json.RawMessage, option *ActivityO
 		MaxRetryDelaySeconds: maxRetryDelaySeconds,
 		Metadata:             metadata,
 		IdempotencyKey:       idempotencyKey,
+		RootActivityID:       id,
+		Depth:                0,
 	}
 }

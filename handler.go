@@ -25,7 +25,18 @@ type ActivityContext struct {
 	Ctx context.Context
 
 	// ActivityExecutor allows executing other activities from within a handler.
+	// Spawns made through this executor are tagged as children of this activity.
 	ActivityExecutor ActivityExecutor
+
+	// ParentActivityID is the direct parent of this activity, if any.
+	ParentActivityID *uuid.UUID
+
+	// RootActivityID is the root of the lineage tree this activity belongs to.
+	// For root activities, RootActivityID equals ActivityID.
+	RootActivityID uuid.UUID
+
+	// Depth is the lineage depth of this activity (0 for roots).
+	Depth uint16
 }
 
 // ActivityHandler is the interface that all activity handlers must implement.

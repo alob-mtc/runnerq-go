@@ -85,6 +85,9 @@ func activityToQueued(a *activity) storage.QueuedActivity {
 		Metadata:             a.Metadata,
 		IdempotencyKey:       idempKey,
 		CreatedAt:            a.CreatedAt,
+		ParentActivityID:     a.ParentActivityID,
+		RootActivityID:       a.RootActivityID,
+		Depth:                a.Depth,
 	}
 }
 
@@ -95,6 +98,10 @@ func queuedToActivity(q *storage.QueuedActivity) *activity {
 			Key:      q.IdempotencyKey.Key,
 			Behavior: storageBehaviorToOnDuplicate(q.IdempotencyKey.Behavior),
 		}
+	}
+	rootID := q.RootActivityID
+	if rootID == (uuid.UUID{}) {
+		rootID = q.ID
 	}
 	return &activity{
 		ID:                   q.ID,
@@ -111,6 +118,9 @@ func queuedToActivity(q *storage.QueuedActivity) *activity {
 		MaxRetryDelaySeconds: q.MaxRetryDelaySeconds,
 		Metadata:             q.Metadata,
 		IdempotencyKey:       idempKey,
+		ParentActivityID:     q.ParentActivityID,
+		RootActivityID:       rootID,
+		Depth:                q.Depth,
 	}
 }
 
