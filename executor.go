@@ -58,6 +58,7 @@ type ActivityBuilder struct {
 	delay          *time.Duration
 	idempotencyKey *IdempotencyConfig
 	metadata       map[string]string
+	asRoot         bool
 }
 
 // Payload sets the JSON payload for the activity.
@@ -113,6 +114,15 @@ func (b *ActivityBuilder) Metadata(key, value string) *ActivityBuilder {
 		b.metadata = make(map[string]string)
 	}
 	b.metadata[key] = value
+	return b
+}
+
+// AsRoot detaches this spawn from its parent's lineage. The resulting activity
+// becomes a root (no parent, root is itself, depth 0) regardless of the
+// surrounding handler context. Use for fire-and-forget side jobs whose lifecycle
+// is logically independent of the parent (audit logs, async telemetry, etc.).
+func (b *ActivityBuilder) AsRoot() *ActivityBuilder {
+	b.asRoot = true
 	return b
 }
 
@@ -182,7 +192,7 @@ func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) 
 		}
 	}
 
-	return b.wrapper.executeActivity(ctx, b.activityType, b.payload, option)
+	return b.wrapper.executeActivity(ctx, b.activityType, b.payload, option, b.asRoot)
 }
 
 // WorkerEngineWrapper provides activity execution capabilities.
@@ -236,10 +246,10 @@ func (w *WorkerEngineWrapper) Activity(activityType string) *ActivityBuilder {
 	}
 }
 
-func (w *WorkerEngineWrapper) executeActivity(ctx context.Context, activityType string, payload json.RawMessage, option *ActivityOption) (*ActivityFuture, error) {
+func (w *WorkerEngineWrapper) executeActivity(ctx context.Context, activityType string, payload json.RawMessage, option *ActivityOption, asRoot bool) (*ActivityFuture, error) {
 	a := newActivity(activityType, payload, option)
 
-	if w.lineage != nil {
+	if w.lineage != nil && !asRoot {
 		if w.lineage.childDepth > w.maxDepth {
 			return nil, &WorkerError{
 				Kind:    ErrDepthExceeded,
