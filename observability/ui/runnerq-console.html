@@ -1521,6 +1521,9 @@ function RunsListPage({ tick }) {
   if (err) return <div className="empty-state"><div className="big">Failed to load</div><div>{err}</div></div>;
   if (!stats || !roots) return <div className="empty-state">Loading…</div>;
 
+  // Filter pills count rows in the loaded batch — they're a UI control over
+  // the visible table, so batch-derived is correct. KPI cards above are
+  // queue-wide via /stats and don't depend on page limit.
   const counts = { total: roots.length };
   const typeCountMap = {};
   roots.forEach(r => {
@@ -1528,17 +1531,6 @@ function RunsListPage({ tick }) {
     counts[sc] = (counts[sc] || 0) + 1;
     typeCountMap[r.activity_type] = (typeCountMap[r.activity_type] || 0) + 1;
   });
-  // KPI counts derive from the loaded batch so the cards and the table agree.
-  // Workers stays from /stats — that's an engine-wide metric, not a row count.
-  const kpi = {
-    running:    counts.running    || 0,
-    pending:    counts.pending    || 0,
-    scheduled:  counts.scheduled  || 0,
-    retrying:   counts.retrying   || 0,
-    completed:  counts.completed  || 0,
-    failed:     counts.failed     || 0,
-    deadletter: counts.deadletter || 0,
-  };
   const types = Object.entries(typeCountMap)
     .map(([name, count]) => ({ name, count }))
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
@@ -1569,39 +1561,36 @@ function RunsListPage({ tick }) {
         </div>
 
         <div className="kpi-row">
-          <div className="kpi" title={'Running ' + (flatten ? 'activities' : 'roots') + ' in the loaded batch'}>
-            <div className="kpi-top"><span className={'kpi-dot ' + (kpi.running > 0 ? 'running' : 'neutral')} /><span className="kpi-label">Running</span></div>
-            <div className="kpi-value">{kpi.running}</div>
+          <div className="kpi" title="Activities currently being processed (queue-wide)">
+            <div className="kpi-top"><span className={'kpi-dot ' + ((stats.processing_activities ?? 0) > 0 ? 'running' : 'neutral')} /><span className="kpi-label">Running</span></div>
+            <div className="kpi-value">{stats.processing_activities ?? 0}</div>
           </div>
-          <div className="kpi" title="Distinct workers currently leasing an activity / configured engine concurrency cap (queue-wide)">
+          <div className="kpi" title="Distinct workers currently leasing an activity / configured engine concurrency cap">
             <div className="kpi-top"><span className={'kpi-dot ' + ((stats.active_workers ?? 0) > 0 ? 'running' : 'neutral')} /><span className="kpi-label">Workers</span></div>
             <div className="kpi-value">
               {stats.active_workers ?? 0}
               {stats.max_workers != null && <span className="frac"> / {stats.max_workers}</span>}
             </div>
           </div>
-          <div className="kpi" title="Pending in the loaded batch">
+          <div className="kpi" title="Pending activities (queue-wide)">
             <div className="kpi-top"><span className="kpi-dot neutral" /><span className="kpi-label">Pending</span></div>
-            <div className="kpi-value">{kpi.pending}</div>
+            <div className="kpi-value">{stats.pending_activities ?? 0}</div>
           </div>
-          <div className="kpi" title="Scheduled in the loaded batch">
+          <div className="kpi" title="Scheduled for future execution (queue-wide)">
             <div className="kpi-top"><span className="kpi-dot scheduled" /><span className="kpi-label">Scheduled</span></div>
-            <div className="kpi-value">{kpi.scheduled}</div>
+            <div className="kpi-value">{stats.scheduled_activities ?? 0}</div>
           </div>
-          <div className="kpi" title="Retrying in the loaded batch">
+          <div className="kpi" title="Activities awaiting a retry attempt (queue-wide)">
             <div className="kpi-top"><span className="kpi-dot retrying" /><span className="kpi-label">Retrying</span></div>
-            <div className="kpi-value">{kpi.retrying}</div>
+            <div className="kpi-value">{stats.retrying_activities ?? 0}</div>
           </div>
-          <div className="kpi" title="Failed in the loaded batch">
+          <div className="kpi" title="Permanently failed (non-retryable; queue-wide)">
             <div className="kpi-top"><span className="kpi-dot failed" /><span className="kpi-label">Failed</span></div>
-            <div className="kpi-value">{kpi.failed}</div>
+            <div className="kpi-value">{stats.failed_activities ?? 0}</div>
           </div>
-          <div className="kpi" title="Dead-lettered in the loaded batch (queue-wide total in parentheses)">
+          <div className="kpi" title="Dead-lettered after exhausting retries (queue-wide)">
             <div className="kpi-top"><span className="kpi-dot deadletter" /><span className="kpi-label">Dead Letter</span></div>
-            <div className="kpi-value">
-              {kpi.deadletter}
-              {(stats.dead_letter_activities ?? 0) !== kpi.deadletter && <span className="frac"> / {stats.dead_letter_activities}</span>}
-            </div>
+            <div className="kpi-value">{stats.dead_letter_activities ?? 0}</div>
           </div>
         </div>
 

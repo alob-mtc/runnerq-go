@@ -832,17 +832,22 @@ func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error
 		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count pending: %v", err))
 	}
 
-	// Separate scheduled (scheduled + retrying) from pure pending.
-	var scheduledCount uint64
+	// Split scheduled and retrying (the dequeue index covers both, plus pending).
 	err = b.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM runnerq_activities
-		WHERE queue_name = $1 AND status IN ('scheduled', 'retrying')`,
-		b.queueName).Scan(&scheduledCount)
+		WHERE queue_name = $1 AND status = 'scheduled'`,
+		b.queueName).Scan(&stats.Scheduled)
 	if err != nil {
 		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count scheduled: %v", err))
 	}
-	stats.Pending -= scheduledCount
-	stats.Scheduled = scheduledCount
+	err = b.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM runnerq_activities
+		WHERE queue_name = $1 AND status = 'retrying'`,
+		b.queueName).Scan(&stats.Retrying)
+	if err != nil {
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count retrying: %v", err))
+	}
+	stats.Pending -= stats.Scheduled + stats.Retrying
 
 	err = b.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM runnerq_activities
@@ -858,6 +863,15 @@ func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error
 		b.queueName).Scan(&stats.ActiveWorkers)
 	if err != nil {
 		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count active workers: %v", err))
+	}
+
+	// Failed (non-retryable) is tracked distinctly from dead_letter (retries exhausted).
+	err = b.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM runnerq_activities
+		WHERE queue_name = $1 AND status = 'failed'`,
+		b.queueName).Scan(&stats.Failed)
+	if err != nil {
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count failed: %v", err))
 	}
 
 	err = b.pool.QueryRow(ctx, `

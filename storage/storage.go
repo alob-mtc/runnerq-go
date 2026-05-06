@@ -103,6 +103,8 @@ type QueueStats struct {
 	Pending       uint64
 	Processing    uint64
 	Scheduled     uint64
+	Retrying      uint64
+	Failed        uint64
 	DeadLetter    uint64
 	ByPriority    PriorityBreakdown
 	MaxWorkers    *int

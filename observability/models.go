@@ -104,6 +104,8 @@ type QueueStats struct {
 	NormalPriority       uint64 `json:"normal_priority"`
 	LowPriority          uint64 `json:"low_priority"`
 	ScheduledActivities  uint64 `json:"scheduled_activities"`
+	RetryingActivities   uint64 `json:"retrying_activities"`
+	FailedActivities     uint64 `json:"failed_activities"`
 	DeadLetterActivities uint64 `json:"dead_letter_activities"`
 	MaxWorkers           *int   `json:"max_workers,omitempty"`
 	ActiveWorkers        uint64 `json:"active_workers"`
