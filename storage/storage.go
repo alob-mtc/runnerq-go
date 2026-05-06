@@ -232,12 +232,13 @@ type InspectionStorage interface {
 	GetChildren(ctx context.Context, parentID uuid.UUID, offset, limit int) ([]ActivitySnapshot, error)
 	// GetSubtree returns all activities in the tree rooted at rootID, including the root itself.
 	GetSubtree(ctx context.Context, rootID uuid.UUID) ([]ActivitySnapshot, error)
-	// ListRecentRoots returns top-level activities (no parent), newest first. Used by the
-	// console workflows list to show distinct runs rather than every activity in every tree.
-	ListRecentRoots(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
-	// ListRecentActivities returns all activities (regardless of lineage), newest first.
-	// Used by the console workflows list when "flatten" is enabled.
-	ListRecentActivities(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
+	// ListRecentRoots returns top-level activities (no parent), newest first. When
+	// status is non-empty, results are filtered to that status (raw column value
+	// — e.g. 'processing', 'completed', 'dead_letter').
+	ListRecentRoots(ctx context.Context, status string, offset, limit int) ([]ActivitySnapshot, error)
+	// ListRecentActivities returns all activities (regardless of lineage), newest
+	// first. Status filter behaves the same way as ListRecentRoots.
+	ListRecentActivities(ctx context.Context, status string, offset, limit int) ([]ActivitySnapshot, error)
 	// ListCronActivities returns recent activities tagged with metadata.source='cron',
 	// regardless of status. Used by the console Schedules page to group cron runs.
 	ListCronActivities(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)

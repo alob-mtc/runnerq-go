@@ -1091,7 +1091,7 @@ func (b *PostgresBackend) GetChildren(ctx context.Context, parentID uuid.UUID, o
 	return b.scanSnapshots(rows)
 }
 
-func (b *PostgresBackend) ListRecentRoots(ctx context.Context, offset, limit int) ([]storage.ActivitySnapshot, error) {
+func (b *PostgresBackend) ListRecentRoots(ctx context.Context, status string, offset, limit int) ([]storage.ActivitySnapshot, error) {
 	rows, err := b.pool.Query(ctx, `
 		SELECT id, activity_type, payload, priority, status, created_at,
 			scheduled_at, started_at, completed_at, current_worker_id,
@@ -1101,9 +1101,10 @@ func (b *PostgresBackend) ListRecentRoots(ctx context.Context, offset, limit int
 			parent_activity_id, root_activity_id, depth
 		FROM runnerq_activities
 		WHERE queue_name = $1 AND parent_activity_id IS NULL
+		  AND ($2 = '' OR status = $2)
 		ORDER BY created_at DESC
-		LIMIT $2 OFFSET $3`,
-		b.queueName, limit, offset)
+		LIMIT $3 OFFSET $4`,
+		b.queueName, status, limit, offset)
 	if err != nil {
 		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list recent roots: %v", err))
 	}
@@ -1112,7 +1113,7 @@ func (b *PostgresBackend) ListRecentRoots(ctx context.Context, offset, limit int
 	return b.scanSnapshots(rows)
 }
 
-func (b *PostgresBackend) ListRecentActivities(ctx context.Context, offset, limit int) ([]storage.ActivitySnapshot, error) {
+func (b *PostgresBackend) ListRecentActivities(ctx context.Context, status string, offset, limit int) ([]storage.ActivitySnapshot, error) {
 	rows, err := b.pool.Query(ctx, `
 		SELECT id, activity_type, payload, priority, status, created_at,
 			scheduled_at, started_at, completed_at, current_worker_id,
@@ -1122,9 +1123,10 @@ func (b *PostgresBackend) ListRecentActivities(ctx context.Context, offset, limi
 			parent_activity_id, root_activity_id, depth
 		FROM runnerq_activities
 		WHERE queue_name = $1
+		  AND ($2 = '' OR status = $2)
 		ORDER BY created_at DESC
-		LIMIT $2 OFFSET $3`,
-		b.queueName, limit, offset)
+		LIMIT $3 OFFSET $4`,
+		b.queueName, status, limit, offset)
 	if err != nil {
 		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list recent activities: %v", err))
 	}

@@ -198,18 +198,36 @@ func activityResultHandler(inspector *observability.QueueInspector) http.Handler
 	}
 }
 
+// allowedStatusFilters protects the storage layer from arbitrary status
+// values being passed in over HTTP. Empty string means no filter.
+var allowedStatusFilters = map[string]bool{
+	"":            true,
+	"pending":     true,
+	"processing":  true,
+	"scheduled":   true,
+	"retrying":    true,
+	"completed":   true,
+	"failed":      true,
+	"dead_letter": true,
+}
+
 func recentRootsHandler(inspector *observability.QueueInspector) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		offset, limit := parsePagination(r)
 		flatten := r.URL.Query().Get("flatten")
+		status := r.URL.Query().Get("status")
+		if !allowedStatusFilters[status] {
+			http.Error(w, "Bad Request: invalid status filter", http.StatusBadRequest)
+			return
+		}
 		var (
 			items []observability.ActivitySnapshot
 			err   error
 		)
 		if flatten == "1" || flatten == "true" {
-			items, err = inspector.ListRecentActivities(r.Context(), offset, limit)
+			items, err = inspector.ListRecentActivities(r.Context(), status, offset, limit)
 		} else {
-			items, err = inspector.ListRecentRoots(r.Context(), offset, limit)
+			items, err = inspector.ListRecentRoots(r.Context(), status, offset, limit)
 		}
 		if err != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)

@@ -281,8 +281,9 @@ func (q *QueueInspector) GetSubtree(ctx context.Context, rootID uuid.UUID) ([]Ac
 }
 
 // ListRecentRoots returns top-level activities (no parent), newest first.
-func (q *QueueInspector) ListRecentRoots(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error) {
-	snapshots, err := q.backend.ListRecentRoots(ctx, offset, limit)
+// Pass an empty status to skip the status filter.
+func (q *QueueInspector) ListRecentRoots(ctx context.Context, status string, offset, limit int) ([]ActivitySnapshot, error) {
+	snapshots, err := q.backend.ListRecentRoots(ctx, status, offset, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -290,8 +291,9 @@ func (q *QueueInspector) ListRecentRoots(ctx context.Context, offset, limit int)
 }
 
 // ListRecentActivities returns all activities (regardless of lineage), newest first.
-func (q *QueueInspector) ListRecentActivities(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error) {
-	snapshots, err := q.backend.ListRecentActivities(ctx, offset, limit)
+// Pass an empty status to skip the status filter.
+func (q *QueueInspector) ListRecentActivities(ctx context.Context, status string, offset, limit int) ([]ActivitySnapshot, error) {
+	snapshots, err := q.backend.ListRecentActivities(ctx, status, offset, limit)
 	if err != nil {
 		return nil, err
 	}

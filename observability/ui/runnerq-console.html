@@ -1513,12 +1513,26 @@ function RunsListPage({ manualTick }) {
   // an existing one could change status. No filter; refetch on any tick.
   const liveTick = useLiveTick(null);
 
+  // UI status name → DB status column value.
+  const statusToBackend = (s) => {
+    switch (s) {
+      case 'running':    return 'processing';
+      case 'deadletter': return 'dead_letter';
+      case 'all':        return '';
+      default:           return s;
+    }
+  };
+
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const flag = flatten ? '&flatten=1' : '';
-        const [s, r] = await Promise.all([api('/stats'), api('/roots?limit=' + limit + flag)]);
+        const params = new URLSearchParams();
+        params.set('limit', String(limit));
+        if (flatten) params.set('flatten', '1');
+        const backendStatus = statusToBackend(statusFilter);
+        if (backendStatus) params.set('status', backendStatus);
+        const [s, r] = await Promise.all([api('/stats'), api('/roots?' + params.toString())]);
         if (cancelled) return;
         setStats(s);
         setRoots(r || []);
@@ -1527,7 +1541,7 @@ function RunsListPage({ manualTick }) {
       }
     })();
     return () => { cancelled = true; };
-  }, [manualTick, liveTick, limit, flatten]);
+  }, [manualTick, liveTick, limit, flatten, statusFilter]);
 
   // If the previously-selected type no longer appears in the loaded batch,
   // fall back to "all" so the user isn't stuck on an empty filter. Hook must
