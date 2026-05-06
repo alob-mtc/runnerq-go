@@ -203,6 +203,38 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
 }
 .topbar .tz:hover { background: var(--bg-3); color: var(--fg-0); }
 
+.live-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 9px 3px 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  background: var(--bg-2);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--fg-2);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  user-select: none;
+}
+.live-pill .dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.live-pill.connected { color: var(--emerald); border-color: var(--emerald-line); background: var(--emerald-soft); }
+.live-pill.connected .dot { background: var(--emerald); box-shadow: 0 0 0 3px rgba(62,207,142,0.18); animation: livePulse 2s ease-in-out infinite; }
+.live-pill.connecting,
+.live-pill.reconnecting { color: var(--amber); border-color: var(--amber-line); background: var(--amber-soft); }
+.live-pill.connecting .dot,
+.live-pill.reconnecting .dot { background: var(--amber); animation: pulse 1s ease-in-out infinite; }
+.live-pill.disconnected { color: var(--red); border-color: var(--red-line); background: var(--red-soft); }
+.live-pill.disconnected .dot { background: var(--red); }
+
+@keyframes livePulse {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(62,207,142,0.18); }
+  50% { box-shadow: 0 0 0 5px rgba(62,207,142,0.05); }
+}
+
 .content {
   flex: 1;
   overflow-y: auto;
@@ -1087,8 +1119,9 @@ function navTo(hash) { window.location.hash = hash; }
 // SSE-driven live updates: open one EventSource against the stream endpoint
 // and bump the global tick on each event (debounced to avoid refetch storms
 // when a burst of events arrives). The browser auto-reconnects on transient
-// drops.
-function useLiveTick(setTick, debounceMs = 600) {
+// drops; we surface that state via the returned status.
+function useLiveStream(setTick, debounceMs = 600) {
+  const [status, setStatus] = React.useState('connecting');
   React.useEffect(() => {
     let pending = false;
     let timer = null;
@@ -1107,16 +1140,27 @@ function useLiveTick(setTick, debounceMs = 600) {
     let es;
     try {
       es = new EventSource(url);
-      es.onmessage = bump;
-      es.onerror = () => { /* browser auto-reconnects */ };
+      es.onopen = () => setStatus('connected');
+      es.onmessage = (e) => {
+        // Some streams send heartbeats as messages with no data; still treat
+        // any inbound chatter as "we're connected".
+        if (status !== 'connected') setStatus('connected');
+        bump();
+      };
+      es.onerror = () => {
+        // readyState: 0 CONNECTING, 1 OPEN, 2 CLOSED
+        if (es.readyState === 2) setStatus('disconnected');
+        else setStatus('reconnecting');
+      };
     } catch (e) {
-      // EventSource unavailable — quietly skip.
+      setStatus('disconnected');
     }
     return () => {
       if (es) es.close();
       if (timer) clearTimeout(timer);
     };
   }, [setTick, debounceMs]);
+  return status;
 }
 
 function useClipboard() {
@@ -1149,13 +1193,35 @@ function Sidebar({ active }) {
   );
 }
 
-function TopBar({ tweaks, setTweak, onRefresh }) {
+function LiveIndicator({ status }) {
+  const labels = {
+    connecting: 'Connecting',
+    connected: 'Live',
+    reconnecting: 'Reconnecting',
+    disconnected: 'Offline',
+  };
+  const titles = {
+    connecting: 'Establishing real-time connection…',
+    connected: 'Receiving real-time updates via SSE',
+    reconnecting: 'Connection dropped — retrying',
+    disconnected: 'Real-time updates unavailable',
+  };
+  return (
+    <span className={'live-pill ' + status} title={titles[status] || status}>
+      <span className="dot" />
+      <span>{labels[status] || status}</span>
+    </span>
+  );
+}
+
+function TopBar({ tweaks, setTweak, onRefresh, liveStatus }) {
   return (
     <div className="topbar">
       <div className="ns-pill">
         <span className="dot" />
         <span>runnerq</span>
       </div>
+      <LiveIndicator status={liveStatus || 'connecting'} />
       <div className="right">
         {onRefresh && (
           <button className="icon-btn" onClick={onRefresh} title="Refresh">
@@ -1969,7 +2035,7 @@ function App() {
   const [tick, setTick] = React.useState(0);
   const route = useHashRoute();
   const { copy, flash } = useClipboard();
-  useLiveTick(setTick);
+  const liveStatus = useLiveStream(setTick);
 
   React.useEffect(() => {
     document.documentElement.setAttribute('data-theme', tweaks.theme);
@@ -1982,7 +2048,7 @@ function App() {
     <div className="app">
       <Sidebar active="workflows" />
       <div className="main">
-        <TopBar tweaks={tweaks} setTweak={setTweak} onRefresh={refresh} />
+        <TopBar tweaks={tweaks} setTweak={setTweak} onRefresh={refresh} liveStatus={liveStatus} />
         <div className="content">
           {route.name === 'list' && <RunsListPage tick={tick} />}
           {route.name === 'run' && <RunDetailPage activityId={route.id} tweaks={tweaks} tick={tick} onCopy={copy} />}
