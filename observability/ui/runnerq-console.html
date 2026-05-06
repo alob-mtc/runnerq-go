@@ -1058,7 +1058,6 @@ const Icon = ({ name, size = 16, strokeWidth = 1.6, ...props }) => {
     'workflows': <><circle cx="6" cy="6" r="2.2" /><circle cx="18" cy="6" r="2.2" /><circle cx="12" cy="18" r="2.2" /><path d="M6 8.2v3.6a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V8.2" /></>,
     'clock': <><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 15 14" /></>,
     'layers': <><polygon points="12 2 2 7 12 12 22 7 12 2" /><polyline points="2 12 12 17 22 12" /><polyline points="2 17 12 22 22 17" /></>,
-    'archive': <><rect x="3" y="4" width="18" height="4" rx="1" /><path d="M5 8v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8" /><line x1="10" y1="12" x2="14" y2="12" /></>,
     'settings': <><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" /></>,
     'arrow-right': <><line x1="5" y1="12" x2="19" y2="12" /><polyline points="12 5 19 12 12 19" /></>,
     'chevron-left': <polyline points="15 18 9 12 15 6" />,
@@ -1306,7 +1305,6 @@ function Sidebar({ active }) {
       <button className={'nav-btn ' + (active === 'workflows' ? 'active' : '')} title="Workflows" onClick={() => navTo('#/')}><Icon name="workflows" /></button>
       <button className={'nav-btn ' + (active === 'schedules' ? 'active' : '')} title="Schedules" onClick={() => navTo('#/schedules')}><Icon name="clock" /></button>
       <button className="nav-btn" title="Queues"><Icon name="layers" /></button>
-      <button className="nav-btn" title="Archive"><Icon name="archive" /></button>
       <div className="spacer"></div>
       <button className="nav-btn" title="Settings"><Icon name="settings" /></button>
     </aside>
