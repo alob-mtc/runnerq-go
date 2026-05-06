@@ -298,6 +298,15 @@ func (q *QueueInspector) ListRecentActivities(ctx context.Context, offset, limit
 	return convertSnapshots(snapshots), nil
 }
 
+// ListCronActivities returns recent activities tagged metadata.source='cron'.
+func (q *QueueInspector) ListCronActivities(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error) {
+	snapshots, err := q.backend.ListCronActivities(ctx, offset, limit)
+	if err != nil {
+		return nil, err
+	}
+	return convertSnapshots(snapshots), nil
+}
+
 // RecentEvents returns recent events for a specific activity.
 func (q *QueueInspector) RecentEvents(ctx context.Context, activityID uuid.UUID, limit int) ([]ActivityEvent, error) {
 	events, err := q.backend.GetActivityEvents(ctx, activityID, limit)

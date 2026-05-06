@@ -1152,6 +1152,27 @@ func (b *PostgresBackend) ListRecentActivities(ctx context.Context, offset, limi
 	return b.scanSnapshots(rows)
 }
 
+func (b *PostgresBackend) ListCronActivities(ctx context.Context, offset, limit int) ([]storage.ActivitySnapshot, error) {
+	rows, err := b.pool.Query(ctx, `
+		SELECT id, activity_type, payload, priority, status, created_at,
+			scheduled_at, started_at, completed_at, current_worker_id,
+			last_worker_id, retry_count, max_retries, timeout_seconds,
+			retry_delay_seconds, last_error, last_error_at, metadata,
+			idempotency_key, lease_deadline_ms,
+			parent_activity_id, root_activity_id, depth
+		FROM runnerq_activities
+		WHERE queue_name = $1 AND metadata->>'source' = 'cron'
+		ORDER BY created_at DESC
+		LIMIT $2 OFFSET $3`,
+		b.queueName, limit, offset)
+	if err != nil {
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list cron activities: %v", err))
+	}
+	defer rows.Close()
+
+	return b.scanSnapshots(rows)
+}
+
 func (b *PostgresBackend) GetSubtree(ctx context.Context, rootID uuid.UUID) ([]storage.ActivitySnapshot, error) {
 	rows, err := b.pool.Query(ctx, `
 		SELECT id, activity_type, payload, priority, status, created_at,

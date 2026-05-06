@@ -235,6 +235,9 @@ type InspectionStorage interface {
 	// ListRecentActivities returns all activities (regardless of lineage), newest first.
 	// Used by the console workflows list when "flatten" is enabled.
 	ListRecentActivities(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
+	// ListCronActivities returns recent activities tagged with metadata.source='cron',
+	// regardless of status. Used by the console Schedules page to group cron runs.
+	ListCronActivities(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
 	// EventStream returns a channel that yields real-time activity events.
 	EventStream(ctx context.Context) (<-chan ActivityEvent, error)
 }

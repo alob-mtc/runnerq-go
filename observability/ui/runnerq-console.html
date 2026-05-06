@@ -1222,6 +1222,7 @@ function useHashRoute() {
     const h = window.location.hash || '#/';
     const m = h.match(/^#\/run\/([0-9a-f-]+)\/?(.*)$/i);
     if (m) return { name: 'run', id: m[1], tab: m[2] || 'history' };
+    if (h.startsWith('#/schedules')) return { name: 'schedules' };
     return { name: 'list' };
   };
   const [route, setRoute] = React.useState(get());
@@ -1303,7 +1304,7 @@ function Sidebar({ active }) {
         <Icon name="logo" size={16} strokeWidth={2} />
       </div>
       <button className={'nav-btn ' + (active === 'workflows' ? 'active' : '')} title="Workflows" onClick={() => navTo('#/')}><Icon name="workflows" /></button>
-      <button className="nav-btn" title="Schedules"><Icon name="clock" /></button>
+      <button className={'nav-btn ' + (active === 'schedules' ? 'active' : '')} title="Schedules" onClick={() => navTo('#/schedules')}><Icon name="clock" /></button>
       <button className="nav-btn" title="Queues"><Icon name="layers" /></button>
       <button className="nav-btn" title="Archive"><Icon name="archive" /></button>
       <div className="spacer"></div>
@@ -2231,6 +2232,120 @@ function PendingView({ tree, onSelect }) {
   );
 }
 
+function SchedulesPage({ tick }) {
+  const [runs, setRuns] = React.useState(null);
+  const [err, setErr] = React.useState(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await api('/cron?limit=500');
+        if (cancelled) return;
+        setRuns(r || []);
+      } catch (e) {
+        if (!cancelled) setErr(String(e));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [tick]);
+
+  if (err) return <div className="empty-state"><div className="big">Failed to load</div><div>{err}</div></div>;
+  if (!runs) return <div className="empty-state">Loading…</div>;
+
+  // Group cron-tagged runs by activity_type. Each group becomes a "schedule"
+  // row showing last run, success/failure split, and total invocations seen.
+  const groups = {};
+  runs.forEach(r => {
+    const k = r.activity_type;
+    if (!groups[k]) groups[k] = { type: k, latest: null, total: 0, ok: 0, err: 0, ids: [] };
+    const g = groups[k];
+    g.total++;
+    g.ids.push(r.id);
+    if (r.status === 'Completed') g.ok++;
+    else if (r.status === 'Failed' || r.status === 'DeadLetter') g.err++;
+    const ts = new Date(r.completed_at || r.started_at || r.created_at).getTime();
+    if (!g.latest || ts > new Date(g.latest.completed_at || g.latest.started_at || g.latest.created_at).getTime()) {
+      g.latest = r;
+    }
+  });
+  const list = Object.values(groups).sort((a, b) => {
+    const ta = a.latest ? new Date(a.latest.completed_at || a.latest.started_at || a.latest.created_at).getTime() : 0;
+    const tb = b.latest ? new Date(b.latest.completed_at || b.latest.started_at || b.latest.created_at).getTime() : 0;
+    return tb - ta;
+  });
+
+  return (
+    <div className="runs-page">
+      <div className="runs-head">
+        <div>
+          <h1>Schedules</h1>
+          <div className="sub">
+            <span>{list.length} cron schedules · {runs.length} runs in window</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="card runs-table-card">
+        <div className="card-head">
+          <span>Cron-tagged activity types</span>
+          <div className="right">
+            <span style={{ fontSize: 11, color: 'var(--fg-3)', textTransform: 'none', letterSpacing: 0 }}>
+              tagged via metadata.source = "cron"
+            </span>
+          </div>
+        </div>
+        {list.length === 0 ? (
+          <div className="empty-state">
+            <div className="big">No cron activities yet</div>
+            <div>Spawn an activity with metadata source set to "cron" and it will appear here.</div>
+          </div>
+        ) : (
+          <table className="runs-table">
+            <thead>
+              <tr>
+                <th>Activity type</th>
+                <th style={{ width: 110 }}>Last status</th>
+                <th style={{ width: 200 }}>Last run</th>
+                <th style={{ width: 90 }}>Total</th>
+                <th style={{ width: 90 }}>Success</th>
+                <th style={{ width: 90 }}>Failures</th>
+              </tr>
+            </thead>
+            <tbody>
+              {list.map(g => {
+                const sc = g.latest ? statusClass(g.latest.status) : 'pending';
+                const lastTs = g.latest && (g.latest.completed_at || g.latest.started_at || g.latest.created_at);
+                return (
+                  <tr key={g.type} onClick={() => g.latest && navTo('#/run/' + g.latest.id)}>
+                    <td>
+                      <div className="id-cell"><span className="typ">{g.type}</span></div>
+                    </td>
+                    <td>
+                      {g.latest ? (
+                        <span className={'status-chip sm ' + sc}><span className="pip" />{g.latest.status}</span>
+                      ) : <span style={{ color: 'var(--fg-3)' }}>—</span>}
+                    </td>
+                    <td>
+                      <div className="ts-cell">
+                        <span className="at">{fmtTsShort(lastTs)}</span>
+                        <span className="ago">{fmtAgo(lastTs)}</span>
+                      </div>
+                    </td>
+                    <td><span className="dur">{g.total}</span></td>
+                    <td><span className="dur" style={{ color: g.ok > 0 ? 'var(--emerald)' : 'var(--fg-3)' }}>{g.ok}</span></td>
+                    <td><span className="dur" style={{ color: g.err > 0 ? 'var(--red)' : 'var(--fg-3)' }}>{g.err}</span></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [theme, setTheme] = useStoredTheme('dark');
   const [tick, setTick] = React.useState(0);
@@ -2247,12 +2362,13 @@ function App() {
 
   return (
     <div className="app">
-      <Sidebar active="workflows" />
+      <Sidebar active={route.name === 'schedules' ? 'schedules' : 'workflows'} />
       <div className="main">
         <TopBar theme={theme} onToggleTheme={toggleTheme} onRefresh={refresh} liveStatus={liveStatus} />
         <div className="content">
           {route.name === 'list' && <RunsListPage tick={tick} />}
           {route.name === 'run' && <RunDetailPage activityId={route.id} tick={tick} onCopy={copy} />}
+          {route.name === 'schedules' && <SchedulesPage tick={tick} />}
         </div>
       </div>
 

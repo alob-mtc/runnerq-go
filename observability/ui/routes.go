@@ -22,6 +22,7 @@ func RunnerQUI(inspector *observability.QueueInspector) http.Handler {
 	mux.HandleFunc("GET /", serveUI)
 	mux.HandleFunc("GET /api/observability/stats", statsHandler(inspector))
 	mux.HandleFunc("GET /api/observability/roots", recentRootsHandler(inspector))
+	mux.HandleFunc("GET /api/observability/cron", cronActivitiesHandler(inspector))
 	mux.HandleFunc("GET /api/observability/activities/{key}", activityCollectionOrDetail(inspector))
 	mux.HandleFunc("GET /api/observability/activities/{id}/events", activityEventsHandler(inspector))
 	mux.HandleFunc("GET /api/observability/activities/{id}/result", activityResultHandler(inspector))
@@ -38,6 +39,7 @@ func ObservabilityAPI(inspector *observability.QueueInspector) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /stats", statsHandler(inspector))
 	mux.HandleFunc("GET /roots", recentRootsHandler(inspector))
+	mux.HandleFunc("GET /cron", cronActivitiesHandler(inspector))
 	mux.HandleFunc("GET /activities/{key}", activityCollectionOrDetail(inspector))
 	mux.HandleFunc("GET /activities/{id}/events", activityEventsHandler(inspector))
 	mux.HandleFunc("GET /activities/{id}/result", activityResultHandler(inspector))
@@ -209,6 +211,18 @@ func recentRootsHandler(inspector *observability.QueueInspector) http.HandlerFun
 		} else {
 			items, err = inspector.ListRecentRoots(r.Context(), offset, limit)
 		}
+		if err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
+	}
+}
+
+func cronActivitiesHandler(inspector *observability.QueueInspector) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		offset, limit := parsePagination(r)
+		items, err := inspector.ListCronActivities(r.Context(), offset, limit)
 		if err != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
