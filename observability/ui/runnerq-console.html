@@ -1346,6 +1346,15 @@ function RunsListPage({ tick }) {
     return () => { cancelled = true; };
   }, [tick]);
 
+  // If the previously-selected type no longer appears in the loaded batch,
+  // fall back to "all" so the user isn't stuck on an empty filter. Hook must
+  // sit above any early returns to keep hook order stable across renders.
+  React.useEffect(() => {
+    if (!roots || typeFilter === 'all') return;
+    const stillThere = roots.some(r => r.activity_type === typeFilter);
+    if (!stillThere) setTypeFilter('all');
+  }, [typeFilter, roots]);
+
   if (err) return <div className="empty-state"><div className="big">Failed to load</div><div>{err}</div></div>;
   if (!stats || !roots) return <div className="empty-state">Loading…</div>;
 
@@ -1359,14 +1368,6 @@ function RunsListPage({ tick }) {
   const types = Object.entries(typeCountMap)
     .map(([name, count]) => ({ name, count }))
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
-
-  // If the previously-selected type no longer appears in the loaded batch,
-  // fall back to "all" so the user isn't stuck on an empty filter.
-  React.useEffect(() => {
-    if (typeFilter !== 'all' && !typeCountMap[typeFilter]) {
-      setTypeFilter('all');
-    }
-  }, [typeFilter, roots]);
 
   const qLower = q.trim().toLowerCase();
   const filtered = roots.filter(r => {
