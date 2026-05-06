@@ -1658,9 +1658,30 @@ function RunsListPage({ manualTick }) {
             <div className="big">{flatten ? 'No activities yet' : 'No runs yet'}</div>
             <div>{flatten ? 'Any enqueued activity will appear here.' : 'Activities you spawn at the engine level appear here.'}</div>
           </div>
-        ) : filtered.length === 0 ? (
-          <div className="empty-state"><div className="big">No runs match</div><div>Try clearing the search or switching the status filter.</div></div>
-        ) : (
+        ) : filtered.length === 0 ? (() => {
+          // If the active status filter has a non-zero queue-wide count
+          // (children that aren't surfaced when Flatten is off), nudge the
+          // user toward the Flatten toggle instead of leaving them stranded.
+          const queueWide = !flatten && {
+            running:    stats.processing_activities,
+            pending:    stats.pending_activities,
+            scheduled:  stats.scheduled_activities,
+            retrying:   stats.retrying_activities,
+            failed:     stats.failed_activities,
+            deadletter: stats.dead_letter_activities,
+          }[statusFilter];
+          const showFlattenHint = queueWide > 0;
+          return (
+            <div className="empty-state">
+              <div className="big">No runs match</div>
+              <div>
+                {showFlattenHint
+                  ? <>{queueWide} {statusFilter} {queueWide === 1 ? 'activity exists' : 'activities exist'} in the queue, but they're children of older runs. Toggle <b>Flatten</b> above to include them.</>
+                  : <>Try clearing the search or switching the status filter.</>}
+              </div>
+            </div>
+          );
+        })() : (
           <table className="runs-table">
             <thead>
               <tr>

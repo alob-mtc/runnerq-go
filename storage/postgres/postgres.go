@@ -811,23 +811,20 @@ func (b *PostgresBackend) resolveIdempotencyBehavior(ctx context.Context, a *sto
 // ============================================================================
 
 func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error) {
-	// Single FILTER aggregate covers all status counts plus active workers in
-	// one round trip. The whole-table scan is fine for active state — the
-	// status partial indexes (created_at WHERE pending|scheduled|...) keep the
-	// hot rows tightly packed; if completed/failed rows dominate the table,
-	// we'd extend this to a series of index-only counts instead.
+	// One round trip, but each scalar subquery is planned independently so the
+	// matching partial index handles its own count. A single FILTER aggregate
+	// over the whole table would force a full scan and degrade as completed
+	// history accumulates — this form keeps each count cheap.
 	stats := &storage.QueueStats{}
 	err := b.pool.QueryRow(ctx, `
 		SELECT
-			COUNT(*) FILTER (WHERE status = 'pending')                                                          AS pending,
-			COUNT(*) FILTER (WHERE status = 'processing')                                                       AS processing,
-			COUNT(*) FILTER (WHERE status = 'scheduled')                                                        AS scheduled,
-			COUNT(*) FILTER (WHERE status = 'retrying')                                                         AS retrying,
-			COUNT(*) FILTER (WHERE status = 'failed')                                                           AS failed,
-			COUNT(*) FILTER (WHERE status = 'dead_letter')                                                      AS dead_letter,
-			COUNT(DISTINCT current_worker_id) FILTER (WHERE status = 'processing' AND current_worker_id IS NOT NULL) AS active_workers
-		FROM runnerq_activities
-		WHERE queue_name = $1`,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'pending')                                                                AS pending,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'processing')                                                             AS processing,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'scheduled')                                                              AS scheduled,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'retrying')                                                               AS retrying,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'failed')                                                                 AS failed,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'dead_letter')                                                            AS dead_letter,
+			(SELECT COUNT(DISTINCT current_worker_id) FROM runnerq_activities WHERE queue_name = $1 AND status = 'processing' AND current_worker_id IS NOT NULL) AS active_workers`,
 		b.queueName).Scan(
 		&stats.Pending,
 		&stats.Processing,
