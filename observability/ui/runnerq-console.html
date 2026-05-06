@@ -93,13 +93,6 @@
   --shadow-2: 0 12px 28px rgba(15,17,21,0.08);
 }
 
-[data-density="compact"] {
-  --pad-xs: 3px; --pad-sm: 6px; --pad-md: 9px; --pad-lg: 12px; --pad-xl: 14px; --row-h: 26px;
-}
-[data-density="comfortable"] {
-  --pad-xs: 5px; --pad-sm: 10px; --pad-md: 14px; --pad-lg: 20px; --pad-xl: 26px; --row-h: 38px;
-}
-
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body, #root { height: 100%; }
 body {
@@ -724,60 +717,6 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
   grid-template-columns: minmax(0, 1fr);
   gap: 14px;
 }
-.layout.with-rail { grid-template-columns: minmax(0, 1fr) 320px; }
-@media (max-width: 1280px) { .layout.with-rail { grid-template-columns: minmax(0, 1fr); } }
-.rail {
-  background: var(--bg-1);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  padding: 14px;
-  font-size: 12px;
-  color: var(--fg-1);
-  height: fit-content;
-  position: sticky;
-  top: 18px;
-}
-.rail h4 {
-  font-size: 10.5px;
-  color: var(--fg-3);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  margin-bottom: 8px;
-  font-weight: 600;
-}
-.rail .row {
-  display: grid;
-  grid-template-columns: 80px 1fr;
-  align-items: baseline;
-  gap: 8px;
-  padding: 6px 0;
-  border-bottom: 1px dashed var(--line);
-}
-.rail .row:last-child { border-bottom: 0; }
-.rail .row .k { color: var(--fg-3); font-size: 11.5px; }
-.rail .row .v {
-  color: var(--fg-0);
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  text-align: right;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.rail .json {
-  background: var(--bg-2);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 8px 10px;
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  color: var(--fg-1);
-  margin-top: 8px;
-  white-space: pre;
-  overflow: auto;
-  line-height: 1.55;
-  max-height: 260px;
-}
 
 .metadata-card pre {
   font-family: var(--font-mono);
@@ -800,67 +739,6 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--bg-4); border-radius: 5px; border: 2px solid var(--bg-0); }
 ::-webkit-scrollbar-thumb:hover { background: var(--line-strong); }
-
-.tweaks-toggle {
-  position: fixed;
-  right: 16px;
-  bottom: 16px;
-  z-index: 1000;
-  width: 36px; height: 36px;
-  border-radius: 18px;
-  background: var(--bg-2);
-  border: 1px solid var(--line-2);
-  display: grid; place-items: center;
-  color: var(--fg-2);
-  box-shadow: var(--shadow-2);
-  cursor: pointer;
-  transition: all .15s;
-}
-.tweaks-toggle:hover { background: var(--bg-3); color: var(--fg-0); border-color: var(--line-strong); }
-
-.tweaks-panel {
-  position: fixed;
-  right: 16px;
-  bottom: 60px;
-  z-index: 1001;
-  width: 280px;
-  background: var(--bg-1);
-  border: 1px solid var(--line-2);
-  border-radius: 10px;
-  box-shadow: var(--shadow-2);
-  font-family: var(--font-sans);
-  overflow: hidden;
-}
-.tweaks-panel header {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--line);
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--fg-0);
-}
-.tweaks-panel header .x { color: var(--fg-3); }
-.tweaks-panel header .x:hover { color: var(--fg-0); }
-.tweaks-panel .body { padding: 10px 14px 14px; display: flex; flex-direction: column; gap: 12px; }
-.tweaks-panel .sect { font-size: 10px; font-weight: 600; letter-spacing: 0.08em; color: var(--fg-3); text-transform: uppercase; padding-top: 4px; }
-.tweaks-panel .sect:first-child { padding-top: 0; }
-.tweaks-panel .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.tweaks-panel .row .lbl { font-size: 12px; color: var(--fg-1); }
-.tweaks-seg {
-  display: inline-flex;
-  background: var(--bg-2);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 2px;
-}
-.tweaks-seg button {
-  padding: 3px 10px;
-  font-size: 11.5px;
-  color: var(--fg-2);
-  border-radius: 4px;
-  text-transform: capitalize;
-}
-.tweaks-seg button.active { background: var(--bg-4); color: var(--fg-0); }
 
 .filter-bar {
   display: flex;
@@ -1125,7 +1003,6 @@ const Icon = ({ name, size = 16, strokeWidth = 1.6, ...props }) => {
     'chevron-left': <polyline points="15 18 9 12 15 6" />,
     'copy': <><rect x="9" y="9" width="11" height="11" rx="1.5" /><path d="M5 15V5a1.5 1.5 0 0 1 1.5-1.5H15" /></>,
     'flag': <><path d="M4 22V4" /><path d="M4 4h12l-2 4 2 4H4" /></>,
-    'sliders': <><line x1="4" y1="21" x2="4" y2="14" /><line x1="4" y1="10" x2="4" y2="3" /><line x1="12" y1="21" x2="12" y2="12" /><line x1="12" y1="8" x2="12" y2="3" /><line x1="20" y1="21" x2="20" y2="16" /><line x1="20" y1="12" x2="20" y2="3" /><line x1="1" y1="14" x2="7" y2="14" /><line x1="9" y1="8" x2="15" y2="8" /><line x1="17" y1="16" x2="23" y2="16" /></>,
     'sort-desc': <><path d="M3 6h18" /><path d="M7 12h10" /><path d="M11 18h2" /></>,
     'globe': <><circle cx="12" cy="12" r="10" /><line x1="2" y1="12" x2="22" y2="12" /><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" /></>,
     'plus': <><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></>,
@@ -1214,22 +1091,19 @@ function shortId(id) {
   return id.length > 8 ? id.slice(0, 8) : id;
 }
 
-function useStoredTweaks(defaults) {
-  const [t, setT] = React.useState(() => {
+function useStoredTheme(defaultTheme) {
+  const [theme, setTheme] = React.useState(() => {
     try {
-      const raw = localStorage.getItem('runnerq.tweaks');
-      if (raw) return Object.assign({}, defaults, JSON.parse(raw));
+      const v = localStorage.getItem('runnerq.theme');
+      if (v === 'dark' || v === 'light') return v;
     } catch (e) {}
-    return defaults;
+    return defaultTheme;
   });
-  const set = React.useCallback((key, val) => {
-    setT(prev => {
-      const next = Object.assign({}, prev, { [key]: val });
-      try { localStorage.setItem('runnerq.tweaks', JSON.stringify(next)); } catch (e) {}
-      return next;
-    });
+  const persist = React.useCallback((next) => {
+    setTheme(next);
+    try { localStorage.setItem('runnerq.theme', next); } catch (e) {}
   }, []);
-  return [t, set];
+  return [theme, persist];
 }
 
 function useHashRoute() {
@@ -1348,7 +1222,7 @@ function LiveIndicator({ status }) {
   );
 }
 
-function TopBar({ tweaks, setTweak, onRefresh, liveStatus }) {
+function TopBar({ theme, onToggleTheme, onRefresh, liveStatus }) {
   return (
     <div className="topbar">
       <div className="ns-pill">
@@ -1365,44 +1239,9 @@ function TopBar({ tweaks, setTweak, onRefresh, liveStatus }) {
         <button className="tz" title="Timezone">
           <Icon name="globe" size={14} /> UTC
         </button>
-        <button className="icon-btn" onClick={() => setTweak('theme', tweaks.theme === 'dark' ? 'light' : 'dark')} title="Toggle theme">
-          {tweaks.theme === 'dark' ? <Icon name="sun" size={15} /> : <Icon name="moon" size={15} />}
+        <button className="icon-btn" onClick={onToggleTheme} title="Toggle theme">
+          {theme === 'dark' ? <Icon name="sun" size={15} /> : <Icon name="moon" size={15} />}
         </button>
-      </div>
-    </div>
-  );
-}
-
-function TweaksPanel({ tweaks, setTweak, open, onClose }) {
-  if (!open) return null;
-  const Seg = ({ value, options, onChange }) => (
-    <div className="tweaks-seg">
-      {options.map(o => (
-        <button key={o} className={value === o ? 'active' : ''} onClick={() => onChange(o)}>{o}</button>
-      ))}
-    </div>
-  );
-  return (
-    <div className="tweaks-panel">
-      <header>
-        <span>Tweaks</span>
-        <button className="x" onClick={onClose}>✕</button>
-      </header>
-      <div className="body">
-        <div className="sect">Layout</div>
-        <div className="row">
-          <span className="lbl">Variation</span>
-          <Seg value={tweaks.variation} options={['stacked', 'rail']} onChange={v => setTweak('variation', v)} />
-        </div>
-        <div className="sect">Display</div>
-        <div className="row">
-          <span className="lbl">Theme</span>
-          <Seg value={tweaks.theme} options={['dark', 'light']} onChange={v => setTweak('theme', v)} />
-        </div>
-        <div className="row">
-          <span className="lbl">Density</span>
-          <Seg value={tweaks.density} options={['compact', 'default', 'comfortable']} onChange={v => setTweak('density', v)} />
-        </div>
       </div>
     </div>
   );
@@ -1637,7 +1476,7 @@ function RunsListPage({ tick }) {
   );
 }
 
-function RunDetailPage({ activityId, tweaks, tick, onCopy }) {
+function RunDetailPage({ activityId, tick, onCopy }) {
   const [activity, setActivity] = React.useState(null);
   const [subtree, setSubtree] = React.useState(null);
   const [events, setEvents] = React.useState(null);
@@ -1733,7 +1572,6 @@ function RunDetailPage({ activityId, tweaks, tick, onCopy }) {
     { id: 'pending', label: 'Pending', count: pending },
   ];
 
-  const useRail = tweaks.variation === 'rail' && (activeTab === 'history' || activeTab === 'graph');
   const selected = treeById[selectedAct] || activity;
 
   return (
@@ -1748,7 +1586,7 @@ function RunDetailPage({ activityId, tweaks, tick, onCopy }) {
       <Details activity={root} stats={{ events: eventCount, workers: workerSet.size, pending: pending, treeSize: tree.length, durationMs: totalMs }} onCopy={onCopy} />
       <Tabs items={tabs} active={activeTab} onChange={setActiveTab} />
 
-      <div className={'layout ' + (useRail ? 'with-rail' : '')}>
+      <div className="layout">
         <div style={{ minWidth: 0 }}>
           {activeTab === 'history' && (
             <>
@@ -1767,8 +1605,6 @@ function RunDetailPage({ activityId, tweaks, tick, onCopy }) {
           {activeTab === 'workers' && <WorkersView events={events} tree={tree} />}
           {activeTab === 'pending' && <PendingView tree={tree} onSelect={(id) => { setSelectedAct(id); setActiveTab('history'); }} />}
         </div>
-
-        {useRail && <Rail activity={selected} result={result} />}
       </div>
     </>
   );
@@ -2168,45 +2004,6 @@ function EventLog({ events }) {
   );
 }
 
-function Rail({ activity: a, result }) {
-  const dur = activityDurationMs(a);
-  let resultStr = null;
-  if (result && result.data != null) {
-    try {
-      const v = typeof result.data === 'string' ? JSON.parse(result.data) : result.data;
-      resultStr = JSON.stringify(v, null, 2);
-    } catch { resultStr = String(result.data); }
-  }
-  return (
-    <aside className="rail">
-      <h4>Selected activity</h4>
-      <div className="row"><span className="k">Type</span><span className="v" title={a.activity_type}>{a.activity_type}</span></div>
-      <div className="row"><span className="k">ID</span><span className="v" title={a.id}>{shortId(a.id)}…</span></div>
-      <div className="row"><span className="k">Status</span><span className="v">{a.status}</span></div>
-      <div className="row"><span className="k">Depth</span><span className="v">{a.depth || 0}</span></div>
-      <div className="row"><span className="k">Started</span><span className="v">{fmtTsShort(a.started_at)}</span></div>
-      <div className="row"><span className="k">Ended</span><span className="v">{fmtTsShort(a.completed_at)}</span></div>
-      <div className="row"><span className="k">Duration</span><span className="v">{fmtDuration(dur)}</span></div>
-      <div className="row"><span className="k">Retry</span><span className="v">{a.retry_count}/{a.max_retries === 0 ? '∞' : a.max_retries}</span></div>
-      <div className="row"><span className="k">Worker</span><span className="v">{a.current_worker_id || a.last_worker_id || '—'}</span></div>
-
-      {a.last_error && (
-        <>
-          <h4 style={{ marginTop: 16 }}>Last error</h4>
-          <div className="json" style={{ color: 'var(--red)' }}>{a.last_error}</div>
-        </>
-      )}
-
-      {resultStr && (
-        <>
-          <h4 style={{ marginTop: 16 }}>Result</h4>
-          <div className="json">{resultStr}</div>
-        </>
-      )}
-    </aside>
-  );
-}
-
 function MetadataView({ activity }) {
   const meta = activity.metadata || {};
   const json = JSON.stringify({
@@ -2310,35 +2107,29 @@ function PendingView({ tree, onSelect }) {
 }
 
 function App() {
-  const [tweaks, setTweak] = useStoredTweaks({ theme: 'dark', density: 'default', variation: 'stacked' });
-  const [tweaksOpen, setTweaksOpen] = React.useState(false);
+  const [theme, setTheme] = useStoredTheme('dark');
   const [tick, setTick] = React.useState(0);
   const route = useHashRoute();
   const { copy, flash } = useClipboard();
   const liveStatus = useLiveStream(setTick);
 
   React.useEffect(() => {
-    document.documentElement.setAttribute('data-theme', tweaks.theme);
-    document.documentElement.setAttribute('data-density', tweaks.density);
-  }, [tweaks.theme, tweaks.density]);
+    document.documentElement.setAttribute('data-theme', theme);
+  }, [theme]);
 
   const refresh = React.useCallback(() => setTick(t => t + 1), []);
+  const toggleTheme = React.useCallback(() => setTheme(theme === 'dark' ? 'light' : 'dark'), [theme, setTheme]);
 
   return (
     <div className="app">
       <Sidebar active="workflows" />
       <div className="main">
-        <TopBar tweaks={tweaks} setTweak={setTweak} onRefresh={refresh} liveStatus={liveStatus} />
+        <TopBar theme={theme} onToggleTheme={toggleTheme} onRefresh={refresh} liveStatus={liveStatus} />
         <div className="content">
           {route.name === 'list' && <RunsListPage tick={tick} />}
-          {route.name === 'run' && <RunDetailPage activityId={route.id} tweaks={tweaks} tick={tick} onCopy={copy} />}
+          {route.name === 'run' && <RunDetailPage activityId={route.id} tick={tick} onCopy={copy} />}
         </div>
       </div>
-
-      <button className="tweaks-toggle" onClick={() => setTweaksOpen(o => !o)} title="Tweaks">
-        <Icon name="sliders" size={15} />
-      </button>
-      <TweaksPanel tweaks={tweaks} setTweak={setTweak} open={tweaksOpen} onClose={() => setTweaksOpen(false)} />
 
       {flash && <div className="copy-flash">{flash}</div>}
     </div>
