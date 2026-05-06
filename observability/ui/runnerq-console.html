@@ -1532,6 +1532,7 @@ function RunsListPage({ manualTick }) {
         const s = await api('/stats');
         if (cancelled) return;
         setStats(s);
+        setErr(null);
       } catch (e) {
         if (!cancelled) setErr(String(e));
       }
@@ -1553,6 +1554,7 @@ function RunsListPage({ manualTick }) {
         const r = await api('/roots?' + params.toString());
         if (cancelled) return;
         setRoots(r || []);
+        setErr(null);
       } catch (e) {
         if (!cancelled) setErr(String(e));
       }
@@ -1569,7 +1571,12 @@ function RunsListPage({ manualTick }) {
     if (!stillThere) setTypeFilter('all');
   }, [typeFilter, roots]);
 
-  if (err) return <div className="empty-state"><div className="big">Failed to load</div><div>{err}</div></div>;
+  // Block the page only on initial-load failure. Once we've rendered data at
+  // least once, transient failures (backend restart, network blip) keep the
+  // last good state and surface as a small banner.
+  if (err && (!stats || !roots)) {
+    return <div className="empty-state"><div className="big">Failed to load</div><div>{err}</div></div>;
+  }
   if (!stats || !roots) return <div className="empty-state">Loading…</div>;
 
   // Filter pills count rows in the loaded batch — they're a UI control over
@@ -1818,6 +1825,7 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
         const cache = subtreeCacheRef.current;
         if (cache.rootId === rootId && cache.tree && cache.key === cacheKey) {
           setSubtree(cache.tree);
+          setErr(null);
           return;
         }
         const st = await api('/activities/' + activityId + '/subtree');
@@ -1825,6 +1833,7 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
         const tree = st || [];
         setSubtree(tree);
         subtreeCacheRef.current = { rootId, tree, key: cacheKey };
+        setErr(null);
       } catch (e) {
         if (!cancelled) setErr(String(e));
       }
@@ -1860,7 +1869,11 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
     return () => { cancelled = true; };
   }, [selectedAct, manualTick, liveTick]);
 
-  if (err) return <div className="empty-state"><div className="big">Failed to load</div><div>{err}</div></div>;
+  // Only block on initial-load failure. Once we've rendered the run once,
+  // transient errors keep the existing view and let the next tick retry.
+  if (err && !activity) {
+    return <div className="empty-state"><div className="big">Failed to load</div><div>{err}</div></div>;
+  }
   if (!activity) return <div className="empty-state">Loading…</div>;
 
   const tree = (subtree && subtree.length > 0) ? subtree : [activity];
@@ -2427,6 +2440,7 @@ function SchedulesPage({ manualTick }) {
         const r = await api('/cron?limit=500');
         if (cancelled) return;
         setRuns(r || []);
+        setErr(null);
       } catch (e) {
         if (!cancelled) setErr(String(e));
       }
@@ -2434,7 +2448,10 @@ function SchedulesPage({ manualTick }) {
     return () => { cancelled = true; };
   }, [manualTick, liveTick]);
 
-  if (err) return <div className="empty-state"><div className="big">Failed to load</div><div>{err}</div></div>;
+  // Block only on initial-load failure; keep prior data on transient errors.
+  if (err && !runs) {
+    return <div className="empty-state"><div className="big">Failed to load</div><div>{err}</div></div>;
+  }
   if (!runs) return <div className="empty-state">Loading…</div>;
 
   // Group cron-tagged runs by activity_type. Each group becomes a "schedule"
