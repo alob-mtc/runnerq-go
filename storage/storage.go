@@ -100,12 +100,13 @@ func NewTimeoutFailure() FailureKind {
 
 // QueueStats holds queue-level statistics.
 type QueueStats struct {
-	Pending    uint64
-	Processing uint64
-	Scheduled  uint64
-	DeadLetter uint64
-	ByPriority PriorityBreakdown
-	MaxWorkers *int
+	Pending       uint64
+	Processing    uint64
+	Scheduled     uint64
+	DeadLetter    uint64
+	ByPriority    PriorityBreakdown
+	MaxWorkers    *int
+	ActiveWorkers uint64 // distinct current_worker_id across processing rows
 }
 
 // PriorityBreakdown counts activities by priority level.

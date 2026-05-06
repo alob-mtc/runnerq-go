@@ -930,8 +930,15 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
 
 .kpi-row {
   display: grid;
-  grid-template-columns: repeat(6, 1fr);
+  grid-template-columns: repeat(7, 1fr);
   gap: 10px;
+}
+.kpi-value .frac {
+  font-size: 14px;
+  color: var(--fg-3);
+  font-weight: 500;
+  margin-left: 2px;
+  letter-spacing: -0.01em;
 }
 .kpi {
   background: var(--bg-1);
@@ -1552,6 +1559,13 @@ function RunsListPage({ tick }) {
 
         <div className="kpi-row">
           <div className="kpi"><div className="kpi-top"><span className="kpi-dot running" /><span className="kpi-label">Running</span></div><div className="kpi-value">{stats.processing_activities ?? 0}</div></div>
+          <div className="kpi" title="Distinct workers currently leasing an activity / configured engine concurrency cap">
+            <div className="kpi-top"><span className={'kpi-dot ' + ((stats.active_workers ?? 0) > 0 ? 'running' : 'neutral')} /><span className="kpi-label">Workers</span></div>
+            <div className="kpi-value">
+              {stats.active_workers ?? 0}
+              {stats.max_workers != null && <span className="frac"> / {stats.max_workers}</span>}
+            </div>
+          </div>
           <div className="kpi"><div className="kpi-top"><span className="kpi-dot neutral" /><span className="kpi-label">Pending</span></div><div className="kpi-value">{stats.pending_activities ?? 0}</div></div>
           <div className="kpi"><div className="kpi-top"><span className="kpi-dot scheduled" /><span className="kpi-label">Scheduled</span></div><div className="kpi-value">{stats.scheduled_activities ?? 0}</div></div>
           <div className="kpi"><div className="kpi-top"><span className="kpi-dot deadletter" /><span className="kpi-label">Dead Letter</span></div><div className="kpi-value">{stats.dead_letter_activities ?? 0}</div></div>

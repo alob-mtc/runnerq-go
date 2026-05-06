@@ -106,4 +106,5 @@ type QueueStats struct {
 	ScheduledActivities  uint64 `json:"scheduled_activities"`
 	DeadLetterActivities uint64 `json:"dead_letter_activities"`
 	MaxWorkers           *int   `json:"max_workers,omitempty"`
+	ActiveWorkers        uint64 `json:"active_workers"`
 }

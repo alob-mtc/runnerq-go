@@ -850,6 +850,14 @@ func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error
 	}
 
 	err = b.pool.QueryRow(ctx, `
+		SELECT COUNT(DISTINCT current_worker_id) FROM runnerq_activities
+		WHERE queue_name = $1 AND status = 'processing' AND current_worker_id IS NOT NULL`,
+		b.queueName).Scan(&stats.ActiveWorkers)
+	if err != nil {
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count active workers: %v", err))
+	}
+
+	err = b.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM runnerq_activities
 		WHERE queue_name = $1 AND status = 'dead_letter'`,
 		b.queueName).Scan(&stats.DeadLetter)
