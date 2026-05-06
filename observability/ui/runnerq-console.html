@@ -1389,9 +1389,22 @@ function RunDetailPage({ activityId, tweaks, tick, onCopy }) {
   const [selectedAct, setSelectedAct] = React.useState(activityId);
   const [err, setErr] = React.useState(null);
 
+  // Navigation reset: only when the user moves to a different activity.
+  // Tick changes (live updates) do NOT clear state — that was the flicker
+  // source.
+  React.useEffect(() => {
+    setActivity(null);
+    setSubtree(null);
+    setEvents(null);
+    setResult(null);
+    setSelectedAct(activityId);
+    setErr(null);
+  }, [activityId]);
+
+  // Re-fetch the activity + its subtree on navigation OR on each live tick.
+  // Stale state stays visible until new data lands so the UI doesn't flash.
   React.useEffect(() => {
     let cancelled = false;
-    setActivity(null); setSubtree(null); setSelectedAct(activityId); setErr(null);
     (async () => {
       try {
         const a = await api('/activities/' + activityId);
@@ -1407,6 +1420,16 @@ function RunDetailPage({ activityId, tweaks, tick, onCopy }) {
     return () => { cancelled = true; };
   }, [activityId, tick]);
 
+  // When the user picks a different node, drop the previous activity's events
+  // and result immediately so the panel doesn't show stale rows for the wrong
+  // activity. Live ticks for the same selectedAct don't clear.
+  React.useEffect(() => {
+    setEvents(null);
+    setResult(null);
+  }, [selectedAct]);
+
+  // Selected-activity events + result. Don't clear on transient fetch errors —
+  // keep the previous render so a momentary blip doesn't blank the panel.
   React.useEffect(() => {
     if (!selectedAct) return;
     let cancelled = false;
@@ -1415,12 +1438,12 @@ function RunDetailPage({ activityId, tweaks, tick, onCopy }) {
         const ev = await api('/activities/' + selectedAct + '/events?limit=200');
         if (cancelled) return;
         setEvents(ev || []);
-      } catch (e) {}
+      } catch (e) { /* keep previous events */ }
       try {
         const rs = await api('/activities/' + selectedAct + '/result');
         if (cancelled) return;
         setResult(rs);
-      } catch (e) { setResult(null); }
+      } catch (e) { /* keep previous result */ }
     })();
     return () => { cancelled = true; };
   }, [selectedAct, tick]);
