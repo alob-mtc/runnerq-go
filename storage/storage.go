@@ -232,6 +232,9 @@ type InspectionStorage interface {
 	// ListRecentRoots returns top-level activities (no parent), newest first. Used by the
 	// console workflows list to show distinct runs rather than every activity in every tree.
 	ListRecentRoots(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
+	// ListRecentActivities returns all activities (regardless of lineage), newest first.
+	// Used by the console workflows list when "flatten" is enabled.
+	ListRecentActivities(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
 	// EventStream returns a channel that yields real-time activity events.
 	EventStream(ctx context.Context) (<-chan ActivityEvent, error)
 }

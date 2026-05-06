@@ -199,7 +199,16 @@ func activityResultHandler(inspector *observability.QueueInspector) http.Handler
 func recentRootsHandler(inspector *observability.QueueInspector) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		offset, limit := parsePagination(r)
-		items, err := inspector.ListRecentRoots(r.Context(), offset, limit)
+		flatten := r.URL.Query().Get("flatten")
+		var (
+			items []observability.ActivitySnapshot
+			err   error
+		)
+		if flatten == "1" || flatten == "true" {
+			items, err = inspector.ListRecentActivities(r.Context(), offset, limit)
+		} else {
+			items, err = inspector.ListRecentRoots(r.Context(), offset, limit)
+		}
 		if err != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return

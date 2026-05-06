@@ -927,6 +927,45 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
   font-family: var(--font-mono);
 }
 
+.toggle-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 9px;
+  border-radius: 5px;
+  font-size: 11px;
+  color: var(--fg-2);
+  background: var(--bg-2);
+  border: 1px solid var(--line-2);
+  cursor: pointer;
+  text-transform: none;
+  letter-spacing: 0;
+  transition: all .12s;
+}
+.toggle-pill:hover { color: var(--fg-0); border-color: var(--line-strong); }
+.toggle-pill.on {
+  color: var(--purple-2);
+  background: var(--purple-soft);
+  border-color: var(--purple-line);
+}
+.toggle-pill .sw {
+  position: relative;
+  width: 22px; height: 12px;
+  border-radius: 999px;
+  background: var(--bg-4);
+  transition: background .15s;
+  flex-shrink: 0;
+}
+.toggle-pill .sw::after {
+  content: '';
+  position: absolute;
+  top: 2px; left: 2px;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--fg-2);
+  transition: transform .15s, background .15s;
+}
+.toggle-pill.on .sw { background: var(--purple); }
+.toggle-pill.on .sw::after { background: #fff; transform: translateX(10px); }
+
 .limit-select {
   appearance: none;
   -webkit-appearance: none;
@@ -1129,6 +1168,22 @@ function useStoredNum(key, defaultVal, allowed) {
   const persist = React.useCallback((next) => {
     setV(next);
     try { localStorage.setItem(key, String(next)); } catch (e) {}
+  }, [key]);
+  return [v, persist];
+}
+
+function useStoredBool(key, defaultVal) {
+  const [v, setV] = React.useState(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw === '1' || raw === 'true') return true;
+      if (raw === '0' || raw === 'false') return false;
+    } catch (e) {}
+    return defaultVal;
+  });
+  const persist = React.useCallback((next) => {
+    setV(next);
+    try { localStorage.setItem(key, next ? '1' : '0'); } catch (e) {}
   }, [key]);
   return [v, persist];
 }
@@ -1373,12 +1428,14 @@ function RunsListPage({ tick }) {
   const [statusFilter, setStatusFilter] = React.useState('all');
   const [typeFilter, setTypeFilter] = React.useState('all');
   const [limit, setLimit] = useStoredNum('runnerq.runsLimit', 200, RUNS_LIMIT_OPTIONS);
+  const [flatten, setFlatten] = useStoredBool('runnerq.flatten', false);
 
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [s, r] = await Promise.all([api('/stats'), api('/roots?limit=' + limit)]);
+        const flag = flatten ? '&flatten=1' : '';
+        const [s, r] = await Promise.all([api('/stats'), api('/roots?limit=' + limit + flag)]);
         if (cancelled) return;
         setStats(s);
         setRoots(r || []);
@@ -1387,7 +1444,7 @@ function RunsListPage({ tick }) {
       }
     })();
     return () => { cancelled = true; };
-  }, [tick, limit]);
+  }, [tick, limit, flatten]);
 
   // If the previously-selected type no longer appears in the loaded batch,
   // fall back to "all" so the user isn't stuck on an empty filter. Hook must
@@ -1455,18 +1512,26 @@ function RunsListPage({ tick }) {
 
       <div className="card runs-table-card">
         <div className="card-head">
-          <span>Recent runs</span>
+          <span>{flatten ? 'Recent activities' : 'Recent runs'}</span>
           <div className="right">
             <span style={{ fontSize: 11, color: 'var(--fg-3)', textTransform: 'none', letterSpacing: 0 }}>
               {filtered.length === roots.length
-                ? roots.length + ' root activities'
+                ? roots.length + (flatten ? ' activities' : ' root activities')
                 : filtered.length + ' of ' + roots.length}
             </span>
+            <button
+              className={'toggle-pill ' + (flatten ? 'on' : '')}
+              onClick={() => setFlatten(!flatten)}
+              title={flatten ? 'Showing every activity (children included)' : 'Showing only root activities — toggle to flatten the tree'}
+            >
+              <span className="sw" />
+              <span>Flatten</span>
+            </button>
             <select
               className="limit-select"
               value={limit}
               onChange={(e) => setLimit(Number(e.target.value))}
-              title="Max runs to fetch"
+              title="Max rows to fetch"
             >
               {RUNS_LIMIT_OPTIONS.map(n => (
                 <option key={n} value={n}>{n} / page</option>
@@ -1475,7 +1540,10 @@ function RunsListPage({ tick }) {
           </div>
         </div>
         {roots.length === 0 ? (
-          <div className="empty-state"><div className="big">No runs yet</div><div>Activities you spawn at the engine level appear here.</div></div>
+          <div className="empty-state">
+            <div className="big">{flatten ? 'No activities yet' : 'No runs yet'}</div>
+            <div>{flatten ? 'Any enqueued activity will appear here.' : 'Activities you spawn at the engine level appear here.'}</div>
+          </div>
         ) : filtered.length === 0 ? (
           <div className="empty-state"><div className="big">No runs match</div><div>Try clearing the search or switching the status filter.</div></div>
         ) : (
