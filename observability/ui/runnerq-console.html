@@ -1263,7 +1263,14 @@ function useHashRoute() {
     const m = h.match(/^#\/run\/([0-9a-f-]+)\/?(.*)$/i);
     if (m) return { name: 'run', id: m[1], tab: m[2] || 'history' };
     if (h.startsWith('#/schedules')) return { name: 'schedules' };
-    return { name: 'list' };
+    // List path with optional query: #/?status=completed&type=foo&q=bar
+    const qIdx = h.indexOf('?');
+    const params = {};
+    if (qIdx >= 0) {
+      const usp = new URLSearchParams(h.slice(qIdx + 1));
+      usp.forEach((v, k) => { params[k] = v; });
+    }
+    return { name: 'list', params };
   };
   const [route, setRoute] = React.useState(get());
   React.useEffect(() => {
@@ -1486,15 +1493,34 @@ function FilterBar({ q, setQ, status, setStatus, type, setType, types, totalLoad
   );
 }
 
-function RunsListPage({ manualTick }) {
+function RunsListPage({ manualTick, urlParams = {} }) {
   const [stats, setStats] = React.useState(null);
   const [roots, setRoots] = React.useState(null);
   const [err, setErr] = React.useState(null);
-  const [q, setQ] = React.useState('');
-  const [statusFilter, setStatusFilter] = React.useState('all');
-  const [typeFilter, setTypeFilter] = React.useState('all');
+  // Filters initialize from URL hash so browser-back from a detail page
+  // restores the user's view (e.g. they were filtering Completed when they
+  // clicked a row).
+  const [q, setQ] = React.useState(urlParams.q || '');
+  const [statusFilter, setStatusFilter] = React.useState(urlParams.status || 'all');
+  const [typeFilter, setTypeFilter] = React.useState(urlParams.type || 'all');
   const [limit, setLimit] = useStoredNum('runnerq.runsLimit', 200, RUNS_LIMIT_OPTIONS);
   const [flatten, setFlatten] = useStoredBool('runnerq.flatten', false);
+
+  // Mirror current filters into the URL hash with replaceState so we don't
+  // pollute browser history on every keystroke. When the user clicks a row,
+  // navTo pushes a new entry on top of this state — browser back lands them
+  // here with filters intact.
+  React.useEffect(() => {
+    const usp = new URLSearchParams();
+    if (q) usp.set('q', q);
+    if (statusFilter !== 'all') usp.set('status', statusFilter);
+    if (typeFilter !== 'all') usp.set('type', typeFilter);
+    const qs = usp.toString();
+    const newHash = '#/' + (qs ? '?' + qs : '');
+    if (window.location.hash !== newHash) {
+      window.history.replaceState(null, '', newHash || '#');
+    }
+  }, [q, statusFilter, typeFilter]);
 
   // Any live event matters to the runs list — a new activity could appear or
   // an existing one could change status. No filter; refetch on any tick.
@@ -1889,7 +1915,16 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
   return (
     <div className="page-scroll">
       <div className="breadcrumb">
-        <a className="back" onClick={() => navTo('#/')}>
+        <a className="back" onClick={() => {
+          // Prefer browser back so the user returns to the exact list view
+          // they came from (filter pills, search, type). Fallback to #/ when
+          // the user landed on the detail page directly (deep link, refresh).
+          if (window.history.length > 1) {
+            window.history.back();
+          } else {
+            navTo('#/');
+          }
+        }}>
           <Icon name="chevron-left" size={14} /> Back to Workflows
         </a>
       </div>
@@ -2554,7 +2589,7 @@ function App() {
       <div className="main">
         <TopBar theme={theme} onToggleTheme={toggleTheme} onRefresh={refresh} liveStatus={liveStatus} />
         <div className="content">
-          {route.name === 'list' && <RunsListPage manualTick={manualTick} />}
+          {route.name === 'list' && <RunsListPage manualTick={manualTick} urlParams={route.params || {}} />}
           {route.name === 'run' && <RunDetailPage activityId={route.id} manualTick={manualTick} onCopy={copy} />}
           {route.name === 'schedules' && <SchedulesPage manualTick={manualTick} />}
         </div>
