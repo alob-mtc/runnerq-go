@@ -68,6 +68,11 @@ CREATE INDEX IF NOT EXISTS idx_runnerq_parent_id
 CREATE INDEX IF NOT EXISTS idx_runnerq_root_id
     ON runnerq_activities(root_activity_id)
     WHERE root_activity_id IS NOT NULL;
+-- Partial index for the workflows-list view (parent IS NULL = roots only),
+-- ordered for the typical "newest first" query.
+CREATE INDEX IF NOT EXISTS idx_runnerq_root_only
+    ON runnerq_activities(queue_name, created_at DESC)
+    WHERE parent_activity_id IS NULL;
 
 -- Idempotency keys table
 CREATE TABLE IF NOT EXISTS runnerq_idempotency (
