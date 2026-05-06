@@ -31,12 +31,6 @@ func (q *QueueInspector) WithMaxWorkers(max int) *QueueInspector {
 	return q
 }
 
-// EventStream returns a channel of real-time activity events.
-// Deprecated: Use SubscribeEvents for fan-out multiplexed access.
-func (q *QueueInspector) EventStream(ctx context.Context) (<-chan ActivityEvent, error) {
-	return q.SubscribeEvents(ctx)
-}
-
 // SubscribeEvents returns a channel of real-time activity events backed by a
 // shared fan-out hub. Only one backend connection is used regardless of how
 // many subscribers are active. The returned channel is closed when ctx is

@@ -133,9 +133,10 @@ type PriorityBreakdown struct {
 	Low      uint64
 }
 
-// ActivitySnapshot is imported from observability - re-declare here for the interface.
-// The actual type lives in observability/models.go. We use the same structure.
-// To avoid circular imports, storage defines its own snapshot type.
+// ActivitySnapshot is the canonical activity-state view returned by
+// InspectionStorage. The observability package mirrors this struct in
+// observability/models.go so it can ship the type to its consumers without
+// importing storage (which would create a circular dependency).
 type ActivitySnapshot struct {
 	ID                uuid.UUID         `json:"id"`
 	ActivityType      string            `json:"activity_type"`

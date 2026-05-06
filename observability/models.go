@@ -59,25 +59,10 @@ type ActivitySnapshot struct {
 	Depth             uint16            `json:"depth"`
 }
 
-// ActivityEventType classifies lifecycle events.
+// ActivityEventType classifies lifecycle events. Concrete event-name
+// constants live in storage/storage.go, where the postgres backend writes
+// them; this package mirrors only the type so we can JSON-decode them.
 type ActivityEventType string
-
-const (
-	EventEnqueued      ActivityEventType = "Enqueued"
-	EventScheduled     ActivityEventType = "Scheduled"
-	EventDequeued      ActivityEventType = "Dequeued"
-	EventStarted       ActivityEventType = "Started"
-	EventCompleted     ActivityEventType = "Completed"
-	EventFailed        ActivityEventType = "Failed"
-	EventRetrying      ActivityEventType = "Retrying"
-	EventDeadLetter    ActivityEventType = "DeadLetter"
-	EventRequeued      ActivityEventType = "Requeued"
-	EventLeaseExtended ActivityEventType = "LeaseExtended"
-	EventResultStored  ActivityEventType = "ResultStored"
-	// EventSpawnLinked records a secondary parent linking to an existing
-	// activity via idempotency reuse.
-	EventSpawnLinked ActivityEventType = "SpawnLinked"
-)
 
 // ActivityEvent records a lifecycle event for an activity.
 type ActivityEvent struct {
