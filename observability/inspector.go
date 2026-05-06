@@ -280,6 +280,15 @@ func (q *QueueInspector) GetSubtree(ctx context.Context, rootID uuid.UUID) ([]Ac
 	return convertSnapshots(snapshots), nil
 }
 
+// ListRecentRoots returns top-level activities (no parent), newest first.
+func (q *QueueInspector) ListRecentRoots(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error) {
+	snapshots, err := q.backend.ListRecentRoots(ctx, offset, limit)
+	if err != nil {
+		return nil, err
+	}
+	return convertSnapshots(snapshots), nil
+}
+
 // RecentEvents returns recent events for a specific activity.
 func (q *QueueInspector) RecentEvents(ctx context.Context, activityID uuid.UUID, limit int) ([]ActivityEvent, error) {
 	events, err := q.backend.GetActivityEvents(ctx, activityID, limit)

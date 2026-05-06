@@ -229,6 +229,9 @@ type InspectionStorage interface {
 	GetChildren(ctx context.Context, parentID uuid.UUID, offset, limit int) ([]ActivitySnapshot, error)
 	// GetSubtree returns all activities in the tree rooted at rootID, including the root itself.
 	GetSubtree(ctx context.Context, rootID uuid.UUID) ([]ActivitySnapshot, error)
+	// ListRecentRoots returns top-level activities (no parent), newest first. Used by the
+	// console workflows list to show distinct runs rather than every activity in every tree.
+	ListRecentRoots(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
 	// EventStream returns a channel that yields real-time activity events.
 	EventStream(ctx context.Context) (<-chan ActivityEvent, error)
 }
