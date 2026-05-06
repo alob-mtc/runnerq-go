@@ -1523,6 +1523,24 @@ function RunsListPage({ manualTick }) {
     }
   };
 
+  // Stats are queue-wide and independent of the row filters — only refetch
+  // when something in the queue could have changed (tick).
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const s = await api('/stats');
+        if (cancelled) return;
+        setStats(s);
+      } catch (e) {
+        if (!cancelled) setErr(String(e));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [manualTick, liveTick]);
+
+  // Rows refetch when the user changes filters OR on tick — but not on every
+  // pill click pulling stats again.
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -1532,9 +1550,8 @@ function RunsListPage({ manualTick }) {
         if (flatten) params.set('flatten', '1');
         const backendStatus = statusToBackend(statusFilter);
         if (backendStatus) params.set('status', backendStatus);
-        const [s, r] = await Promise.all([api('/stats'), api('/roots?' + params.toString())]);
+        const r = await api('/roots?' + params.toString());
         if (cancelled) return;
-        setStats(s);
         setRoots(r || []);
       } catch (e) {
         if (!cancelled) setErr(String(e));
