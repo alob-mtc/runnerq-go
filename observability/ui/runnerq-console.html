@@ -867,6 +867,55 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
   flex-direction: column;
   gap: 10px;
 }
+.filter-row {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+}
+.filter-row .search { flex: 1; min-width: 0; }
+
+.type-filter {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 0 10px;
+  height: 36px;
+  background: var(--bg-1);
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  flex-shrink: 0;
+  min-width: 200px;
+  transition: border-color .15s, box-shadow .15s;
+}
+.type-filter:focus-within { border-color: var(--purple-line); box-shadow: 0 0 0 3px var(--purple-soft); }
+.type-filter > label {
+  font-size: 10.5px;
+  color: var(--fg-3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 500;
+}
+.type-filter select {
+  appearance: none;
+  -webkit-appearance: none;
+  background: none;
+  border: 0;
+  outline: none;
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--fg-0);
+  cursor: pointer;
+  padding: 0 22px 0 0;
+  flex: 1;
+  min-width: 0;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6' fill='none' stroke='%238b919c' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M0.5 1l4.5 4 4.5-4'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 4px center;
+}
+.type-filter select option {
+  background: var(--bg-1);
+  color: var(--fg-0);
+}
+
 .search {
   position: relative;
   display: flex; align-items: center; gap: 8px;
@@ -1359,11 +1408,11 @@ function TweaksPanel({ tweaks, setTweak, open, onClose }) {
   );
 }
 
-function FilterBar({ q, setQ, status, setStatus, counts }) {
+function FilterBar({ q, setQ, status, setStatus, type, setType, types, counts }) {
   const ref = React.useRef(null);
   React.useEffect(() => {
     const onKey = (e) => {
-      if ((e.key === '/' || (e.key === 'k' && (e.metaKey || e.ctrlKey))) && document.activeElement.tagName !== 'INPUT') {
+      if ((e.key === '/' || (e.key === 'k' && (e.metaKey || e.ctrlKey))) && document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'SELECT') {
         e.preventDefault();
         ref.current && ref.current.focus();
       }
@@ -1389,20 +1438,35 @@ function FilterBar({ q, setQ, status, setStatus, counts }) {
 
   return (
     <div className="filter-bar">
-      <div className="search">
-        <Icon name="search" size={14} />
-        <input
-          ref={ref}
-          placeholder="Search by activity type or ID…"
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-        />
-        {q && (
-          <button className="clear" onClick={() => setQ('')} title="Clear (Esc)">
-            <Icon name="x" size={13} />
-          </button>
-        )}
-        <kbd>/</kbd>
+      <div className="filter-row">
+        <div className="search">
+          <Icon name="search" size={14} />
+          <input
+            ref={ref}
+            placeholder="Search by activity type or ID…"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+          />
+          {q && (
+            <button className="clear" onClick={() => setQ('')} title="Clear (Esc)">
+              <Icon name="x" size={13} />
+            </button>
+          )}
+          <kbd>/</kbd>
+        </div>
+        <div className="type-filter">
+          <label htmlFor="type-select-input">Type</label>
+          <select
+            id="type-select-input"
+            value={type}
+            onChange={(e) => setType(e.target.value)}
+          >
+            <option value="all">All types ({counts.total})</option>
+            {types.map(t => (
+              <option key={t.name} value={t.name}>{t.name} ({t.count})</option>
+            ))}
+          </select>
+        </div>
       </div>
       <div className="filter-pills">
         {filters.map(f => {
@@ -1426,6 +1490,7 @@ function RunsListPage({ tick }) {
   const [err, setErr] = React.useState(null);
   const [q, setQ] = React.useState('');
   const [statusFilter, setStatusFilter] = React.useState('all');
+  const [typeFilter, setTypeFilter] = React.useState('all');
 
   React.useEffect(() => {
     let cancelled = false;
@@ -1446,14 +1511,28 @@ function RunsListPage({ tick }) {
   if (!stats || !roots) return <div className="empty-state">Loading…</div>;
 
   const counts = { total: roots.length };
+  const typeCountMap = {};
   roots.forEach(r => {
     const sc = statusClass(r.status);
     counts[sc] = (counts[sc] || 0) + 1;
+    typeCountMap[r.activity_type] = (typeCountMap[r.activity_type] || 0) + 1;
   });
+  const types = Object.entries(typeCountMap)
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+
+  // If the previously-selected type no longer appears in the loaded batch,
+  // fall back to "all" so the user isn't stuck on an empty filter.
+  React.useEffect(() => {
+    if (typeFilter !== 'all' && !typeCountMap[typeFilter]) {
+      setTypeFilter('all');
+    }
+  }, [typeFilter, roots]);
 
   const qLower = q.trim().toLowerCase();
   const filtered = roots.filter(r => {
     if (statusFilter !== 'all' && statusClass(r.status) !== statusFilter) return false;
+    if (typeFilter !== 'all' && r.activity_type !== typeFilter) return false;
     if (qLower) {
       const hay = (r.activity_type + ' ' + r.id).toLowerCase();
       if (!hay.includes(qLower)) return false;
@@ -1483,7 +1562,13 @@ function RunsListPage({ tick }) {
         <div className="kpi"><div className="kpi-top"><span className="kpi-dot retrying" /><span className="kpi-label">High</span></div><div className="kpi-value">{stats.high_priority ?? 0}</div></div>
       </div>
 
-      <FilterBar q={q} setQ={setQ} status={statusFilter} setStatus={setStatusFilter} counts={counts} />
+      <FilterBar
+        q={q} setQ={setQ}
+        status={statusFilter} setStatus={setStatusFilter}
+        type={typeFilter} setType={setTypeFilter}
+        types={types}
+        counts={counts}
+      />
 
       <div className="card runs-table-card">
         <div className="card-head">
