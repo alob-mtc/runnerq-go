@@ -1084,6 +1084,41 @@ function useHashRoute() {
 
 function navTo(hash) { window.location.hash = hash; }
 
+// SSE-driven live updates: open one EventSource against the stream endpoint
+// and bump the global tick on each event (debounced to avoid refetch storms
+// when a burst of events arrives). The browser auto-reconnects on transient
+// drops.
+function useLiveTick(setTick, debounceMs = 600) {
+  React.useEffect(() => {
+    let pending = false;
+    let timer = null;
+    const flush = () => {
+      timer = null;
+      if (pending) {
+        pending = false;
+        setTick(t => t + 1);
+      }
+    };
+    const bump = () => {
+      pending = true;
+      if (!timer) timer = setTimeout(flush, debounceMs);
+    };
+    const url = API + '/stream';
+    let es;
+    try {
+      es = new EventSource(url);
+      es.onmessage = bump;
+      es.onerror = () => { /* browser auto-reconnects */ };
+    } catch (e) {
+      // EventSource unavailable — quietly skip.
+    }
+    return () => {
+      if (es) es.close();
+      if (timer) clearTimeout(timer);
+    };
+  }, [setTick, debounceMs]);
+}
+
 function useClipboard() {
   const [flash, setFlash] = React.useState('');
   const copy = React.useCallback((text, label) => {
@@ -1934,6 +1969,7 @@ function App() {
   const [tick, setTick] = React.useState(0);
   const route = useHashRoute();
   const { copy, flash } = useClipboard();
+  useLiveTick(setTick);
 
   React.useEffect(() => {
     document.documentElement.setAttribute('data-theme', tweaks.theme);
