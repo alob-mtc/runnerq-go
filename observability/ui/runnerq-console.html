@@ -1152,6 +1152,20 @@ function shortId(id) {
   return id.length > 8 ? id.slice(0, 8) : id;
 }
 
+// Pretty-print a value that may already be a parsed JS object (json.RawMessage
+// from the backend round-trips as the embedded JSON) OR a string holding JSON
+// OR a primitive. Avoids the classic JSON.parse(object) -> "[object Object]"
+// trap.
+function formatJsonField(v) {
+  if (v == null) return 'null';
+  if (typeof v === 'string') {
+    try { return JSON.stringify(JSON.parse(v), null, 2); }
+    catch { return v; }
+  }
+  try { return JSON.stringify(v, null, 2); }
+  catch { return String(v); }
+}
+
 const RUNS_LIMIT_OPTIONS = [25, 50, 100, 200, 500, 1000];
 
 function useStoredNum(key, defaultVal, allowed) {
@@ -1813,19 +1827,8 @@ function Tabs({ items, active, onChange }) {
 }
 
 function IORow({ activity, result, onCopy }) {
-  const inputStr = (() => {
-    try { return JSON.stringify(JSON.parse(activity.payload || 'null'), null, 2); }
-    catch { return String(activity.payload || ''); }
-  })();
-  const resultStr = (() => {
-    if (!result || result.data == null) return null;
-    try {
-      const v = typeof result.data === 'string' ? JSON.parse(result.data) : result.data;
-      return JSON.stringify(v, null, 2);
-    } catch {
-      return typeof result.data === 'string' ? result.data : JSON.stringify(result.data);
-    }
-  })();
+  const inputStr = formatJsonField(activity.payload);
+  const resultStr = result && result.data != null ? formatJsonField(result.data) : null;
 
   return (
     <div className="io-row">
