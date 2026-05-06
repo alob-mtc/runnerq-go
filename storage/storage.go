@@ -109,6 +109,20 @@ type QueueStats struct {
 	ByPriority    PriorityBreakdown
 	MaxWorkers    *int
 	ActiveWorkers uint64 // distinct current_worker_id across processing rows
+	// Roots is the same status breakdown but limited to root activities
+	// (parent_activity_id IS NULL). Drives pill counts on the workflows list.
+	Roots RootStatusBreakdown
+}
+
+// RootStatusBreakdown counts root activities per status.
+type RootStatusBreakdown struct {
+	Pending    uint64
+	Processing uint64
+	Scheduled  uint64
+	Retrying   uint64
+	Completed  uint64
+	Failed     uint64
+	DeadLetter uint64
 }
 
 // PriorityBreakdown counts activities by priority level.

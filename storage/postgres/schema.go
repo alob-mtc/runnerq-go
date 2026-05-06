@@ -73,6 +73,9 @@ CREATE INDEX IF NOT EXISTS idx_runnerq_root_id
 CREATE INDEX IF NOT EXISTS idx_runnerq_root_only
     ON runnerq_activities(queue_name, created_at DESC)
     WHERE parent_activity_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_runnerq_root_status
+    ON runnerq_activities(queue_name, status)
+    WHERE parent_activity_id IS NULL;
 
 -- Idempotency keys table
 CREATE TABLE IF NOT EXISTS runnerq_idempotency (

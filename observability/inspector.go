@@ -347,6 +347,15 @@ func (q *QueueInspector) Stats(ctx context.Context) (*QueueStats, error) {
 		DeadLetterActivities: backendStats.DeadLetter,
 		MaxWorkers:           maxWorkers,
 		ActiveWorkers:        backendStats.ActiveWorkers,
+		Roots: RootStatusBreakdown{
+			Pending:    backendStats.Roots.Pending,
+			Processing: backendStats.Roots.Processing,
+			Scheduled:  backendStats.Roots.Scheduled,
+			Retrying:   backendStats.Roots.Retrying,
+			Completed:  backendStats.Roots.Completed,
+			Failed:     backendStats.Roots.Failed,
+			DeadLetter: backendStats.Roots.DeadLetter,
+		},
 	}, nil
 }
 

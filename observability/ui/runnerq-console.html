@@ -1579,14 +1579,43 @@ function RunsListPage({ manualTick }) {
   }
   if (!stats || !roots) return <div className="empty-state">Loading…</div>;
 
-  // Filter pills count rows in the loaded batch — they're a UI control over
-  // the visible table, so batch-derived is correct. KPI cards above are
-  // queue-wide via /stats and don't depend on page limit.
-  const counts = { total: roots.length };
+  // Filter pill counts are queue-wide so they reflect reality, not whatever
+  // the current page-limit slice happens to contain. /stats supplies a
+  // root-only breakdown (used when flatten is off) plus the all-activity
+  // counts (used when flatten is on). Type counts and "All total" still
+  // come from the loaded batch since we don't fetch a queue-wide type
+  // breakdown.
+  const counts = (() => {
+    const c = { total: 0 };
+    if (flatten) {
+      c.total      = (stats.processing_activities || 0)
+                   + (stats.pending_activities    || 0)
+                   + (stats.scheduled_activities  || 0)
+                   + (stats.retrying_activities   || 0)
+                   + (stats.failed_activities     || 0)
+                   + (stats.dead_letter_activities|| 0);
+      c.running    = stats.processing_activities  || 0;
+      c.pending    = stats.pending_activities     || 0;
+      c.scheduled  = stats.scheduled_activities   || 0;
+      c.retrying   = stats.retrying_activities    || 0;
+      c.failed     = stats.failed_activities      || 0;
+      c.deadletter = stats.dead_letter_activities || 0;
+      c.completed  = 0; // /stats doesn't aggregate completed queue-wide
+    } else if (stats.roots) {
+      const r = stats.roots;
+      c.running    = r.processing  || 0;
+      c.pending    = r.pending     || 0;
+      c.scheduled  = r.scheduled   || 0;
+      c.retrying   = r.retrying    || 0;
+      c.completed  = r.completed   || 0;
+      c.failed     = r.failed      || 0;
+      c.deadletter = r.dead_letter || 0;
+      c.total      = c.running + c.pending + c.scheduled + c.retrying + c.completed + c.failed + c.deadletter;
+    }
+    return c;
+  })();
   const typeCountMap = {};
   roots.forEach(r => {
-    const sc = statusClass(r.status);
-    counts[sc] = (counts[sc] || 0) + 1;
     typeCountMap[r.activity_type] = (typeCountMap[r.activity_type] || 0) + 1;
   });
   const types = Object.entries(typeCountMap)

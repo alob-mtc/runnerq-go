@@ -824,7 +824,14 @@ func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error
 			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'retrying')                                                               AS retrying,
 			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'failed')                                                                 AS failed,
 			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'dead_letter')                                                            AS dead_letter,
-			(SELECT COUNT(DISTINCT current_worker_id) FROM runnerq_activities WHERE queue_name = $1 AND status = 'processing' AND current_worker_id IS NOT NULL) AS active_workers`,
+			(SELECT COUNT(DISTINCT current_worker_id) FROM runnerq_activities WHERE queue_name = $1 AND status = 'processing' AND current_worker_id IS NOT NULL) AS active_workers,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'pending')     AS root_pending,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'processing')  AS root_processing,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'scheduled')   AS root_scheduled,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'retrying')    AS root_retrying,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'completed')   AS root_completed,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'failed')      AS root_failed,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'dead_letter') AS root_dead_letter`,
 		b.queueName).Scan(
 		&stats.Pending,
 		&stats.Processing,
@@ -833,6 +840,13 @@ func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error
 		&stats.Failed,
 		&stats.DeadLetter,
 		&stats.ActiveWorkers,
+		&stats.Roots.Pending,
+		&stats.Roots.Processing,
+		&stats.Roots.Scheduled,
+		&stats.Roots.Retrying,
+		&stats.Roots.Completed,
+		&stats.Roots.Failed,
+		&stats.Roots.DeadLetter,
 	)
 	if err != nil {
 		return nil, storage.NewInternalError(fmt.Sprintf("Failed to compute queue stats: %v", err))
