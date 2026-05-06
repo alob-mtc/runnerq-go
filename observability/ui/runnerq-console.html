@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>RunnerQ Console</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%237c5cff'%3E%3Cpath d='M12 2L4 7v10l8 5 8-5V7z'/%3E%3C/svg%3E" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -980,7 +981,15 @@ const Icon = ({ name, size = 16, strokeWidth = 1.6, ...props }) => {
   );
 };
 
-const API = '/api/observability';
+// Compute API base from the current document path so the console works whether
+// it's served at the root or behind a StripPrefix mount like /console/.
+const __apiBase = (() => {
+  const p = window.location.pathname;
+  const idx = p.lastIndexOf('/');
+  const dir = idx >= 0 ? p.slice(0, idx + 1) : '/';
+  return dir + 'api/observability';
+})();
+const API = __apiBase;
 
 async function api(path) {
   const r = await fetch(API + path);
