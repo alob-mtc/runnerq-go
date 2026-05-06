@@ -895,15 +895,6 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
   border-color: var(--line-strong);
   box-shadow: inset 0 -2px 0 var(--purple);
 }
-.fpill .ct {
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  color: var(--fg-3);
-  background: var(--bg-2);
-  padding: 1px 5px;
-  border-radius: 3px;
-}
-.fpill.active .ct { color: var(--fg-1); background: var(--bg-4); }
 .fpill .dot { width: 6px; height: 6px; border-radius: 50%; }
 .fpill .dot.running   { background: var(--blue); box-shadow: 0 0 0 2px var(--blue-soft); }
 .fpill .dot.completed { background: var(--emerald); }
@@ -1423,7 +1414,7 @@ function TopBar({ theme, onToggleTheme, onRefresh, liveStatus }) {
   );
 }
 
-function FilterBar({ q, setQ, status, setStatus, type, setType, types, counts }) {
+function FilterBar({ q, setQ, status, setStatus, type, setType, types, totalLoaded }) {
   const ref = React.useRef(null);
   React.useEffect(() => {
     const onKey = (e) => {
@@ -1476,7 +1467,7 @@ function FilterBar({ q, setQ, status, setStatus, type, setType, types, counts })
             value={type}
             onChange={(e) => setType(e.target.value)}
           >
-            <option value="all">All types ({counts.total})</option>
+            <option value="all">All types ({totalLoaded})</option>
             {types.map(t => (
               <option key={t.name} value={t.name}>{t.name} ({t.count})</option>
             ))}
@@ -1484,16 +1475,12 @@ function FilterBar({ q, setQ, status, setStatus, type, setType, types, counts })
         </div>
       </div>
       <div className="filter-pills">
-        {filters.map(f => {
-          const ct = f.id === 'all' ? counts.total : (counts[f.id] || 0);
-          return (
-            <button key={f.id} className={'fpill ' + (status === f.id ? 'active' : '')} onClick={() => setStatus(f.id)}>
-              {f.id !== 'all' && <span className={'dot ' + f.id} />}
-              <span>{f.label}</span>
-              <span className="ct">{ct}</span>
-            </button>
-          );
-        })}
+        {filters.map(f => (
+          <button key={f.id} className={'fpill ' + (status === f.id ? 'active' : '')} onClick={() => setStatus(f.id)}>
+            {f.id !== 'all' && <span className={'dot ' + f.id} />}
+            <span>{f.label}</span>
+          </button>
+        ))}
       </div>
     </div>
   );
@@ -1579,41 +1566,8 @@ function RunsListPage({ manualTick }) {
   }
   if (!stats || !roots) return <div className="empty-state">Loading…</div>;
 
-  // Filter pill counts are queue-wide so they reflect reality, not whatever
-  // the current page-limit slice happens to contain. /stats supplies a
-  // root-only breakdown (used when flatten is off) plus the all-activity
-  // counts (used when flatten is on). Type counts and "All total" still
-  // come from the loaded batch since we don't fetch a queue-wide type
-  // breakdown.
-  const counts = (() => {
-    const c = { total: 0 };
-    if (flatten) {
-      c.total      = (stats.processing_activities || 0)
-                   + (stats.pending_activities    || 0)
-                   + (stats.scheduled_activities  || 0)
-                   + (stats.retrying_activities   || 0)
-                   + (stats.failed_activities     || 0)
-                   + (stats.dead_letter_activities|| 0);
-      c.running    = stats.processing_activities  || 0;
-      c.pending    = stats.pending_activities     || 0;
-      c.scheduled  = stats.scheduled_activities   || 0;
-      c.retrying   = stats.retrying_activities    || 0;
-      c.failed     = stats.failed_activities      || 0;
-      c.deadletter = stats.dead_letter_activities || 0;
-      c.completed  = 0; // /stats doesn't aggregate completed queue-wide
-    } else if (stats.roots) {
-      const r = stats.roots;
-      c.running    = r.processing  || 0;
-      c.pending    = r.pending     || 0;
-      c.scheduled  = r.scheduled   || 0;
-      c.retrying   = r.retrying    || 0;
-      c.completed  = r.completed   || 0;
-      c.failed     = r.failed      || 0;
-      c.deadletter = r.dead_letter || 0;
-      c.total      = c.running + c.pending + c.scheduled + c.retrying + c.completed + c.failed + c.deadletter;
-    }
-    return c;
-  })();
+  // Type-dropdown counts come from the loaded batch. Pills no longer carry
+  // counts — they're pure filter selectors.
   const typeCountMap = {};
   roots.forEach(r => {
     typeCountMap[r.activity_type] = (typeCountMap[r.activity_type] || 0) + 1;
@@ -1686,7 +1640,7 @@ function RunsListPage({ manualTick }) {
           status={statusFilter} setStatus={setStatusFilter}
           type={typeFilter} setType={setTypeFilter}
           types={types}
-          counts={counts}
+          totalLoaded={roots.length}
         />
       </div>
 
