@@ -324,10 +324,17 @@ func (e *WorkerEngine) safeHandle(handler ActivityHandler, ctx ActivityContext, 
 }
 
 func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result json.RawMessage, workerLabel string, workerID int, activityID any, activityType string) {
-	e.metrics.IncCounter("activity_completed", 1)
 	if err := e.queue.MarkCompleted(ctx, act, workerLabel); err != nil {
-		slog.Error("Failed to mark activity as completed", "worker_id", workerID, "activity_id", activityID, "error", err)
+		// MarkCompleted failed — the row was no longer in 'processing' with
+		// this worker (lease likely expired and the reaper requeued it).
+		// Don't claim success: another worker will rerun the activity.
+		// Don't store the result either, since the rerun will produce its own.
+		slog.Warn("Activity completed in handler but row was no longer claimable; another worker will rerun it",
+			"worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "error", err)
+		e.metrics.IncCounter("activity_lost_completion", 1)
+		return
 	}
+	e.metrics.IncCounter("activity_completed", 1)
 	slog.Info("Activity completed successfully", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType)
 
 	// Async result storage — tracked for graceful shutdown

@@ -333,11 +333,14 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, _ time.D
 		return nil, storage.NewInternalError(fmt.Sprintf("Failed to commit dequeue: %v", err))
 	}
 
-	// Auto-extend lease if timeout > default lease
+	// Auto-extend lease if the activity's per-attempt timeout exceeds the
+	// default lease window. ExtendLease replaces the deadline (it does not add
+	// to it), so the new value must cover the FULL timeout — earlier code
+	// computed (timeout - defaultLease + 10) and ended up with a lease shorter
+	// than the timeout, causing the reaper to requeue still-running handlers.
 	defaultLeaseSecs := b.defaultLeaseMS / 1000
 	if defaultLeaseSecs < int64(a.TimeoutSeconds) {
-		additionalSecs := int64(a.TimeoutSeconds) - defaultLeaseSecs
-		extendBy := time.Duration(additionalSecs+10) * time.Second
+		extendBy := time.Duration(int64(a.TimeoutSeconds)+10) * time.Second
 		if _, err := b.ExtendLease(ctx, a.ID, extendBy); err != nil {
 			slog.Warn("Failed to extend lease for long-running activity",
 				"activity_id", a.ID,
