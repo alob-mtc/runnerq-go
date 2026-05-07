@@ -56,6 +56,19 @@ CREATE INDEX IF NOT EXISTS idx_runnerq_dead_letter
 ALTER TABLE runnerq_activities
     ADD COLUMN IF NOT EXISTS max_retry_delay_seconds BIGINT NOT NULL DEFAULT 0;
 
+-- Lineage columns for parent/child activity tracking.
+ALTER TABLE runnerq_activities
+    ADD COLUMN IF NOT EXISTS parent_activity_id UUID,
+    ADD COLUMN IF NOT EXISTS root_activity_id UUID,
+    ADD COLUMN IF NOT EXISTS depth SMALLINT NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_runnerq_parent_id
+    ON runnerq_activities(parent_activity_id)
+    WHERE parent_activity_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_runnerq_root_id
+    ON runnerq_activities(root_activity_id)
+    WHERE root_activity_id IS NOT NULL;
+
 -- Idempotency keys table
 CREATE TABLE IF NOT EXISTS runnerq_idempotency (
     queue_name TEXT NOT NULL,

@@ -39,10 +39,11 @@ type activityQueue interface {
 	ScheduleActivity(ctx context.Context, a *activity) error
 	ProcessScheduledActivities(ctx context.Context) ([]*activity, error)
 	RequeueExpired(ctx context.Context, maxToProcess int) (uint64, error)
-	EvaluateIdempotencyRule(ctx context.Context, a *activity) (*uuid.UUID, error)
+	EvaluateIdempotencyRule(ctx context.Context, a *activity) (*storage.IdempotencyResult, error)
 	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
 	StoreResult(ctx context.Context, activityID uuid.UUID, result activityResult) error
 	GetResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error)
+	RecordSpawnLinked(ctx context.Context, childID, parentID uuid.UUID) error
 	SchedulesNatively() bool
 }
 
@@ -85,6 +86,9 @@ func activityToQueued(a *activity) storage.QueuedActivity {
 		Metadata:             a.Metadata,
 		IdempotencyKey:       idempKey,
 		CreatedAt:            a.CreatedAt,
+		ParentActivityID:     a.ParentActivityID,
+		RootActivityID:       a.RootActivityID,
+		Depth:                a.Depth,
 	}
 }
 
@@ -95,6 +99,10 @@ func queuedToActivity(q *storage.QueuedActivity) *activity {
 			Key:      q.IdempotencyKey.Key,
 			Behavior: storageBehaviorToOnDuplicate(q.IdempotencyKey.Behavior),
 		}
+	}
+	rootID := q.RootActivityID
+	if rootID == (uuid.UUID{}) {
+		rootID = q.ID
 	}
 	return &activity{
 		ID:                   q.ID,
@@ -111,6 +119,9 @@ func queuedToActivity(q *storage.QueuedActivity) *activity {
 		MaxRetryDelaySeconds: q.MaxRetryDelaySeconds,
 		Metadata:             q.Metadata,
 		IdempotencyKey:       idempKey,
+		ParentActivityID:     q.ParentActivityID,
+		RootActivityID:       rootID,
+		Depth:                q.Depth,
 	}
 }
 
@@ -199,7 +210,7 @@ func (a *backendQueueAdapter) RequeueExpired(ctx context.Context, maxToProcess i
 	return a.backend.RequeueExpired(ctx, maxToProcess)
 }
 
-func (a *backendQueueAdapter) EvaluateIdempotencyRule(ctx context.Context, act *activity) (*uuid.UUID, error) {
+func (a *backendQueueAdapter) EvaluateIdempotencyRule(ctx context.Context, act *activity) (*storage.IdempotencyResult, error) {
 	queued := activityToQueued(act)
 	return a.backend.CheckIdempotency(ctx, &queued)
 }
@@ -234,6 +245,10 @@ func (a *backendQueueAdapter) GetResult(ctx context.Context, activityID uuid.UUI
 		Data:  data,
 		State: ResultState(backendResult.State),
 	}, nil
+}
+
+func (a *backendQueueAdapter) RecordSpawnLinked(ctx context.Context, childID, parentID uuid.UUID) error {
+	return a.backend.RecordSpawnLinked(ctx, childID, parentID)
 }
 
 func (a *backendQueueAdapter) SchedulesNatively() bool {

@@ -68,6 +68,7 @@ const (
 	ErrScheduling
 	ErrDuplicateActivityW
 	ErrIdempotencyConflictW
+	ErrDepthExceeded
 	ErrUnknown
 )
 
@@ -109,6 +110,8 @@ func (e *WorkerError) Error() string {
 		prefix = "Duplicate activity detected"
 	case ErrIdempotencyConflictW:
 		prefix = "Idempotency key conflict"
+	case ErrDepthExceeded:
+		prefix = "Activity depth limit exceeded"
 	case ErrUnknown:
 		prefix = "Unknown error"
 	}

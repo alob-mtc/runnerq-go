@@ -54,6 +54,9 @@ type ActivitySnapshot struct {
 	LeaseDeadlineMS   *int64            `json:"lease_deadline_ms,omitempty"`
 	ProcessingMember  *string           `json:"processing_member,omitempty"`
 	IdempotencyKey    *string           `json:"idempotency_key,omitempty"`
+	ParentActivityID  *uuid.UUID        `json:"parent_activity_id,omitempty"`
+	RootActivityID    *uuid.UUID        `json:"root_activity_id,omitempty"`
+	Depth             uint16            `json:"depth"`
 }
 
 // ActivityEventType classifies lifecycle events.
@@ -71,6 +74,9 @@ const (
 	EventRequeued      ActivityEventType = "Requeued"
 	EventLeaseExtended ActivityEventType = "LeaseExtended"
 	EventResultStored  ActivityEventType = "ResultStored"
+	// EventSpawnLinked records a secondary parent linking to an existing
+	// activity via idempotency reuse.
+	EventSpawnLinked ActivityEventType = "SpawnLinked"
 )
 
 // ActivityEvent records a lifecycle event for an activity.

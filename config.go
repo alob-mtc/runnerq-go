@@ -28,7 +28,15 @@ type WorkerConfig struct {
 	// ActivityTypes restricts this engine to only dequeue specific activity types.
 	// When nil, workers dequeue all activity types.
 	ActivityTypes []string `json:"activity_types,omitempty"`
+
+	// MaxActivityDepth caps how deep the parent/child activity tree can grow.
+	// A handler attempting to spawn a child beyond this depth will receive ErrDepthExceeded.
+	// When zero, defaults to 32.
+	MaxActivityDepth uint16 `json:"max_activity_depth,omitempty"`
 }
+
+// DefaultMaxActivityDepth is the default cap when MaxActivityDepth is unset.
+const DefaultMaxActivityDepth uint16 = 32
 
 // DefaultWorkerConfig returns a WorkerConfig with sensible defaults.
 func DefaultWorkerConfig() WorkerConfig {

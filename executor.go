@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -58,6 +60,7 @@ type ActivityBuilder struct {
 	delay          *time.Duration
 	idempotencyKey *IdempotencyConfig
 	metadata       map[string]string
+	asRoot         bool
 }
 
 // Payload sets the JSON payload for the activity.
@@ -113,6 +116,15 @@ func (b *ActivityBuilder) Metadata(key, value string) *ActivityBuilder {
 		b.metadata = make(map[string]string)
 	}
 	b.metadata[key] = value
+	return b
+}
+
+// AsRoot detaches this spawn from its parent's lineage. The resulting activity
+// becomes a root (no parent, root is itself, depth 0) regardless of the
+// surrounding handler context. Use for fire-and-forget side jobs whose lifecycle
+// is logically independent of the parent (audit logs, async telemetry, etc.).
+func (b *ActivityBuilder) AsRoot() *ActivityBuilder {
+	b.asRoot = true
 	return b
 }
 
@@ -182,17 +194,53 @@ func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) 
 		}
 	}
 
-	return b.wrapper.executeActivity(ctx, b.activityType, b.payload, option)
+	return b.wrapper.executeActivity(ctx, b.activityType, b.payload, option, b.asRoot)
 }
 
 // WorkerEngineWrapper provides activity execution capabilities.
 // It implements ActivityExecutor.
 type WorkerEngineWrapper struct {
-	queue activityQueue
+	queue    activityQueue
+	maxDepth uint16
+	lineage  *lineageScope // nil at engine level; set when scoped to a running parent
 }
 
-func newWorkerEngineWrapper(queue activityQueue) *WorkerEngineWrapper {
-	return &WorkerEngineWrapper{queue: queue}
+// lineageScope captures the parent context that this wrapper applies to spawns.
+type lineageScope struct {
+	parentID  uuid.UUID
+	rootID    uuid.UUID
+	childDepth uint16 // depth of the CHILD being spawned (parent.Depth + 1)
+}
+
+func newWorkerEngineWrapperWithDepth(queue activityQueue, maxDepth uint16) *WorkerEngineWrapper {
+	if maxDepth == 0 {
+		maxDepth = DefaultMaxActivityDepth
+	}
+	return &WorkerEngineWrapper{queue: queue, maxDepth: maxDepth}
+}
+
+// scopedForChild returns a wrapper whose spawns will be tagged as children of parent.
+func (w *WorkerEngineWrapper) scopedForChild(parent *activity) *WorkerEngineWrapper {
+	rootID := parent.RootActivityID
+	if rootID == (uuid.UUID{}) {
+		rootID = parent.ID
+	}
+	// Clamp the increment so a maxed-out parent depth doesn't wrap around to
+	// 0. childDepth=MaxUint16 sentinel will fail the > maxDepth check on the
+	// next spawn and stop the chain cleanly.
+	childDepth := uint16(math.MaxUint16)
+	if parent.Depth < math.MaxUint16 {
+		childDepth = parent.Depth + 1
+	}
+	return &WorkerEngineWrapper{
+		queue:    w.queue,
+		maxDepth: w.maxDepth,
+		lineage: &lineageScope{
+			parentID:   parent.ID,
+			rootID:     rootID,
+			childDepth: childDepth,
+		},
+	}
 }
 
 // Activity creates a fluent activity builder.
@@ -203,16 +251,47 @@ func (w *WorkerEngineWrapper) Activity(activityType string) *ActivityBuilder {
 	}
 }
 
-func (w *WorkerEngineWrapper) executeActivity(ctx context.Context, activityType string, payload json.RawMessage, option *ActivityOption) (*ActivityFuture, error) {
+func (w *WorkerEngineWrapper) executeActivity(ctx context.Context, activityType string, payload json.RawMessage, option *ActivityOption, asRoot bool) (*ActivityFuture, error) {
 	a := newActivity(activityType, payload, option)
+
+	if w.lineage != nil && !asRoot {
+		if w.lineage.childDepth > w.maxDepth {
+			return nil, &WorkerError{
+				Kind:    ErrDepthExceeded,
+				Message: fmt.Sprintf("activity depth %d exceeds max %d", w.lineage.childDepth, w.maxDepth),
+			}
+		}
+		p := w.lineage.parentID
+		a.ParentActivityID = &p
+		a.RootActivityID = w.lineage.rootID
+		a.Depth = w.lineage.childDepth
+	}
+
 	activityID := a.ID
 
-	existingID, err := w.queue.EvaluateIdempotencyRule(ctx, a)
+	existing, err := w.queue.EvaluateIdempotencyRule(ctx, a)
 	if err != nil {
 		return nil, WorkerErrorFromStorage(err)
 	}
-	if existingID != nil {
-		return &ActivityFuture{queue: w.queue, activityID: *existingID}, nil
+	if existing != nil {
+		// Idempotency reuse: a different parent is logically spawning the same
+		// child. The row's parent_activity_id stays as the original spawner;
+		// we record this secondary link as an event for full audit attribution.
+		// Skip the event when our parent IS the original recorded parent — that
+		// would just be a same-parent retry of the same idempotency key, not a
+		// new attribution.
+		if w.lineage != nil && !asRoot {
+			sameParent := existing.ExistingParentID != nil && *existing.ExistingParentID == w.lineage.parentID
+			if !sameParent {
+				if err := w.queue.RecordSpawnLinked(ctx, existing.ExistingID, w.lineage.parentID); err != nil {
+					slog.Warn("Failed to record spawn link",
+						"child_id", existing.ExistingID,
+						"parent_id", w.lineage.parentID,
+						"error", err)
+				}
+			}
+		}
+		return &ActivityFuture{queue: w.queue, activityID: existing.ExistingID}, nil
 	}
 
 	if a.ScheduledAt == nil {

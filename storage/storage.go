@@ -51,12 +51,23 @@ type QueuedActivity struct {
 	Metadata             map[string]string
 	IdempotencyKey       *IdempotencyKeyConfig
 	CreatedAt            time.Time
+	ParentActivityID     *uuid.UUID
+	RootActivityID       uuid.UUID
+	Depth                uint16
 }
 
 // IdempotencyKeyConfig holds a key and its behavior.
 type IdempotencyKeyConfig struct {
 	Key      string
 	Behavior IdempotencyBehavior
+}
+
+// IdempotencyResult is returned by CheckIdempotency when an existing activity
+// already owns the idempotency key. ExistingParentID is the parent recorded on
+// that activity (may be nil for legacy or root activities).
+type IdempotencyResult struct {
+	ExistingID       uuid.UUID
+	ExistingParentID *uuid.UUID
 }
 
 // DequeuedActivity is an activity claimed by a worker.
@@ -140,6 +151,9 @@ type ActivitySnapshot struct {
 	LeaseDeadlineMS   *int64            `json:"lease_deadline_ms,omitempty"`
 	ProcessingMember  *string           `json:"processing_member,omitempty"`
 	IdempotencyKey    *string           `json:"idempotency_key,omitempty"`
+	ParentActivityID  *uuid.UUID        `json:"parent_activity_id,omitempty"`
+	RootActivityID    *uuid.UUID        `json:"root_activity_id,omitempty"`
+	Depth             uint16            `json:"depth"`
 }
 
 // ActivityEventType classifies lifecycle events.
@@ -157,6 +171,9 @@ const (
 	EventRequeued      ActivityEventType = "Requeued"
 	EventLeaseExtended ActivityEventType = "LeaseExtended"
 	EventResultStored  ActivityEventType = "ResultStored"
+	// EventSpawnLinked records a secondary parent's link to an existing activity
+	// when an idempotency reuse causes a different parent to claim ownership.
+	EventSpawnLinked ActivityEventType = "SpawnLinked"
 )
 
 // ActivityEvent records a lifecycle event.
@@ -193,7 +210,15 @@ type QueueStorage interface {
 	RequeueExpired(ctx context.Context, batchSize int) (uint64, error)
 	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
 	StoreResult(ctx context.Context, activityID uuid.UUID, result ActivityResult) error
-	CheckIdempotency(ctx context.Context, activity *QueuedActivity) (*uuid.UUID, error)
+	// CheckIdempotency claims the activity's idempotency key, or — if a row
+	// already owns the key — returns a result describing the existing
+	// activity (its id and the parent_activity_id recorded on it). A nil
+	// result with a nil error means the caller's new activity has the claim.
+	CheckIdempotency(ctx context.Context, activity *QueuedActivity) (*IdempotencyResult, error)
+	// RecordSpawnLinked records that parentID logically spawned childID, even
+	// though no new activity row was created (idempotency reuse). Best-effort:
+	// callers should log but not fail on errors.
+	RecordSpawnLinked(ctx context.Context, childID, parentID uuid.UUID) error
 	// SchedulesNatively returns true if dequeue handles scheduled activities natively.
 	SchedulesNatively() bool
 }
@@ -212,6 +237,10 @@ type InspectionStorage interface {
 	ListDeadLetter(ctx context.Context, offset, limit int) ([]DeadLetterRecord, error)
 	GetActivity(ctx context.Context, activityID uuid.UUID) (*ActivitySnapshot, error)
 	GetActivityEvents(ctx context.Context, activityID uuid.UUID, limit int) ([]ActivityEvent, error)
+	// GetChildren returns direct children of a parent activity.
+	GetChildren(ctx context.Context, parentID uuid.UUID, offset, limit int) ([]ActivitySnapshot, error)
+	// GetSubtree returns all activities in the tree rooted at rootID, including the root itself.
+	GetSubtree(ctx context.Context, rootID uuid.UUID) ([]ActivitySnapshot, error)
 	// EventStream returns a channel that yields real-time activity events.
 	EventStream(ctx context.Context) (<-chan ActivityEvent, error)
 }
