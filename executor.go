@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -211,10 +212,6 @@ type lineageScope struct {
 	childDepth uint16 // depth of the CHILD being spawned (parent.Depth + 1)
 }
 
-func newWorkerEngineWrapper(queue activityQueue) *WorkerEngineWrapper {
-	return &WorkerEngineWrapper{queue: queue, maxDepth: DefaultMaxActivityDepth}
-}
-
 func newWorkerEngineWrapperWithDepth(queue activityQueue, maxDepth uint16) *WorkerEngineWrapper {
 	if maxDepth == 0 {
 		maxDepth = DefaultMaxActivityDepth
@@ -228,13 +225,20 @@ func (w *WorkerEngineWrapper) scopedForChild(parent *activity) *WorkerEngineWrap
 	if rootID == (uuid.UUID{}) {
 		rootID = parent.ID
 	}
+	// Clamp the increment so a maxed-out parent depth doesn't wrap around to
+	// 0. childDepth=MaxUint16 sentinel will fail the > maxDepth check on the
+	// next spawn and stop the chain cleanly.
+	childDepth := uint16(math.MaxUint16)
+	if parent.Depth < math.MaxUint16 {
+		childDepth = parent.Depth + 1
+	}
 	return &WorkerEngineWrapper{
 		queue:    w.queue,
 		maxDepth: w.maxDepth,
 		lineage: &lineageScope{
 			parentID:   parent.ID,
 			rootID:     rootID,
-			childDepth: parent.Depth + 1,
+			childDepth: childDepth,
 		},
 	}
 }
@@ -265,23 +269,29 @@ func (w *WorkerEngineWrapper) executeActivity(ctx context.Context, activityType 
 
 	activityID := a.ID
 
-	existingID, err := w.queue.EvaluateIdempotencyRule(ctx, a)
+	existing, err := w.queue.EvaluateIdempotencyRule(ctx, a)
 	if err != nil {
 		return nil, WorkerErrorFromStorage(err)
 	}
-	if existingID != nil {
+	if existing != nil {
 		// Idempotency reuse: a different parent is logically spawning the same
 		// child. The row's parent_activity_id stays as the original spawner;
 		// we record this secondary link as an event for full audit attribution.
-		if w.lineage != nil && !asRoot && *existingID != w.lineage.parentID {
-			if err := w.queue.RecordSpawnLinked(ctx, *existingID, w.lineage.parentID); err != nil {
-				slog.Warn("Failed to record spawn link",
-					"child_id", *existingID,
-					"parent_id", w.lineage.parentID,
-					"error", err)
+		// Skip the event when our parent IS the original recorded parent — that
+		// would just be a same-parent retry of the same idempotency key, not a
+		// new attribution.
+		if w.lineage != nil && !asRoot {
+			sameParent := existing.ExistingParentID != nil && *existing.ExistingParentID == w.lineage.parentID
+			if !sameParent {
+				if err := w.queue.RecordSpawnLinked(ctx, existing.ExistingID, w.lineage.parentID); err != nil {
+					slog.Warn("Failed to record spawn link",
+						"child_id", existing.ExistingID,
+						"parent_id", w.lineage.parentID,
+						"error", err)
+				}
 			}
 		}
-		return &ActivityFuture{queue: w.queue, activityID: *existingID}, nil
+		return &ActivityFuture{queue: w.queue, activityID: existing.ExistingID}, nil
 	}
 
 	if a.ScheduledAt == nil {

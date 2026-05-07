@@ -39,7 +39,7 @@ type activityQueue interface {
 	ScheduleActivity(ctx context.Context, a *activity) error
 	ProcessScheduledActivities(ctx context.Context) ([]*activity, error)
 	RequeueExpired(ctx context.Context, maxToProcess int) (uint64, error)
-	EvaluateIdempotencyRule(ctx context.Context, a *activity) (*uuid.UUID, error)
+	EvaluateIdempotencyRule(ctx context.Context, a *activity) (*storage.IdempotencyResult, error)
 	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
 	StoreResult(ctx context.Context, activityID uuid.UUID, result activityResult) error
 	GetResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error)
@@ -210,7 +210,7 @@ func (a *backendQueueAdapter) RequeueExpired(ctx context.Context, maxToProcess i
 	return a.backend.RequeueExpired(ctx, maxToProcess)
 }
 
-func (a *backendQueueAdapter) EvaluateIdempotencyRule(ctx context.Context, act *activity) (*uuid.UUID, error) {
+func (a *backendQueueAdapter) EvaluateIdempotencyRule(ctx context.Context, act *activity) (*storage.IdempotencyResult, error) {
 	queued := activityToQueued(act)
 	return a.backend.CheckIdempotency(ctx, &queued)
 }

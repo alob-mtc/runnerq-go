@@ -62,6 +62,14 @@ type IdempotencyKeyConfig struct {
 	Behavior IdempotencyBehavior
 }
 
+// IdempotencyResult is returned by CheckIdempotency when an existing activity
+// already owns the idempotency key. ExistingParentID is the parent recorded on
+// that activity (may be nil for legacy or root activities).
+type IdempotencyResult struct {
+	ExistingID       uuid.UUID
+	ExistingParentID *uuid.UUID
+}
+
 // DequeuedActivity is an activity claimed by a worker.
 type DequeuedActivity struct {
 	Activity      QueuedActivity
@@ -202,7 +210,11 @@ type QueueStorage interface {
 	RequeueExpired(ctx context.Context, batchSize int) (uint64, error)
 	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
 	StoreResult(ctx context.Context, activityID uuid.UUID, result ActivityResult) error
-	CheckIdempotency(ctx context.Context, activity *QueuedActivity) (*uuid.UUID, error)
+	// CheckIdempotency claims the activity's idempotency key, or — if a row
+	// already owns the key — returns a result describing the existing
+	// activity (its id and the parent_activity_id recorded on it). A nil
+	// result with a nil error means the caller's new activity has the claim.
+	CheckIdempotency(ctx context.Context, activity *QueuedActivity) (*IdempotencyResult, error)
 	// RecordSpawnLinked records that parentID logically spawned childID, even
 	// though no new activity row was created (idempotency reuse). Best-effort:
 	// callers should log but not fail on errors.

@@ -694,7 +694,7 @@ func (b *PostgresBackend) GetResult(ctx context.Context, activityID uuid.UUID) (
 	return &storage.ActivityResult{Data: data, State: state}, nil
 }
 
-func (b *PostgresBackend) CheckIdempotency(ctx context.Context, a *storage.QueuedActivity) (*uuid.UUID, error) {
+func (b *PostgresBackend) CheckIdempotency(ctx context.Context, a *storage.QueuedActivity) (*storage.IdempotencyResult, error) {
 	if a.IdempotencyKey == nil {
 		return nil, nil
 	}
@@ -716,9 +716,10 @@ func (b *PostgresBackend) CheckIdempotency(ctx context.Context, a *storage.Queue
 }
 
 type idempotencyResult struct {
-	claimed    bool
-	existingID *uuid.UUID
-	status     *string
+	claimed          bool
+	existingID       *uuid.UUID
+	existingParentID *uuid.UUID
+	status           *string
 }
 
 func (b *PostgresBackend) tryClaimIdempotencyKey(ctx context.Context, a *storage.QueuedActivity, key string) (idempotencyResult, error) {
@@ -736,15 +737,17 @@ func (b *PostgresBackend) tryClaimIdempotencyKey(ctx context.Context, a *storage
 		return idempotencyResult{claimed: true}, nil
 	}
 
-	// Key exists - get existing activity
+	// Key exists - look up the existing activity, including its parent so the
+	// caller can decide whether a SpawnLinked attribution event is needed.
 	var existingID uuid.UUID
+	var existingParentID *uuid.UUID
 	var status *string
 	err = b.pool.QueryRow(ctx, `
-		SELECT i.activity_id, a.status
+		SELECT i.activity_id, a.status, a.parent_activity_id
 		FROM runnerq_idempotency i
 		LEFT JOIN runnerq_activities a ON i.activity_id = a.id
 		WHERE i.queue_name = $1 AND i.idempotency_key = $2`,
-		b.queueName, key).Scan(&existingID, &status)
+		b.queueName, key).Scan(&existingID, &status, &existingParentID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			// Row disappeared between INSERT and SELECT
@@ -753,20 +756,21 @@ func (b *PostgresBackend) tryClaimIdempotencyKey(ctx context.Context, a *storage
 		return idempotencyResult{}, storage.NewInternalError(fmt.Sprintf("Failed to get existing key: %v", err))
 	}
 
-	return idempotencyResult{existingID: &existingID, status: status}, nil
+	return idempotencyResult{existingID: &existingID, existingParentID: existingParentID, status: status}, nil
 }
 
-func (b *PostgresBackend) resolveIdempotencyBehavior(ctx context.Context, a *storage.QueuedActivity, key string, behavior storage.IdempotencyBehavior, result idempotencyResult) (*uuid.UUID, error) {
+func (b *PostgresBackend) resolveIdempotencyBehavior(ctx context.Context, a *storage.QueuedActivity, key string, behavior storage.IdempotencyBehavior, result idempotencyResult) (*storage.IdempotencyResult, error) {
 	if result.claimed {
 		return nil, nil
 	}
 
 	existingID := *result.existingID
 	status := result.status
+	existingResult := &storage.IdempotencyResult{ExistingID: existingID, ExistingParentID: result.existingParentID}
 
 	switch behavior {
 	case storage.BehaviorReturnExisting:
-		return &existingID, nil
+		return existingResult, nil
 
 	case storage.BehaviorAllowReuse:
 		_, err := b.pool.Exec(ctx, `
