@@ -280,6 +280,33 @@ func (q *QueueInspector) GetSubtree(ctx context.Context, rootID uuid.UUID) ([]Ac
 	return convertSnapshots(snapshots), nil
 }
 
+// ListRecentRoots returns top-level activities (no parent), newest first.
+func (q *QueueInspector) ListRecentRoots(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error) {
+	snapshots, err := q.backend.ListRecentRoots(ctx, offset, limit)
+	if err != nil {
+		return nil, err
+	}
+	return convertSnapshots(snapshots), nil
+}
+
+// ListRecentActivities returns all activities (regardless of lineage), newest first.
+func (q *QueueInspector) ListRecentActivities(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error) {
+	snapshots, err := q.backend.ListRecentActivities(ctx, offset, limit)
+	if err != nil {
+		return nil, err
+	}
+	return convertSnapshots(snapshots), nil
+}
+
+// ListCronActivities returns recent activities tagged metadata.source='cron'.
+func (q *QueueInspector) ListCronActivities(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error) {
+	snapshots, err := q.backend.ListCronActivities(ctx, offset, limit)
+	if err != nil {
+		return nil, err
+	}
+	return convertSnapshots(snapshots), nil
+}
+
 // RecentEvents returns recent events for a specific activity.
 func (q *QueueInspector) RecentEvents(ctx context.Context, activityID uuid.UUID, limit int) ([]ActivityEvent, error) {
 	events, err := q.backend.GetActivityEvents(ctx, activityID, limit)
@@ -313,8 +340,11 @@ func (q *QueueInspector) Stats(ctx context.Context) (*QueueStats, error) {
 		NormalPriority:       backendStats.ByPriority.Normal,
 		LowPriority:          backendStats.ByPriority.Low,
 		ScheduledActivities:  backendStats.Scheduled,
+		RetryingActivities:   backendStats.Retrying,
+		FailedActivities:     backendStats.Failed,
 		DeadLetterActivities: backendStats.DeadLetter,
 		MaxWorkers:           maxWorkers,
+		ActiveWorkers:        backendStats.ActiveWorkers,
 	}, nil
 }
 

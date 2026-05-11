@@ -21,9 +21,13 @@ func RunnerQUI(inspector *observability.QueueInspector) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", serveUI)
 	mux.HandleFunc("GET /api/observability/stats", statsHandler(inspector))
+	mux.HandleFunc("GET /api/observability/roots", recentRootsHandler(inspector))
+	mux.HandleFunc("GET /api/observability/cron", cronActivitiesHandler(inspector))
 	mux.HandleFunc("GET /api/observability/activities/{key}", activityCollectionOrDetail(inspector))
 	mux.HandleFunc("GET /api/observability/activities/{id}/events", activityEventsHandler(inspector))
 	mux.HandleFunc("GET /api/observability/activities/{id}/result", activityResultHandler(inspector))
+	mux.HandleFunc("GET /api/observability/activities/{id}/subtree", subtreeHandler(inspector))
+	mux.HandleFunc("GET /api/observability/activities/{id}/children", childrenHandler(inspector))
 	mux.HandleFunc("GET /api/observability/dead-letter", deadLettersHandler(inspector))
 	mux.HandleFunc("GET /api/observability/stream", eventStreamHandler(inspector, sseSema))
 	return mux
@@ -34,9 +38,13 @@ func ObservabilityAPI(inspector *observability.QueueInspector) http.Handler {
 	sseSema := make(chan struct{}, defaultMaxSSEConns)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /stats", statsHandler(inspector))
+	mux.HandleFunc("GET /roots", recentRootsHandler(inspector))
+	mux.HandleFunc("GET /cron", cronActivitiesHandler(inspector))
 	mux.HandleFunc("GET /activities/{key}", activityCollectionOrDetail(inspector))
 	mux.HandleFunc("GET /activities/{id}/events", activityEventsHandler(inspector))
 	mux.HandleFunc("GET /activities/{id}/result", activityResultHandler(inspector))
+	mux.HandleFunc("GET /activities/{id}/subtree", subtreeHandler(inspector))
+	mux.HandleFunc("GET /activities/{id}/children", childrenHandler(inspector))
 	mux.HandleFunc("GET /dead-letter", deadLettersHandler(inspector))
 	mux.HandleFunc("GET /stream", eventStreamHandler(inspector, sseSema))
 	return mux
@@ -187,6 +195,89 @@ func activityResultHandler(inspector *observability.QueueInspector) http.Handler
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func recentRootsHandler(inspector *observability.QueueInspector) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		offset, limit := parsePagination(r)
+		flatten := r.URL.Query().Get("flatten")
+		var (
+			items []observability.ActivitySnapshot
+			err   error
+		)
+		if flatten == "1" || flatten == "true" {
+			items, err = inspector.ListRecentActivities(r.Context(), offset, limit)
+		} else {
+			items, err = inspector.ListRecentRoots(r.Context(), offset, limit)
+		}
+		if err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
+	}
+}
+
+func cronActivitiesHandler(inspector *observability.QueueInspector) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		offset, limit := parsePagination(r)
+		items, err := inspector.ListCronActivities(r.Context(), offset, limit)
+		if err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
+	}
+}
+
+func subtreeHandler(inspector *observability.QueueInspector) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := r.PathValue("id")
+		id, err := uuid.Parse(idStr)
+		if err != nil {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+		// Caller may pass any activity ID; resolve to its root first so a click
+		// on a child still returns the whole tree.
+		act, err := inspector.GetActivity(r.Context(), id)
+		if err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		if act == nil {
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
+		rootID := id
+		if act.RootActivityID != nil {
+			rootID = *act.RootActivityID
+		}
+		items, err := inspector.GetSubtree(r.Context(), rootID)
+		if err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
+	}
+}
+
+func childrenHandler(inspector *observability.QueueInspector) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := r.PathValue("id")
+		id, err := uuid.Parse(idStr)
+		if err != nil {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+		offset, limit := parsePagination(r)
+		items, err := inspector.GetChildren(r.Context(), id, offset, limit)
+		if err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
 	}
 }
 
