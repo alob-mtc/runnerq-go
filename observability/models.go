@@ -59,25 +59,10 @@ type ActivitySnapshot struct {
 	Depth             uint16            `json:"depth"`
 }
 
-// ActivityEventType classifies lifecycle events.
+// ActivityEventType classifies lifecycle events. Concrete event-name
+// constants live in storage/storage.go, where the postgres backend writes
+// them; this package mirrors only the type so we can JSON-decode them.
 type ActivityEventType string
-
-const (
-	EventEnqueued      ActivityEventType = "Enqueued"
-	EventScheduled     ActivityEventType = "Scheduled"
-	EventDequeued      ActivityEventType = "Dequeued"
-	EventStarted       ActivityEventType = "Started"
-	EventCompleted     ActivityEventType = "Completed"
-	EventFailed        ActivityEventType = "Failed"
-	EventRetrying      ActivityEventType = "Retrying"
-	EventDeadLetter    ActivityEventType = "DeadLetter"
-	EventRequeued      ActivityEventType = "Requeued"
-	EventLeaseExtended ActivityEventType = "LeaseExtended"
-	EventResultStored  ActivityEventType = "ResultStored"
-	// EventSpawnLinked records a secondary parent linking to an existing
-	// activity via idempotency reuse.
-	EventSpawnLinked ActivityEventType = "SpawnLinked"
-)
 
 // ActivityEvent records a lifecycle event for an activity.
 type ActivityEvent struct {
@@ -97,16 +82,28 @@ type DeadLetterRecord struct {
 
 // QueueStats provides queue monitoring statistics.
 type QueueStats struct {
-	PendingActivities    uint64 `json:"pending_activities"`
-	ProcessingActivities uint64 `json:"processing_activities"`
-	CriticalPriority     uint64 `json:"critical_priority"`
-	HighPriority         uint64 `json:"high_priority"`
-	NormalPriority       uint64 `json:"normal_priority"`
-	LowPriority          uint64 `json:"low_priority"`
-	ScheduledActivities  uint64 `json:"scheduled_activities"`
-	RetryingActivities   uint64 `json:"retrying_activities"`
-	FailedActivities     uint64 `json:"failed_activities"`
-	DeadLetterActivities uint64 `json:"dead_letter_activities"`
-	MaxWorkers           *int   `json:"max_workers,omitempty"`
-	ActiveWorkers        uint64 `json:"active_workers"`
+	PendingActivities    uint64               `json:"pending_activities"`
+	ProcessingActivities uint64               `json:"processing_activities"`
+	CriticalPriority     uint64               `json:"critical_priority"`
+	HighPriority         uint64               `json:"high_priority"`
+	NormalPriority       uint64               `json:"normal_priority"`
+	LowPriority          uint64               `json:"low_priority"`
+	ScheduledActivities  uint64               `json:"scheduled_activities"`
+	RetryingActivities   uint64               `json:"retrying_activities"`
+	FailedActivities     uint64               `json:"failed_activities"`
+	DeadLetterActivities uint64               `json:"dead_letter_activities"`
+	MaxWorkers           *int                 `json:"max_workers,omitempty"`
+	ActiveWorkers        uint64               `json:"active_workers"`
+	Roots                RootStatusBreakdown  `json:"roots"`
+}
+
+// RootStatusBreakdown is per-status counts limited to root activities.
+type RootStatusBreakdown struct {
+	Pending    uint64 `json:"pending"`
+	Processing uint64 `json:"processing"`
+	Scheduled  uint64 `json:"scheduled"`
+	Retrying   uint64 `json:"retrying"`
+	Completed  uint64 `json:"completed"`
+	Failed     uint64 `json:"failed"`
+	DeadLetter uint64 `json:"dead_letter"`
 }

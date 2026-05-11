@@ -266,8 +266,8 @@ func (b *PostgresBackend) Enqueue(ctx context.Context, a storage.QueuedActivity)
 }
 
 func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, _ time.Duration, activityTypes []string) (*storage.QueuedActivity, error) {
-	deadline := time.Now().UTC().Add(time.Duration(b.defaultLeaseMS) * time.Millisecond)
 	now := time.Now().UTC()
+	nowMS := now.UnixMilli()
 
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
@@ -280,20 +280,25 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, _ time.D
 		types = activityTypes
 	}
 
+	// Compute the lease deadline directly from the row's per-activity timeout
+	// (clamped to at least the engine default lease). Earlier code did this
+	// via a follow-up ExtendLease call for activities whose timeout exceeded
+	// the default lease — every dequeue paid for two SQL round trips on the
+	// hot worker loop. Folded into the single UPDATE here.
 	row := tx.QueryRow(ctx, `
 		UPDATE runnerq_activities
 		SET status = 'processing',
 			current_worker_id = $1,
-			lease_deadline_ms = $2,
-			started_at = $3
+			started_at = $2,
+			lease_deadline_ms = $3 + GREATEST($4::bigint, (timeout_seconds + 10) * 1000)
 		WHERE id = (
 			SELECT id FROM runnerq_activities
-			WHERE queue_name = $4
+			WHERE queue_name = $5
 			  AND (
 				status = 'pending'
-				OR (status IN ('scheduled', 'retrying') AND scheduled_at <= $5)
+				OR (status IN ('scheduled', 'retrying') AND scheduled_at <= $6)
 			  )
-			  AND ($6::text[] IS NULL OR activity_type = ANY($6))
+			  AND ($7::text[] IS NULL OR activity_type = ANY($7))
 			ORDER BY
 				priority DESC,
 				retry_count DESC,
@@ -304,17 +309,19 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, _ time.D
 		RETURNING id, activity_type, payload, priority, retry_count, max_retries,
 			timeout_seconds, retry_delay_seconds, max_retry_delay_seconds,
 			scheduled_at, metadata, idempotency_key, created_at,
-			parent_activity_id, root_activity_id, depth`,
-		workerID, deadline.UnixMilli(), now, b.queueName, now, types)
+			parent_activity_id, root_activity_id, depth, lease_deadline_ms`,
+		workerID, now, nowMS, b.defaultLeaseMS, b.queueName, now, types)
 
 	var ar activityRow
+	var leaseDeadlineMS int64
 	err = row.Scan(
 		&ar.id, &ar.activityType, &ar.payload, &ar.priority,
 		&ar.retryCount, &ar.maxRetries, &ar.timeoutSeconds,
 		&ar.retryDelaySeconds, &ar.maxRetryDelaySeconds,
 		&ar.scheduledAt, &ar.metadata,
 		&ar.idempotencyKey, &ar.createdAt,
-		&ar.parentActivityID, &ar.rootActivityID, &ar.depth)
+		&ar.parentActivityID, &ar.rootActivityID, &ar.depth,
+		&leaseDeadlineMS)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, nil
@@ -324,29 +331,13 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, _ time.D
 
 	a := ar.toQueuedActivity()
 
-	detail := toDetail(map[string]any{"lease_deadline_ms": deadline.UnixMilli()})
+	detail := toDetail(map[string]any{"lease_deadline_ms": leaseDeadlineMS})
 	if err := b.recordEvent(ctx, tx, a.ID, storage.EventDequeued, &workerID, detail); err != nil {
 		return nil, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, storage.NewInternalError(fmt.Sprintf("Failed to commit dequeue: %v", err))
-	}
-
-	// Auto-extend lease if the activity's per-attempt timeout exceeds the
-	// default lease window. ExtendLease replaces the deadline (it does not add
-	// to it), so the new value must cover the FULL timeout — earlier code
-	// computed (timeout - defaultLease + 10) and ended up with a lease shorter
-	// than the timeout, causing the reaper to requeue still-running handlers.
-	defaultLeaseSecs := b.defaultLeaseMS / 1000
-	if defaultLeaseSecs < int64(a.TimeoutSeconds) {
-		extendBy := time.Duration(int64(a.TimeoutSeconds)+10) * time.Second
-		if _, err := b.ExtendLease(ctx, a.ID, extendBy); err != nil {
-			slog.Warn("Failed to extend lease for long-running activity",
-				"activity_id", a.ID,
-				"extend_by_secs", extendBy.Seconds(),
-				"error", err)
-		}
 	}
 
 	slog.Debug("Activity claimed",
@@ -824,66 +815,45 @@ func (b *PostgresBackend) resolveIdempotencyBehavior(ctx context.Context, a *sto
 // ============================================================================
 
 func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error) {
-	// Use targeted counts against partial indexes instead of a full-table
-	// GROUP BY, which degrades linearly as completed rows accumulate.
+	// One round trip, but each scalar subquery is planned independently so the
+	// matching partial index handles its own count. A single FILTER aggregate
+	// over the whole table would force a full scan and degrade as completed
+	// history accumulates — this form keeps each count cheap.
 	stats := &storage.QueueStats{}
-
 	err := b.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM runnerq_activities
-		WHERE queue_name = $1 AND status IN ('pending', 'scheduled', 'retrying')`,
-		b.queueName).Scan(&stats.Pending)
+		SELECT
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'pending')                                                                AS pending,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'processing')                                                             AS processing,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'scheduled')                                                              AS scheduled,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'retrying')                                                               AS retrying,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'failed')                                                                 AS failed,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'dead_letter')                                                            AS dead_letter,
+			(SELECT COUNT(DISTINCT current_worker_id) FROM runnerq_activities WHERE queue_name = $1 AND status = 'processing' AND current_worker_id IS NOT NULL) AS active_workers,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'pending')     AS root_pending,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'processing')  AS root_processing,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'scheduled')   AS root_scheduled,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'retrying')    AS root_retrying,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'completed')   AS root_completed,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'failed')      AS root_failed,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'dead_letter') AS root_dead_letter`,
+		b.queueName).Scan(
+		&stats.Pending,
+		&stats.Processing,
+		&stats.Scheduled,
+		&stats.Retrying,
+		&stats.Failed,
+		&stats.DeadLetter,
+		&stats.ActiveWorkers,
+		&stats.Roots.Pending,
+		&stats.Roots.Processing,
+		&stats.Roots.Scheduled,
+		&stats.Roots.Retrying,
+		&stats.Roots.Completed,
+		&stats.Roots.Failed,
+		&stats.Roots.DeadLetter,
+	)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count pending: %v", err))
-	}
-
-	// Split scheduled and retrying (the dequeue index covers both, plus pending).
-	err = b.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM runnerq_activities
-		WHERE queue_name = $1 AND status = 'scheduled'`,
-		b.queueName).Scan(&stats.Scheduled)
-	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count scheduled: %v", err))
-	}
-	err = b.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM runnerq_activities
-		WHERE queue_name = $1 AND status = 'retrying'`,
-		b.queueName).Scan(&stats.Retrying)
-	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count retrying: %v", err))
-	}
-	stats.Pending -= stats.Scheduled + stats.Retrying
-
-	err = b.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM runnerq_activities
-		WHERE queue_name = $1 AND status = 'processing'`,
-		b.queueName).Scan(&stats.Processing)
-	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count processing: %v", err))
-	}
-
-	err = b.pool.QueryRow(ctx, `
-		SELECT COUNT(DISTINCT current_worker_id) FROM runnerq_activities
-		WHERE queue_name = $1 AND status = 'processing' AND current_worker_id IS NOT NULL`,
-		b.queueName).Scan(&stats.ActiveWorkers)
-	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count active workers: %v", err))
-	}
-
-	// Failed (non-retryable) is tracked distinctly from dead_letter (retries exhausted).
-	err = b.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM runnerq_activities
-		WHERE queue_name = $1 AND status = 'failed'`,
-		b.queueName).Scan(&stats.Failed)
-	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count failed: %v", err))
-	}
-
-	err = b.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM runnerq_activities
-		WHERE queue_name = $1 AND status = 'dead_letter'`,
-		b.queueName).Scan(&stats.DeadLetter)
-	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to count dead_letter: %v", err))
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to compute queue stats: %v", err))
 	}
 
 	// Priority breakdown for pending activities — hits the dequeue partial index.
@@ -1139,7 +1109,7 @@ func (b *PostgresBackend) GetChildren(ctx context.Context, parentID uuid.UUID, o
 	return b.scanSnapshots(rows)
 }
 
-func (b *PostgresBackend) ListRecentRoots(ctx context.Context, offset, limit int) ([]storage.ActivitySnapshot, error) {
+func (b *PostgresBackend) ListRecentRoots(ctx context.Context, status string, offset, limit int) ([]storage.ActivitySnapshot, error) {
 	rows, err := b.pool.Query(ctx, `
 		SELECT id, activity_type, payload, priority, status, created_at,
 			scheduled_at, started_at, completed_at, current_worker_id,
@@ -1149,9 +1119,10 @@ func (b *PostgresBackend) ListRecentRoots(ctx context.Context, offset, limit int
 			parent_activity_id, root_activity_id, depth
 		FROM runnerq_activities
 		WHERE queue_name = $1 AND parent_activity_id IS NULL
+		  AND ($2 = '' OR status = $2)
 		ORDER BY created_at DESC
-		LIMIT $2 OFFSET $3`,
-		b.queueName, limit, offset)
+		LIMIT $3 OFFSET $4`,
+		b.queueName, status, limit, offset)
 	if err != nil {
 		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list recent roots: %v", err))
 	}
@@ -1160,7 +1131,7 @@ func (b *PostgresBackend) ListRecentRoots(ctx context.Context, offset, limit int
 	return b.scanSnapshots(rows)
 }
 
-func (b *PostgresBackend) ListRecentActivities(ctx context.Context, offset, limit int) ([]storage.ActivitySnapshot, error) {
+func (b *PostgresBackend) ListRecentActivities(ctx context.Context, status string, offset, limit int) ([]storage.ActivitySnapshot, error) {
 	rows, err := b.pool.Query(ctx, `
 		SELECT id, activity_type, payload, priority, status, created_at,
 			scheduled_at, started_at, completed_at, current_worker_id,
@@ -1170,9 +1141,10 @@ func (b *PostgresBackend) ListRecentActivities(ctx context.Context, offset, limi
 			parent_activity_id, root_activity_id, depth
 		FROM runnerq_activities
 		WHERE queue_name = $1
+		  AND ($2 = '' OR status = $2)
 		ORDER BY created_at DESC
-		LIMIT $2 OFFSET $3`,
-		b.queueName, limit, offset)
+		LIMIT $3 OFFSET $4`,
+		b.queueName, status, limit, offset)
 	if err != nil {
 		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list recent activities: %v", err))
 	}

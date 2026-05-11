@@ -31,12 +31,6 @@ func (q *QueueInspector) WithMaxWorkers(max int) *QueueInspector {
 	return q
 }
 
-// EventStream returns a channel of real-time activity events.
-// Deprecated: Use SubscribeEvents for fan-out multiplexed access.
-func (q *QueueInspector) EventStream(ctx context.Context) (<-chan ActivityEvent, error) {
-	return q.SubscribeEvents(ctx)
-}
-
 // SubscribeEvents returns a channel of real-time activity events backed by a
 // shared fan-out hub. Only one backend connection is used regardless of how
 // many subscribers are active. The returned channel is closed when ctx is
@@ -281,8 +275,9 @@ func (q *QueueInspector) GetSubtree(ctx context.Context, rootID uuid.UUID) ([]Ac
 }
 
 // ListRecentRoots returns top-level activities (no parent), newest first.
-func (q *QueueInspector) ListRecentRoots(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error) {
-	snapshots, err := q.backend.ListRecentRoots(ctx, offset, limit)
+// Pass an empty status to skip the status filter.
+func (q *QueueInspector) ListRecentRoots(ctx context.Context, status string, offset, limit int) ([]ActivitySnapshot, error) {
+	snapshots, err := q.backend.ListRecentRoots(ctx, status, offset, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -290,8 +285,9 @@ func (q *QueueInspector) ListRecentRoots(ctx context.Context, offset, limit int)
 }
 
 // ListRecentActivities returns all activities (regardless of lineage), newest first.
-func (q *QueueInspector) ListRecentActivities(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error) {
-	snapshots, err := q.backend.ListRecentActivities(ctx, offset, limit)
+// Pass an empty status to skip the status filter.
+func (q *QueueInspector) ListRecentActivities(ctx context.Context, status string, offset, limit int) ([]ActivitySnapshot, error) {
+	snapshots, err := q.backend.ListRecentActivities(ctx, status, offset, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -345,6 +341,15 @@ func (q *QueueInspector) Stats(ctx context.Context) (*QueueStats, error) {
 		DeadLetterActivities: backendStats.DeadLetter,
 		MaxWorkers:           maxWorkers,
 		ActiveWorkers:        backendStats.ActiveWorkers,
+		Roots: RootStatusBreakdown{
+			Pending:    backendStats.Roots.Pending,
+			Processing: backendStats.Roots.Processing,
+			Scheduled:  backendStats.Roots.Scheduled,
+			Retrying:   backendStats.Roots.Retrying,
+			Completed:  backendStats.Roots.Completed,
+			Failed:     backendStats.Roots.Failed,
+			DeadLetter: backendStats.Roots.DeadLetter,
+		},
 	}, nil
 }
 

@@ -117,6 +117,20 @@ type QueueStats struct {
 	ByPriority    PriorityBreakdown
 	MaxWorkers    *int
 	ActiveWorkers uint64 // distinct current_worker_id across processing rows
+	// Roots is the same status breakdown but limited to root activities
+	// (parent_activity_id IS NULL). Drives pill counts on the workflows list.
+	Roots RootStatusBreakdown
+}
+
+// RootStatusBreakdown counts root activities per status.
+type RootStatusBreakdown struct {
+	Pending    uint64
+	Processing uint64
+	Scheduled  uint64
+	Retrying   uint64
+	Completed  uint64
+	Failed     uint64
+	DeadLetter uint64
 }
 
 // PriorityBreakdown counts activities by priority level.
@@ -127,9 +141,10 @@ type PriorityBreakdown struct {
 	Low      uint64
 }
 
-// ActivitySnapshot is imported from observability - re-declare here for the interface.
-// The actual type lives in observability/models.go. We use the same structure.
-// To avoid circular imports, storage defines its own snapshot type.
+// ActivitySnapshot is the canonical activity-state view returned by
+// InspectionStorage. The observability package mirrors this struct in
+// observability/models.go so it can ship the type to its consumers without
+// importing storage (which would create a circular dependency).
 type ActivitySnapshot struct {
 	ID                uuid.UUID         `json:"id"`
 	ActivityType      string            `json:"activity_type"`
@@ -244,12 +259,13 @@ type InspectionStorage interface {
 	GetChildren(ctx context.Context, parentID uuid.UUID, offset, limit int) ([]ActivitySnapshot, error)
 	// GetSubtree returns all activities in the tree rooted at rootID, including the root itself.
 	GetSubtree(ctx context.Context, rootID uuid.UUID) ([]ActivitySnapshot, error)
-	// ListRecentRoots returns top-level activities (no parent), newest first. Used by the
-	// console workflows list to show distinct runs rather than every activity in every tree.
-	ListRecentRoots(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
-	// ListRecentActivities returns all activities (regardless of lineage), newest first.
-	// Used by the console workflows list when "flatten" is enabled.
-	ListRecentActivities(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
+	// ListRecentRoots returns top-level activities (no parent), newest first. When
+	// status is non-empty, results are filtered to that status (raw column value
+	// — e.g. 'processing', 'completed', 'dead_letter').
+	ListRecentRoots(ctx context.Context, status string, offset, limit int) ([]ActivitySnapshot, error)
+	// ListRecentActivities returns all activities (regardless of lineage), newest
+	// first. Status filter behaves the same way as ListRecentRoots.
+	ListRecentActivities(ctx context.Context, status string, offset, limit int) ([]ActivitySnapshot, error)
 	// ListCronActivities returns recent activities tagged with metadata.source='cron',
 	// regardless of status. Used by the console Schedules page to group cron runs.
 	ListCronActivities(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)

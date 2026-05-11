@@ -895,15 +895,6 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
   border-color: var(--line-strong);
   box-shadow: inset 0 -2px 0 var(--purple);
 }
-.fpill .ct {
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  color: var(--fg-3);
-  background: var(--bg-2);
-  padding: 1px 5px;
-  border-radius: 3px;
-}
-.fpill.active .ct { color: var(--fg-1); background: var(--bg-4); }
 .fpill .dot { width: 6px; height: 6px; border-radius: 50%; }
 .fpill .dot.running   { background: var(--blue); box-shadow: 0 0 0 2px var(--blue-soft); }
 .fpill .dot.completed { background: var(--emerald); }
@@ -1272,7 +1263,14 @@ function useHashRoute() {
     const m = h.match(/^#\/run\/([0-9a-f-]+)\/?(.*)$/i);
     if (m) return { name: 'run', id: m[1], tab: m[2] || 'history' };
     if (h.startsWith('#/schedules')) return { name: 'schedules' };
-    return { name: 'list' };
+    // List path with optional query: #/?status=completed&type=foo&q=bar
+    const qIdx = h.indexOf('?');
+    const params = {};
+    if (qIdx >= 0) {
+      const usp = new URLSearchParams(h.slice(qIdx + 1));
+      usp.forEach((v, k) => { params[k] = v; });
+    }
+    return { name: 'list', params };
   };
   const [route, setRoute] = React.useState(get());
   React.useEffect(() => {
@@ -1285,51 +1283,67 @@ function useHashRoute() {
 
 function navTo(hash) { window.location.hash = hash; }
 
-// SSE-driven live updates: open one EventSource against the stream endpoint
-// and bump the global tick on each event (debounced to avoid refetch storms
-// when a burst of events arrives). The browser auto-reconnects on transient
-// drops; we surface that state via the returned status.
-function useLiveStream(setTick, debounceMs = 600) {
+// One SSE connection at app level fans out to per-page listeners. Each page
+// supplies its own filter so a burst of events on activities the page doesn't
+// care about doesn't cause a refetch.
+const __liveListeners = new Set();
+
+function useLiveStream() {
   const [status, setStatus] = React.useState('connecting');
   React.useEffect(() => {
-    let pending = false;
-    let timer = null;
-    const flush = () => {
-      timer = null;
-      if (pending) {
-        pending = false;
-        setTick(t => t + 1);
-      }
-    };
-    const bump = () => {
-      pending = true;
-      if (!timer) timer = setTimeout(flush, debounceMs);
-    };
     const url = API + '/stream';
     let es;
     try {
       es = new EventSource(url);
       es.onopen = () => setStatus('connected');
       es.onmessage = (e) => {
-        // Some streams send heartbeats as messages with no data; still treat
-        // any inbound chatter as "we're connected".
-        if (status !== 'connected') setStatus('connected');
-        bump();
+        let ev = null;
+        try { ev = JSON.parse(e.data); } catch (_) {}
+        // Some streams send heartbeats with no JSON; still flag we're connected.
+        setStatus('connected');
+        if (ev) {
+          __liveListeners.forEach(fn => { try { fn(ev); } catch (_) {} });
+        }
       };
       es.onerror = () => {
-        // readyState: 0 CONNECTING, 1 OPEN, 2 CLOSED
         if (es.readyState === 2) setStatus('disconnected');
         else setStatus('reconnecting');
       };
     } catch (e) {
       setStatus('disconnected');
     }
+    return () => { if (es) es.close(); };
+  }, []);
+  return status;
+}
+
+// Per-page selective tick: subscribe to live events filtered by the supplied
+// predicate, bump the local tick (debounced) when a relevant event arrives.
+// Filter is read through a ref so changes don't tear down the subscription.
+function useLiveTick(filter, debounceMs = 600) {
+  const [tick, setTick] = React.useState(0);
+  const filterRef = React.useRef(filter);
+  React.useEffect(() => { filterRef.current = filter; }, [filter]);
+  React.useEffect(() => {
+    let pending = false;
+    let timer = null;
+    const flush = () => {
+      timer = null;
+      if (pending) { pending = false; setTick(t => t + 1); }
+    };
+    const listener = (ev) => {
+      const f = filterRef.current;
+      if (f && !f(ev)) return;
+      pending = true;
+      if (!timer) timer = setTimeout(flush, debounceMs);
+    };
+    __liveListeners.add(listener);
     return () => {
-      if (es) es.close();
+      __liveListeners.delete(listener);
       if (timer) clearTimeout(timer);
     };
-  }, [setTick, debounceMs]);
-  return status;
+  }, [debounceMs]);
+  return tick;
 }
 
 function useClipboard() {
@@ -1407,7 +1421,7 @@ function TopBar({ theme, onToggleTheme, onRefresh, liveStatus }) {
   );
 }
 
-function FilterBar({ q, setQ, status, setStatus, type, setType, types, counts }) {
+function FilterBar({ q, setQ, status, setStatus, type, setType, types, totalLoaded }) {
   const ref = React.useRef(null);
   React.useEffect(() => {
     const onKey = (e) => {
@@ -1460,7 +1474,7 @@ function FilterBar({ q, setQ, status, setStatus, type, setType, types, counts })
             value={type}
             onChange={(e) => setType(e.target.value)}
           >
-            <option value="all">All types ({counts.total})</option>
+            <option value="all">All types ({totalLoaded})</option>
             {types.map(t => (
               <option key={t.name} value={t.name}>{t.name} ({t.count})</option>
             ))}
@@ -1468,46 +1482,98 @@ function FilterBar({ q, setQ, status, setStatus, type, setType, types, counts })
         </div>
       </div>
       <div className="filter-pills">
-        {filters.map(f => {
-          const ct = f.id === 'all' ? counts.total : (counts[f.id] || 0);
-          return (
-            <button key={f.id} className={'fpill ' + (status === f.id ? 'active' : '')} onClick={() => setStatus(f.id)}>
-              {f.id !== 'all' && <span className={'dot ' + f.id} />}
-              <span>{f.label}</span>
-              <span className="ct">{ct}</span>
-            </button>
-          );
-        })}
+        {filters.map(f => (
+          <button key={f.id} className={'fpill ' + (status === f.id ? 'active' : '')} onClick={() => setStatus(f.id)}>
+            {f.id !== 'all' && <span className={'dot ' + f.id} />}
+            <span>{f.label}</span>
+          </button>
+        ))}
       </div>
     </div>
   );
 }
 
-function RunsListPage({ tick }) {
+function RunsListPage({ manualTick, urlParams = {} }) {
   const [stats, setStats] = React.useState(null);
   const [roots, setRoots] = React.useState(null);
   const [err, setErr] = React.useState(null);
-  const [q, setQ] = React.useState('');
-  const [statusFilter, setStatusFilter] = React.useState('all');
-  const [typeFilter, setTypeFilter] = React.useState('all');
+  // Filters initialize from URL hash so browser-back from a detail page
+  // restores the user's view (e.g. they were filtering Completed when they
+  // clicked a row).
+  const [q, setQ] = React.useState(urlParams.q || '');
+  const [statusFilter, setStatusFilter] = React.useState(urlParams.status || 'all');
+  const [typeFilter, setTypeFilter] = React.useState(urlParams.type || 'all');
   const [limit, setLimit] = useStoredNum('runnerq.runsLimit', 200, RUNS_LIMIT_OPTIONS);
   const [flatten, setFlatten] = useStoredBool('runnerq.flatten', false);
 
+  // Mirror current filters into the URL hash with replaceState so we don't
+  // pollute browser history on every keystroke. When the user clicks a row,
+  // navTo pushes a new entry on top of this state — browser back lands them
+  // here with filters intact.
+  React.useEffect(() => {
+    const usp = new URLSearchParams();
+    if (q) usp.set('q', q);
+    if (statusFilter !== 'all') usp.set('status', statusFilter);
+    if (typeFilter !== 'all') usp.set('type', typeFilter);
+    const qs = usp.toString();
+    const newHash = '#/' + (qs ? '?' + qs : '');
+    if (window.location.hash !== newHash) {
+      window.history.replaceState(null, '', newHash || '#');
+    }
+  }, [q, statusFilter, typeFilter]);
+
+  // Any live event matters to the runs list — a new activity could appear or
+  // an existing one could change status. No filter; refetch on any tick.
+  const liveTick = useLiveTick(null);
+
+  // UI status name → DB status column value.
+  const statusToBackend = (s) => {
+    switch (s) {
+      case 'running':    return 'processing';
+      case 'deadletter': return 'dead_letter';
+      case 'all':        return '';
+      default:           return s;
+    }
+  };
+
+  // Stats are queue-wide and independent of the row filters — only refetch
+  // when something in the queue could have changed (tick).
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const flag = flatten ? '&flatten=1' : '';
-        const [s, r] = await Promise.all([api('/stats'), api('/roots?limit=' + limit + flag)]);
+        const s = await api('/stats');
         if (cancelled) return;
         setStats(s);
-        setRoots(r || []);
+        setErr(null);
       } catch (e) {
         if (!cancelled) setErr(String(e));
       }
     })();
     return () => { cancelled = true; };
-  }, [tick, limit, flatten]);
+  }, [manualTick, liveTick]);
+
+  // Rows refetch when the user changes filters OR on tick — but not on every
+  // pill click pulling stats again.
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const params = new URLSearchParams();
+        params.set('limit', String(limit));
+        if (flatten) params.set('flatten', '1');
+        const backendStatus = statusToBackend(statusFilter);
+        if (backendStatus) params.set('status', backendStatus);
+        const r = await api('/roots?' + params.toString());
+        if (cancelled) return;
+        setRoots(r || []);
+        setErr(null);
+      } catch (e) {
+        if (!cancelled) setErr(String(e));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [manualTick, liveTick, limit, flatten, statusFilter]);
 
   // If the previously-selected type no longer appears in the loaded batch,
   // fall back to "all" so the user isn't stuck on an empty filter. Hook must
@@ -1518,17 +1584,18 @@ function RunsListPage({ tick }) {
     if (!stillThere) setTypeFilter('all');
   }, [typeFilter, roots]);
 
-  if (err) return <div className="empty-state"><div className="big">Failed to load</div><div>{err}</div></div>;
+  // Block the page only on initial-load failure. Once we've rendered data at
+  // least once, transient failures (backend restart, network blip) keep the
+  // last good state and surface as a small banner.
+  if (err && (!stats || !roots)) {
+    return <div className="empty-state"><div className="big">Failed to load</div><div>{err}</div></div>;
+  }
   if (!stats || !roots) return <div className="empty-state">Loading…</div>;
 
-  // Filter pills count rows in the loaded batch — they're a UI control over
-  // the visible table, so batch-derived is correct. KPI cards above are
-  // queue-wide via /stats and don't depend on page limit.
-  const counts = { total: roots.length };
+  // Type-dropdown counts come from the loaded batch. Pills no longer carry
+  // counts — they're pure filter selectors.
   const typeCountMap = {};
   roots.forEach(r => {
-    const sc = statusClass(r.status);
-    counts[sc] = (counts[sc] || 0) + 1;
     typeCountMap[r.activity_type] = (typeCountMap[r.activity_type] || 0) + 1;
   });
   const types = Object.entries(typeCountMap)
@@ -1599,7 +1666,7 @@ function RunsListPage({ tick }) {
           status={statusFilter} setStatus={setStatusFilter}
           type={typeFilter} setType={setTypeFilter}
           types={types}
-          counts={counts}
+          totalLoaded={roots.length}
         />
       </div>
 
@@ -1638,9 +1705,30 @@ function RunsListPage({ tick }) {
             <div className="big">{flatten ? 'No activities yet' : 'No runs yet'}</div>
             <div>{flatten ? 'Any enqueued activity will appear here.' : 'Activities you spawn at the engine level appear here.'}</div>
           </div>
-        ) : filtered.length === 0 ? (
-          <div className="empty-state"><div className="big">No runs match</div><div>Try clearing the search or switching the status filter.</div></div>
-        ) : (
+        ) : filtered.length === 0 ? (() => {
+          // If the active status filter has a non-zero queue-wide count
+          // (children that aren't surfaced when Flatten is off), nudge the
+          // user toward the Flatten toggle instead of leaving them stranded.
+          const queueWide = !flatten && {
+            running:    stats.processing_activities,
+            pending:    stats.pending_activities,
+            scheduled:  stats.scheduled_activities,
+            retrying:   stats.retrying_activities,
+            failed:     stats.failed_activities,
+            deadletter: stats.dead_letter_activities,
+          }[statusFilter];
+          const showFlattenHint = queueWide > 0;
+          return (
+            <div className="empty-state">
+              <div className="big">No runs match</div>
+              <div>
+                {showFlattenHint
+                  ? <>{queueWide} {statusFilter} {queueWide === 1 ? 'activity exists' : 'activities exist'} in the queue, but they're children of older runs. Toggle <b>Flatten</b> above to include them.</>
+                  : <>Try clearing the search or switching the status filter.</>}
+              </div>
+            </div>
+          );
+        })() : (
           <table className="runs-table">
             <thead>
               <tr>
@@ -1693,7 +1781,7 @@ function RunsListPage({ tick }) {
   );
 }
 
-function RunDetailPage({ activityId, tick, onCopy }) {
+function RunDetailPage({ activityId, manualTick, onCopy }) {
   const [activity, setActivity] = React.useState(null);
   const [subtree, setSubtree] = React.useState(null);
   const [events, setEvents] = React.useState(null);
@@ -1703,8 +1791,6 @@ function RunDetailPage({ activityId, tick, onCopy }) {
   const [err, setErr] = React.useState(null);
 
   // Navigation reset: only when the user moves to a different activity.
-  // Tick changes (live updates) do NOT clear state — that was the flicker
-  // source.
   React.useEffect(() => {
     setActivity(null);
     setSubtree(null);
@@ -1714,24 +1800,55 @@ function RunDetailPage({ activityId, tick, onCopy }) {
     setErr(null);
   }, [activityId]);
 
-  // Re-fetch the activity + its subtree on navigation OR on each live tick.
-  // Stale state stays visible until new data lands so the UI doesn't flash.
+  // Subtree by-root cache. Clicking a child of the same tree shouldn't trigger
+  // a refetch — the subtree shape is identical until a live event changes it.
+  const subtreeCacheRef = React.useRef({ rootId: null, tree: null, key: null });
+
+  // Build a Set of subtree IDs so SSE filtering is O(1) per event.
+  const subtreeIds = React.useMemo(() => {
+    const s = new Set();
+    if (subtree) subtree.forEach(a => s.add(a.id));
+    if (activity && !subtree) s.add(activity.id);
+    return s;
+  }, [subtree, activity]);
+
+  // Only refetch on events for activities in this run's subtree.
+  const liveTick = useLiveTick(React.useCallback(
+    (ev) => ev && ev.activity_id && subtreeIds.has(ev.activity_id),
+    [subtreeIds],
+  ));
+
+  // Re-fetch the activity + its subtree on navigation, manual refresh, or
+  // a relevant live event. Subtree fetch is skipped when navigating within
+  // the same tree without a live update — the cache key combines rootId and
+  // (manualTick, liveTick) so freshness still wins on user-initiated reloads.
   React.useEffect(() => {
     let cancelled = false;
+    const cacheKey = manualTick + ':' + liveTick;
     (async () => {
       try {
         const a = await api('/activities/' + activityId);
         if (cancelled) return;
         setActivity(a);
+        const rootId = a.root_activity_id || a.id;
+        const cache = subtreeCacheRef.current;
+        if (cache.rootId === rootId && cache.tree && cache.key === cacheKey) {
+          setSubtree(cache.tree);
+          setErr(null);
+          return;
+        }
         const st = await api('/activities/' + activityId + '/subtree');
         if (cancelled) return;
-        setSubtree(st || []);
+        const tree = st || [];
+        setSubtree(tree);
+        subtreeCacheRef.current = { rootId, tree, key: cacheKey };
+        setErr(null);
       } catch (e) {
         if (!cancelled) setErr(String(e));
       }
     })();
     return () => { cancelled = true; };
-  }, [activityId, tick]);
+  }, [activityId, manualTick, liveTick]);
 
   // When the user picks a different node, drop the previous activity's events
   // and result immediately so the panel doesn't show stale rows for the wrong
@@ -1759,9 +1876,13 @@ function RunDetailPage({ activityId, tick, onCopy }) {
       } catch (e) { /* keep previous result */ }
     })();
     return () => { cancelled = true; };
-  }, [selectedAct, tick]);
+  }, [selectedAct, manualTick, liveTick]);
 
-  if (err) return <div className="empty-state"><div className="big">Failed to load</div><div>{err}</div></div>;
+  // Only block on initial-load failure. Once we've rendered the run once,
+  // transient errors keep the existing view and let the next tick retry.
+  if (err && !activity) {
+    return <div className="empty-state"><div className="big">Failed to load</div><div>{err}</div></div>;
+  }
   if (!activity) return <div className="empty-state">Loading…</div>;
 
   const tree = (subtree && subtree.length > 0) ? subtree : [activity];
@@ -1794,7 +1915,16 @@ function RunDetailPage({ activityId, tick, onCopy }) {
   return (
     <div className="page-scroll">
       <div className="breadcrumb">
-        <a className="back" onClick={() => navTo('#/')}>
+        <a className="back" onClick={() => {
+          // Prefer browser back so the user returns to the exact list view
+          // they came from (filter pills, search, type). Fallback to #/ when
+          // the user landed on the detail page directly (deep link, refresh).
+          if (window.history.length > 1) {
+            window.history.back();
+          } else {
+            navTo('#/');
+          }
+        }}>
           <Icon name="chevron-left" size={14} /> Back to Workflows
         </a>
       </div>
@@ -2312,9 +2442,14 @@ function PendingView({ tree, onSelect }) {
   );
 }
 
-function SchedulesPage({ tick }) {
+function SchedulesPage({ manualTick }) {
   const [runs, setRuns] = React.useState(null);
   const [err, setErr] = React.useState(null);
+
+  // Without per-event metadata we can't cheaply filter to "cron only" — accept
+  // a refetch on any live event. Could be tightened later if SSE detail starts
+  // including activity metadata.
+  const liveTick = useLiveTick(null);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -2323,14 +2458,18 @@ function SchedulesPage({ tick }) {
         const r = await api('/cron?limit=500');
         if (cancelled) return;
         setRuns(r || []);
+        setErr(null);
       } catch (e) {
         if (!cancelled) setErr(String(e));
       }
     })();
     return () => { cancelled = true; };
-  }, [tick]);
+  }, [manualTick, liveTick]);
 
-  if (err) return <div className="empty-state"><div className="big">Failed to load</div><div>{err}</div></div>;
+  // Block only on initial-load failure; keep prior data on transient errors.
+  if (err && !runs) {
+    return <div className="empty-state"><div className="big">Failed to load</div><div>{err}</div></div>;
+  }
   if (!runs) return <div className="empty-state">Loading…</div>;
 
   // Group cron-tagged runs by activity_type. Each group becomes a "schedule"
@@ -2432,16 +2571,16 @@ function SchedulesPage({ tick }) {
 
 function App() {
   const [theme, setTheme] = useStoredTheme('dark');
-  const [tick, setTick] = React.useState(0);
+  const [manualTick, setManualTick] = React.useState(0);
   const route = useHashRoute();
   const { copy, flash } = useClipboard();
-  const liveStatus = useLiveStream(setTick);
+  const liveStatus = useLiveStream();
 
   React.useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
 
-  const refresh = React.useCallback(() => setTick(t => t + 1), []);
+  const refresh = React.useCallback(() => setManualTick(t => t + 1), []);
   const toggleTheme = React.useCallback(() => setTheme(theme === 'dark' ? 'light' : 'dark'), [theme, setTheme]);
 
   return (
@@ -2450,9 +2589,9 @@ function App() {
       <div className="main">
         <TopBar theme={theme} onToggleTheme={toggleTheme} onRefresh={refresh} liveStatus={liveStatus} />
         <div className="content">
-          {route.name === 'list' && <RunsListPage tick={tick} />}
-          {route.name === 'run' && <RunDetailPage activityId={route.id} tick={tick} onCopy={copy} />}
-          {route.name === 'schedules' && <SchedulesPage tick={tick} />}
+          {route.name === 'list' && <RunsListPage manualTick={manualTick} urlParams={route.params || {}} />}
+          {route.name === 'run' && <RunDetailPage activityId={route.id} manualTick={manualTick} onCopy={copy} />}
+          {route.name === 'schedules' && <SchedulesPage manualTick={manualTick} />}
         </div>
       </div>
 
