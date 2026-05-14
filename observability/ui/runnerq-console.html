@@ -2615,6 +2615,10 @@ function PendingView({ tree, onSelect }) {
 function SchedulesPage({ manualTick }) {
   const [runs, setRuns] = React.useState(null);
   const [err, setErr] = React.useState(null);
+  // Default to grouped (one row per schedule). Flatten = one row per run, useful
+  // when the operator wants to inspect the individual firings rather than the
+  // schedule-level summary. Persisted so the operator's preference survives nav.
+  const [flatten, setFlatten] = useStoredBool('runnerq.schedulesFlatten', false);
 
   // Without per-event metadata we can't cheaply filter to "cron only" — accept
   // a refetch on any live event. Could be tightened later if SSE detail starts
@@ -2642,12 +2646,16 @@ function SchedulesPage({ manualTick }) {
   }
   if (!runs) return <div className="empty-state">Loading…</div>;
 
-  // Group cron-tagged runs by activity_type. Each group becomes a "schedule"
-  // row showing last run, success/failure split, and total invocations seen.
+  // Group cron-tagged runs by metadata.cron_job (the README-blessed tag for
+  // identifying a specific schedule) when present, falling back to
+  // activity_type so existing tagging continues to group sensibly. This lets a
+  // single activity_type host multiple distinct schedules without collapsing
+  // them into one row.
+  const scheduleKey = (r) => (r.metadata && r.metadata.cron_job) || r.activity_type;
   const groups = {};
   runs.forEach(r => {
-    const k = r.activity_type;
-    if (!groups[k]) groups[k] = { type: k, latest: null, total: 0, ok: 0, err: 0, ids: [] };
+    const k = scheduleKey(r);
+    if (!groups[k]) groups[k] = { key: k, type: r.activity_type, cronJob: r.metadata && r.metadata.cron_job, latest: null, total: 0, ok: 0, err: 0, ids: [] };
     const g = groups[k];
     g.total++;
     g.ids.push(r.id);
@@ -2662,6 +2670,12 @@ function SchedulesPage({ manualTick }) {
     const ta = a.latest ? new Date(a.latest.completed_at || a.latest.started_at || a.latest.created_at).getTime() : 0;
     const tb = b.latest ? new Date(b.latest.completed_at || b.latest.started_at || b.latest.created_at).getTime() : 0;
     return tb - ta;
+  });
+
+  // Flat run list — newest first by the most relevant transition timestamp.
+  const flatRuns = runs.slice().sort((a, b) => {
+    const ts = (r) => new Date(r.completed_at || r.started_at || r.created_at).getTime() || 0;
+    return ts(b) - ts(a);
   });
 
   return (
@@ -2679,11 +2693,19 @@ function SchedulesPage({ manualTick }) {
 
       <div className="card runs-table-card scroll-card">
         <div className="card-head">
-          <span>Cron-tagged activity types</span>
+          <span>{flatten ? 'Cron runs (flattened)' : 'Cron-tagged activity types'}</span>
           <div className="right">
             <span style={{ fontSize: 11, color: 'var(--fg-3)', textTransform: 'none', letterSpacing: 0 }}>
               tagged via metadata.source = "cron"
             </span>
+            <button
+              className={'toggle-pill ' + (flatten ? 'on' : '')}
+              onClick={() => setFlatten(!flatten)}
+              title={flatten ? 'Showing every cron run individually — toggle to group by schedule' : 'Grouped by schedule (one row per cron_job or activity_type) — toggle to see each run'}
+            >
+              <span className="sw" />
+              <span>Flatten</span>
+            </button>
           </div>
         </div>
         <div className="table-scroll">
@@ -2692,6 +2714,46 @@ function SchedulesPage({ manualTick }) {
             <div className="big">No cron activities yet</div>
             <div>Spawn an activity with metadata source set to "cron" and it will appear here.</div>
           </div>
+        ) : flatten ? (
+          <table className="runs-table">
+            <thead>
+              <tr>
+                <th>Schedule</th>
+                <th style={{ width: 110 }}>Status</th>
+                <th style={{ width: 200 }}>Last run</th>
+                <th style={{ width: 90 }}>Attempts</th>
+              </tr>
+            </thead>
+            <tbody>
+              {flatRuns.map(r => {
+                const sc = statusClass(r.status);
+                const ts = r.completed_at || r.started_at || r.created_at;
+                const k = scheduleKey(r);
+                return (
+                  <tr key={r.id} onClick={() => navTo('#/run/' + r.id)}>
+                    <td>
+                      <div className="id-cell">
+                        <span className="typ">{k}</span>
+                        <span className="uid">{r.activity_type !== k ? r.activity_type + ' · ' : ''}{r.id}</span>
+                      </div>
+                    </td>
+                    <td><span className={'status-chip sm ' + sc}><span className="pip" />{r.status}</span></td>
+                    <td>
+                      <div className="ts-cell">
+                        <span className="at">{fmtTsShort(ts)}</span>
+                        <span className="ago">{fmtAgo(ts)}</span>
+                      </div>
+                    </td>
+                    <td>
+                      <span className={'att ' + (r.retry_count > 0 ? 'high' : '')}>
+                        {r.retry_count}/{r.max_retries === 0 ? '∞' : r.max_retries}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         ) : (
           <table className="runs-table">
             <thead>
@@ -2709,9 +2771,12 @@ function SchedulesPage({ manualTick }) {
                 const sc = g.latest ? statusClass(g.latest.status) : 'pending';
                 const lastTs = g.latest && (g.latest.completed_at || g.latest.started_at || g.latest.created_at);
                 return (
-                  <tr key={g.type} onClick={() => g.latest && navTo('#/run/' + g.latest.id)}>
+                  <tr key={g.key} onClick={() => g.latest && navTo('#/run/' + g.latest.id)}>
                     <td>
-                      <div className="id-cell"><span className="typ">{g.type}</span></div>
+                      <div className="id-cell">
+                        <span className="typ">{g.key}</span>
+                        {g.cronJob && g.cronJob !== g.type && <span className="uid">{g.type}</span>}
+                      </div>
                     </td>
                     <td>
                       {g.latest ? (
