@@ -22,6 +22,13 @@ type suspendKey struct{}
 // handler's context is bounded by that same timeout. A parent that
 // release()s its slot and waits on children stays well within both
 // budgets, so no separate lease-extension loop is required at this layer.
+//
+// Concurrency: a slotHolder represents one logical seat. If a handler
+// fans out concurrent goroutines that all call GetResult on the same ctx,
+// they share that single seat — release/reacquire is serialized by the
+// CAS in each method, so the worst case is one goroutine winning the
+// reacquire race and the others no-op'ing. Don't rely on per-goroutine
+// slot accounting in that pattern.
 type slotHolder struct {
 	sem  chan struct{}
 	held atomic.Bool
@@ -41,16 +48,21 @@ func (h *slotHolder) release() {
 }
 
 // reacquire blocks (respecting ctx) until a slot is free, then takes it.
-// Safe to call when already held — no-op in that case.
+// Safe to call when already held or when racing with another reacquire on
+// the same holder — no-op in those cases. The CAS-then-send order matters:
+// claim ownership of held first so concurrent callers no-op rather than
+// both succeeding at the send and double-consuming semaphore tokens.
 func (h *slotHolder) reacquire(ctx context.Context) error {
-	if h.held.Load() {
+	if !h.held.CompareAndSwap(false, true) {
 		return nil
 	}
 	select {
 	case h.sem <- struct{}{}:
-		h.held.Store(true)
 		return nil
 	case <-ctx.Done():
+		// Couldn't take the slot we'd claimed responsibility for — give the
+		// claim back so a future reacquire can try again.
+		h.held.Store(false)
 		return ctx.Err()
 	}
 }

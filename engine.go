@@ -129,6 +129,50 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		}
 	}
 
+	// SuspendOnAwait config sanity. Fail fast on the misconfigurations that
+	// would otherwise silently degrade capacity, waste reserved slots, or
+	// (worst case) cause this engine's leaf dispatcher to dequeue activities
+	// it can't run — stealing work that another engine in the cluster would
+	// have handled.
+	if e.config.SuspendOnAwait {
+		if e.config.SuspendLeavesReserved < 0 {
+			return &WorkerError{
+				Kind:    ErrConfiguration,
+				Message: "SuspendLeavesReserved must be >= 0",
+			}
+		}
+		if e.config.SuspendLeavesReserved >= e.config.MaxConcurrentActivities {
+			return &WorkerError{
+				Kind: ErrConfiguration,
+				Message: fmt.Sprintf(
+					"SuspendLeavesReserved (%d) must be < MaxConcurrentActivities (%d); otherwise the primary pool collapses to 1 slot",
+					e.config.SuspendLeavesReserved, e.config.MaxConcurrentActivities,
+				),
+			}
+		}
+		if e.config.SuspendLeavesReserved > 0 && len(e.config.SuspendLeafActivityTypes) == 0 {
+			return &WorkerError{
+				Kind:    ErrConfiguration,
+				Message: "SuspendLeavesReserved > 0 requires SuspendLeafActivityTypes to be non-empty; otherwise reserved slots become dead capacity",
+			}
+		}
+		var missingLeaf []string
+		for _, t := range e.config.SuspendLeafActivityTypes {
+			if _, ok := e.handlers[t]; !ok {
+				missingLeaf = append(missingLeaf, t)
+			}
+		}
+		if len(missingLeaf) > 0 {
+			return &WorkerError{
+				Kind: ErrConfiguration,
+				Message: fmt.Sprintf(
+					"SuspendLeafActivityTypes contains types with no registered handler: %v — leaf dispatcher would dequeue them and mark them handler_not_found, stealing work from other engines",
+					missingLeaf,
+				),
+			}
+		}
+	}
+
 	if !e.running.CompareAndSwap(false, true) {
 		return &WorkerError{Kind: ErrAlreadyRunning}
 	}
