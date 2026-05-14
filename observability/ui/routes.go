@@ -20,6 +20,7 @@ func RunnerQUI(inspector *observability.QueueInspector) http.Handler {
 	sseSema := make(chan struct{}, defaultMaxSSEConns)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", serveUI)
+	mux.Handle("GET /vendor/", http.StripPrefix("/vendor/", http.FileServerFS(VendorAssets())))
 	mux.HandleFunc("GET /api/observability/stats", statsHandler(inspector))
 	mux.HandleFunc("GET /api/observability/roots", recentRootsHandler(inspector))
 	mux.HandleFunc("GET /api/observability/cron", cronActivitiesHandler(inspector))
