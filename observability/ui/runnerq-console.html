@@ -1089,9 +1089,24 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
   <body>
     <div id="root"></div>
 
-    <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin="anonymous"></script>
-    <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
-    <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" crossorigin="anonymous"></script>
+    <!-- Vendored locally so the console runs behind strict CSPs (script-src 'self')
+         and on networks that can't reach unpkg.com. Served by the /vendor/ route
+         registered in observability/ui/routes.go.
+
+         The integrity= attributes pin the bytes the browser will execute.
+         Even though we serve these files ourselves, SRI defends against:
+           - Vendor-time compromise: if someone swaps a vendored file
+             without updating the hash here, the browser refuses to run it.
+           - Build-pipeline injection: an attacker who modifies the embedded
+             FS in the binary still has to update this HTML to match.
+         Hashes must match observability/ui/vendor/CHECKSUMS.txt — the
+         refresh.sh script regenerates both in lockstep. -->
+    <script src="vendor/react.production.min.js"
+            integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z"></script>
+    <script src="vendor/react-dom.production.min.js"
+            integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1"></script>
+    <script src="vendor/babel.min.js"
+            integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y"></script>
 
     <script type="text/babel" data-presets="env,react">
 const Icon = ({ name, size = 16, strokeWidth = 1.6, ...props }) => {
