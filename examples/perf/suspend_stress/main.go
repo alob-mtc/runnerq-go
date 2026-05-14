@@ -14,6 +14,22 @@
 // leaf can dispatch immediately. Reserving a fraction of slots for leaf
 // types (ReserveSlotsForLeaves) bounds the wake-up deadlock risk.
 //
+// ## Caveat: GetResult poll storm
+//
+// ActivityFuture.GetResult currently polls runnerq_results every 100ms. In
+// suspend mode the number of concurrent waiters is no longer capped by the
+// worker pool — hundreds of parents can be waiting at once, multiplying
+// the poll rate proportionally. The DB connection pool has to be sized to
+// absorb that traffic; this example does so automatically. The proper
+// long-term fix is event-driven futures (subscribe to the existing event
+// hub instead of polling), tracked separately.
+//
+// ## Each invocation uses a unique queue name
+//
+// To avoid one stalled run leaving rows behind that contaminate the next,
+// the example defaults to suspend_stress_<short-uuid> per invocation. Set
+// QUEUE_NAME if you want to share state across runs (debugging only).
+//
 // ## Running
 //
 //	# Baseline (suspend off): expect DLQ growth and slow drain.
@@ -39,6 +55,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/alob-mtc/runnerq-go"
 	"github.com/alob-mtc/runnerq-go/observability"
 	"github.com/alob-mtc/runnerq-go/storage/postgres"
@@ -61,6 +79,10 @@ type config struct {
 }
 
 func loadConfig() config {
+	// Default to a unique queue name per invocation so stale rows from a
+	// previous stalled run don't contaminate the next one. Override with
+	// QUEUE_NAME if you want to share state across runs (e.g. for debugging).
+	defaultQueue := fmt.Sprintf("suspend_stress_%s", uuid.New().String()[:8])
 	c := config{
 		roots:          envInt("ROOTS", 100),
 		workers:        envInt("WORKERS", 20),
@@ -69,7 +91,7 @@ func loadConfig() config {
 		fanout:         envInt("FANOUT", 2),
 		workMS:         envInt("WORK_MS", 200),
 		activityTOSec:  envInt("ACTIVITY_TIMEOUT_SEC", 120),
-		queueName:      envStr("QUEUE_NAME", "suspend_stress"),
+		queueName:      envStr("QUEUE_NAME", defaultQueue),
 		drainTimeout:   time.Duration(envInt("DRAIN_TIMEOUT_SEC", 300)) * time.Second,
 	}
 	return c
@@ -205,8 +227,20 @@ func main() {
 
 	databaseURL := envStr("DATABASE_URL", "postgres://postgres:runnerq@localhost:5432/runnerq")
 
-	// Pool size sized for workers + dispatcher + stats poller + reaper.
-	poolSize := int32(cfg.workers + 10)
+	// Pool size has to absorb the GetResult poll storm in suspend mode:
+	// every concurrently-suspended parent polls runnerq_results every
+	// 100ms. With several hundred suspended parents that's thousands of
+	// queries per second sharing the pool with Dequeue/Stats/Ack. Sized
+	// generously here for the stress test; production pools should be
+	// tuned to match expected concurrent-parent counts.
+	poolSize := int32(cfg.workers + 30)
+	if cfg.suspend {
+		extra := cfg.roots / 4
+		if extra < 30 {
+			extra = 30
+		}
+		poolSize = int32(cfg.workers + extra)
+	}
 	backend, err := postgres.WithConfig(ctx, databaseURL, cfg.queueName, 30_000, poolSize)
 	if err != nil {
 		log.Fatalf("backend: %v", err)
