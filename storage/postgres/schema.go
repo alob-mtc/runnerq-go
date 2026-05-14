@@ -109,4 +109,17 @@ CREATE TABLE IF NOT EXISTS runnerq_results (
     data JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Worker pools: one row per live engine instance. Heartbeats let us tell
+-- which pools are still alive for cluster-wide capacity reporting.
+CREATE TABLE IF NOT EXISTS runnerq_worker_pools (
+    pool_id        UUID PRIMARY KEY,
+    queue_name     TEXT NOT NULL,
+    max_workers    INTEGER NOT NULL,
+    activity_types TEXT[],
+    started_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_runnerq_worker_pools_queue_alive
+    ON runnerq_worker_pools(queue_name, last_seen_at);
 `

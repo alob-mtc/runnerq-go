@@ -13,8 +13,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/alob-mtc/runnerq-go/storage"
 )
+
+// workerPoolHeartbeatInterval is how often the engine refreshes its
+// runnerq_worker_pools row when the backend supports registration. Should be
+// roughly 1/6 of the backend's liveness window so a single missed beat
+// doesn't drop the pool out of cluster-wide capacity reporting.
+const workerPoolHeartbeatInterval = 10 * time.Second
 
 // backoff implements simple exponential backoff for idle polls.
 type backoff struct {
@@ -48,6 +56,7 @@ type WorkerEngine struct {
 	shutdownCh chan struct{}
 	metrics    MetricsSink
 	resultWg   sync.WaitGroup // tracks in-flight result storage goroutines
+	poolID     uuid.UUID      // identity used for worker_pools registration; zero if backend doesn't support it
 }
 
 // NewWorkerEngineWithBackend creates a WorkerEngine from a custom backend.
@@ -125,7 +134,31 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	e.cancelFunc = cancel
 	e.shutdownCh = make(chan struct{})
 
+	// Register this pool so cluster-wide capacity reporting stays accurate.
+	// Registration failure is non-fatal — the engine still runs, the KPI just
+	// under-reports until a later heartbeat re-establishes the row.
+	e.poolID = uuid.New()
+	info := storage.WorkerPoolInfo{
+		PoolID:        e.poolID,
+		QueueName:     e.config.QueueName,
+		MaxWorkers:    e.config.MaxConcurrentActivities,
+		ActivityTypes: e.config.ActivityTypes,
+	}
+	if err := e.backend.RegisterWorkerPool(engineCtx, info); err != nil {
+		slog.Warn("Failed to register worker pool", "error", err, "pool_id", e.poolID)
+		e.poolID = uuid.Nil
+	} else {
+		slog.Info("Registered worker pool", "pool_id", e.poolID, "max_workers", info.MaxWorkers)
+	}
+
 	var wg sync.WaitGroup
+
+	// Heartbeat the worker_pools row so we keep counting toward cluster capacity.
+	if e.poolID != uuid.Nil {
+		wg.Go(func() {
+			e.runWorkerPoolHeartbeat(engineCtx)
+		})
+	}
 
 	// Scheduled activities processor (skipped if backend handles it natively)
 	if !e.queue.SchedulesNatively() {
@@ -174,6 +207,17 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	case <-resultDone:
 	case <-time.After(10 * time.Second):
 		slog.Warn("Timed out waiting for result storage goroutines to drain")
+	}
+
+	// Best-effort deregistration. Use a fresh background context — the engine
+	// context is already cancelled at this point, and crashed pools are reaped
+	// by the liveness window anyway.
+	if e.poolID != uuid.Nil {
+		deregCtx, deregCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := e.backend.DeregisterWorkerPool(deregCtx, e.poolID); err != nil {
+			slog.Warn("Failed to deregister worker pool", "error", err, "pool_id", e.poolID)
+		}
+		deregCancel()
 	}
 
 	signal.Stop(sigCh)
@@ -448,6 +492,25 @@ func (e *WorkerEngine) runScheduledProcessor(ctx context.Context) {
 		}
 	}
 	slog.Debug("Scheduled activities processor stopped")
+}
+
+// runWorkerPoolHeartbeat keeps this engine's runnerq_worker_pools row marked
+// as alive so the cluster-wide MaxWorkers reported by Stats() stays accurate.
+// A failure to heartbeat is logged but doesn't shut down the engine — the row
+// will simply age out of the liveness window until the next successful beat.
+func (e *WorkerEngine) runWorkerPoolHeartbeat(ctx context.Context) {
+	ticker := time.NewTicker(workerPoolHeartbeatInterval)
+	defer ticker.Stop()
+	for e.running.Load() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := e.backend.HeartbeatWorkerPool(ctx, e.poolID); err != nil {
+				slog.Warn("Worker pool heartbeat failed", "error", err, "pool_id", e.poolID)
+			}
+		}
+	}
 }
 
 func (e *WorkerEngine) runReaperProcessor(ctx context.Context) {

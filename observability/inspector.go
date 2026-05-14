@@ -323,9 +323,13 @@ func (q *QueueInspector) Stats(ctx context.Context) (*QueueStats, error) {
 		return nil, err
 	}
 
-	maxWorkers := q.maxWorkers
+	// Prefer the backend's cluster-wide value when available — it sums across
+	// every live worker pool and is the only correct number on multi-process
+	// deployments. Fall back to WithMaxWorkers (a per-process literal) only
+	// when the backend doesn't track pools, e.g. in single-process demos.
+	maxWorkers := backendStats.MaxWorkers
 	if maxWorkers == nil {
-		maxWorkers = backendStats.MaxWorkers
+		maxWorkers = q.maxWorkers
 	}
 
 	return &QueueStats{

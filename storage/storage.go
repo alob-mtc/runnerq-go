@@ -271,14 +271,35 @@ type InspectionStorage interface {
 	EventStream(ctx context.Context) (<-chan ActivityEvent, error)
 }
 
-// Storage combines QueueStorage and InspectionStorage.
+// WorkerPoolStorage tracks live engine instances for cluster-wide capacity
+// reporting. Engines call Register on Start, Heartbeat periodically, and
+// Deregister on graceful shutdown. Crashed pools age out of Stats() once
+// their last_seen_at falls outside the backend's liveness window.
+type WorkerPoolStorage interface {
+	RegisterWorkerPool(ctx context.Context, pool WorkerPoolInfo) error
+	HeartbeatWorkerPool(ctx context.Context, poolID uuid.UUID) error
+	DeregisterWorkerPool(ctx context.Context, poolID uuid.UUID) error
+}
+
+// Storage combines the queue, inspection, and worker-pool surfaces a backend
+// must provide.
 type Storage interface {
 	QueueStorage
 	InspectionStorage
+	WorkerPoolStorage
 }
 
 // LeaseConfigurer is an optional interface backends can implement to accept
 // the lease duration from the engine configuration at startup.
 type LeaseConfigurer interface {
 	SetLeaseMS(leaseMS int64)
+}
+
+// WorkerPoolInfo describes one engine instance's worker pool for cluster-wide
+// liveness tracking.
+type WorkerPoolInfo struct {
+	PoolID        uuid.UUID
+	QueueName     string
+	MaxWorkers    int
+	ActivityTypes []string
 }
