@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -19,16 +20,29 @@ import (
 
 const notifyPayloadMax = 7900
 
+// statsCacheTTL bounds how often Stats() actually hits the database.
+// Stats() runs ~14 COUNT subqueries per call and is polled by every
+// connected SSE client; without this the dashboard amplifies into real
+// load on the activities table.
+const statsCacheTTL = time.Second
+
 // PostgresBackend is a PostgreSQL-based storage backend for RunnerQ.
 type PostgresBackend struct {
 	pool           *pgxpool.Pool
 	queueName      string
 	defaultLeaseMS int64
+
+	statsMu     sync.Mutex
+	statsCache  *storage.QueueStats
+	statsExpiry time.Time
 }
 
-// New creates a new PostgresBackend with default pool size 10 and lease 30s.
+// New creates a new PostgresBackend with default pool size 25 and lease 30s.
+// In multi-process deployments the operator should still pick a size that
+// matches the worker count via WithConfig (rule of thumb: maxWorkers + ~5
+// for reaper/stats/scheduled-processor headroom).
 func New(ctx context.Context, databaseURL, queueName string) (*PostgresBackend, error) {
-	return WithConfig(ctx, databaseURL, queueName, 30_000, 10)
+	return WithConfig(ctx, databaseURL, queueName, 30_000, 25)
 }
 
 // WithConfig creates a new PostgresBackend with custom configuration.
@@ -815,6 +829,14 @@ func (b *PostgresBackend) resolveIdempotencyBehavior(ctx context.Context, a *sto
 // ============================================================================
 
 func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error) {
+	b.statsMu.Lock()
+	if b.statsCache != nil && time.Now().Before(b.statsExpiry) {
+		s := *b.statsCache
+		b.statsMu.Unlock()
+		return &s, nil
+	}
+	b.statsMu.Unlock()
+
 	// One round trip, but each scalar subquery is planned independently so the
 	// matching partial index handles its own count. A single FILTER aggregate
 	// over the whole table would force a full scan and degrade as completed
@@ -884,6 +906,11 @@ func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error
 			stats.ByPriority.Low = uint64(count)
 		}
 	}
+
+	b.statsMu.Lock()
+	b.statsCache = stats
+	b.statsExpiry = time.Now().Add(statsCacheTTL)
+	b.statsMu.Unlock()
 
 	return stats, nil
 }
