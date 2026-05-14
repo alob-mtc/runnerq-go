@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Re-download the console's vendored JS deps from unpkg and verify the
-# resulting files against CHECKSUMS.txt. Run from the repo root or this
-# directory. Exits non-zero on any download error or checksum mismatch.
+# Re-download the console's vendored JS deps from unpkg, verify SHA-256
+# against CHECKSUMS.txt, and print the SHA-384 SRI hashes that need to
+# match runnerq-console.html's integrity= attributes.
 #
 # Bump versions by editing the URLs below, then re-running this script.
-# Commit the new files alongside the new CHECKSUMS.txt so reviewers can
-# audit the diff and re-verify locally.
+# Commit the new files alongside the new CHECKSUMS.txt and the updated
+# integrity= hashes in runnerq-console.html so reviewers can audit the
+# diff and re-verify locally.
+#
+# Run from the repo root or from this directory.
 
 set -euo pipefail
 
@@ -23,9 +26,20 @@ for url in "${urls[@]}"; do
   curl -sSf -o "$fname" "$url"
 done
 
-echo "Verifying checksums against CHECKSUMS.txt..."
+echo
+echo "Verifying SHA-256 against CHECKSUMS.txt..."
 shasum -a 256 -c CHECKSUMS.txt
 
-echo "OK — vendored files match CHECKSUMS.txt."
-echo "If you bumped versions, regenerate CHECKSUMS.txt:"
-echo "  shasum -a 256 *.js > CHECKSUMS.txt"
+echo
+echo "SRI hashes for runnerq-console.html integrity= attributes:"
+for url in "${urls[@]}"; do
+  fname="$(basename "$url")"
+  hash=$(openssl dgst -sha384 -binary "$fname" | openssl base64 -A)
+  printf "  %-32s sha384-%s\n" "$fname" "$hash"
+done
+
+echo
+echo "If you bumped versions:"
+echo "  1. Regenerate CHECKSUMS.txt:  shasum -a 256 *.js > CHECKSUMS.txt"
+echo "  2. Update the integrity= attributes in"
+echo "     observability/ui/runnerq-console.html with the SRI hashes above."
