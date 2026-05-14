@@ -1288,6 +1288,11 @@ function navTo(hash) { window.location.hash = hash; }
 // care about doesn't cause a refetch.
 const __liveListeners = new Set();
 
+// Lifecycle events that don't materially change anything the console renders
+// at a glance — suppress them at the source so they don't trigger refetches.
+// They still land in the activity events table on the next normal refresh.
+const __noisyEventTypes = new Set(['ResultStored', 'SpawnLinked', 'LeaseExtended']);
+
 function useLiveStream() {
   const [status, setStatus] = React.useState('connecting');
   React.useEffect(() => {
@@ -1301,7 +1306,7 @@ function useLiveStream() {
         try { ev = JSON.parse(e.data); } catch (_) {}
         // Some streams send heartbeats with no JSON; still flag we're connected.
         setStatus('connected');
-        if (ev) {
+        if (ev && !__noisyEventTypes.has(ev.event_type)) {
           __liveListeners.forEach(fn => { try { fn(ev); } catch (_) {} });
         }
       };

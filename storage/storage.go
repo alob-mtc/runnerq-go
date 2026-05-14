@@ -181,12 +181,10 @@ const (
 	EventEnqueued      ActivityEventType = "Enqueued"
 	EventScheduled     ActivityEventType = "Scheduled"
 	EventDequeued      ActivityEventType = "Dequeued"
-	EventStarted       ActivityEventType = "Started"
 	EventCompleted     ActivityEventType = "Completed"
 	EventFailed        ActivityEventType = "Failed"
 	EventRetrying      ActivityEventType = "Retrying"
 	EventDeadLetter    ActivityEventType = "DeadLetter"
-	EventRequeued      ActivityEventType = "Requeued"
 	EventLeaseExtended ActivityEventType = "LeaseExtended"
 	EventResultStored  ActivityEventType = "ResultStored"
 	// EventSpawnLinked records a secondary parent's link to an existing activity
