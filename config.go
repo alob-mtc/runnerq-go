@@ -33,6 +33,28 @@ type WorkerConfig struct {
 	// A handler attempting to spawn a child beyond this depth will receive ErrDepthExceeded.
 	// When zero, defaults to 32.
 	MaxActivityDepth uint16 `json:"max_activity_depth,omitempty"`
+
+	// SuspendOnAwait, when true, switches the engine to a semaphore-based
+	// concurrency model where ActivityFuture.GetResult releases this
+	// activity's worker slot while it waits for the child future to resolve.
+	// Eliminates the parent-blocking-on-children starvation pattern that
+	// pins worker slots on recursive fan-out workloads. Default false to
+	// preserve the existing fixed-goroutine behaviour.
+	SuspendOnAwait bool `json:"suspend_on_await,omitempty"`
+
+	// SuspendLeafActivityTypes, when non-empty together with SuspendOnAwait,
+	// reserves SuspendLeavesReserved slots for these "leaf" types — i.e. when
+	// the free-slot count drops to the reservation, the dispatcher only
+	// dequeues leaf types. Prevents the wake-up deadlock where every freed
+	// slot is immediately taken by another awakening parent and no leaf can
+	// run. Mirrors the parent/leaf split from the WORKER_MODE example
+	// pattern, but in-process.
+	SuspendLeafActivityTypes []string `json:"suspend_leaf_activity_types,omitempty"`
+
+	// SuspendLeavesReserved is the number of slots set aside for leaf
+	// activity types when at-pressure. Only meaningful with SuspendOnAwait
+	// and SuspendLeafActivityTypes set. Default 0 (no reservation).
+	SuspendLeavesReserved int `json:"suspend_leaves_reserved,omitempty"`
 }
 
 // DefaultMaxActivityDepth is the default cap when MaxActivityDepth is unset.

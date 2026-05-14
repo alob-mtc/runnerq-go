@@ -56,7 +56,15 @@ type WorkerEngine struct {
 	shutdownCh chan struct{}
 	metrics    MetricsSink
 	resultWg   sync.WaitGroup // tracks in-flight result storage goroutines
-	poolID     uuid.UUID      // identity used for worker_pools registration; zero if backend doesn't support it
+
+	poolID uuid.UUID // identity used for worker_pools registration; zero if backend doesn't support it
+
+	// SuspendOnAwait dispatcher state. These are nil and unused when the
+	// flag is off; the engine falls back to the fixed-goroutine pool.
+	workerSem  chan struct{}  // primary slot pool; capacity = MaxConcurrentActivities - SuspendLeavesReserved
+	leafSem    chan struct{}  // reservation pool, only populated when SuspendLeavesReserved>0 && len(SuspendLeafActivityTypes)>0
+	leafQueue  activityQueue  // adapter filtered to leaf types (paired with leafSem)
+	activityWg sync.WaitGroup // tracks in-flight activity goroutines (suspend mode only)
 }
 
 // NewWorkerEngineWithBackend creates a WorkerEngine from a custom backend.
@@ -172,12 +180,39 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		e.runReaperProcessor(engineCtx)
 	})
 
-	// Worker loops
-	for i := 0; i < e.config.MaxConcurrentActivities; i++ {
-		workerID := i
+	if e.config.SuspendOnAwait {
+		// Semaphore-based dispatcher model. A parent's slot is released
+		// while it waits on a child future (see suspend.go) so leaves can
+		// keep dequeueing — eliminates the parent-blocking starvation
+		// pattern on recursive fan-out workloads.
+		primary := e.config.MaxConcurrentActivities - e.config.SuspendLeavesReserved
+		if primary < 1 {
+			primary = 1
+		}
+		e.workerSem = make(chan struct{}, primary)
 		wg.Go(func() {
-			e.runWorkerLoop(engineCtx, workerID)
+			e.runSuspendDispatcher(engineCtx, e.queue, e.workerSem, "dispatcher")
 		})
+
+		// Optional reservation: a separate dispatcher with its own slot
+		// pool that dequeues only leaf types, so leaves can always run
+		// even when every primary slot holds a suspended parent that's
+		// about to wake.
+		if e.config.SuspendLeavesReserved > 0 && len(e.config.SuspendLeafActivityTypes) > 0 {
+			e.leafSem = make(chan struct{}, e.config.SuspendLeavesReserved)
+			e.leafQueue = newBackendQueueAdapter(e.backend, e.config.SuspendLeafActivityTypes)
+			wg.Go(func() {
+				e.runSuspendDispatcher(engineCtx, e.leafQueue, e.leafSem, "dispatcher-leaf")
+			})
+		}
+	} else {
+		// Existing fixed-goroutine pool. One worker per slot.
+		for i := 0; i < e.config.MaxConcurrentActivities; i++ {
+			workerID := i
+			wg.Go(func() {
+				e.runWorkerLoop(engineCtx, workerID)
+			})
+		}
 	}
 
 	// Wait for shutdown signal or context cancellation
@@ -196,6 +231,21 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	e.stop()
 	cancel()
 	wg.Wait()
+
+	// In suspend mode the dispatcher hands work off to per-activity
+	// goroutines; wait for those before draining result-storage.
+	if e.config.SuspendOnAwait {
+		activityDone := make(chan struct{})
+		go func() {
+			e.activityWg.Wait()
+			close(activityDone)
+		}()
+		select {
+		case <-activityDone:
+		case <-time.After(30 * time.Second):
+			slog.Warn("Timed out waiting for in-flight activities to drain")
+		}
+	}
 
 	// Wait for any in-flight result storage goroutines to finish (bounded)
 	resultDone := make(chan struct{})
@@ -285,6 +335,71 @@ func (e *WorkerEngine) runWorkerLoop(ctx context.Context, workerID int) {
 	}
 
 	slog.Debug("Worker loop stopped", "worker_id", workerID)
+}
+
+// runSuspendDispatcher is the SuspendOnAwait equivalent of runWorkerLoop.
+// One dispatcher goroutine acquires a slot from sem, dequeues, and hands the
+// activity off to a per-activity goroutine that owns the slot via a
+// slotHolder. The slotHolder is installed in the activity's context so that
+// ActivityFuture.GetResult inside the handler can release the slot for the
+// duration of the wait — that's the whole point of SuspendOnAwait.
+//
+// Two dispatchers can run concurrently against different (queue, sem) pairs
+// to implement leaf-slot reservation; they share the engine's activityWg so
+// shutdown waits for both.
+func (e *WorkerEngine) runSuspendDispatcher(ctx context.Context, q activityQueue, sem chan struct{}, label string) {
+	slog.Debug("Starting suspend dispatcher", "label", label, "slots", cap(sem))
+	bo := newBackoff(100*time.Millisecond, 5*time.Second)
+
+	for e.running.Load() {
+		// Acquire a slot before dequeueing — keeps in-flight activities
+		// bounded by the semaphore capacity even under bursty load.
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			slog.Debug("Suspend dispatcher stopped (context)", "label", label)
+			return
+		}
+
+		act, err := q.Dequeue(ctx, time.Second, label)
+		if err != nil {
+			<-sem
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Error("Suspend dispatcher dequeue failed", "label", label, "error", err)
+			select {
+			case <-time.After(time.Second):
+			case <-ctx.Done():
+				return
+			}
+			continue
+		}
+
+		if act == nil {
+			<-sem
+			sleepFor := bo.next()
+			select {
+			case <-time.After(sleepFor):
+			case <-ctx.Done():
+				return
+			}
+			continue
+		}
+
+		bo.reset()
+		holder := newSlotHolder(sem)
+		e.activityWg.Add(1)
+		go func(act *activity) {
+			defer e.activityWg.Done()
+			defer holder.release() // safety net — release() is idempotent
+
+			workerLabel := fmt.Sprintf("%s-%s", label, act.ID.String()[:8])
+			ctxWithSlot := withSuspendSlot(ctx, holder)
+			e.processActivity(ctxWithSlot, act, workerLabel, 0)
+		}(act)
+	}
+	slog.Debug("Suspend dispatcher stopped", "label", label)
 }
 
 func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, workerLabel string, workerID int) {
@@ -543,12 +658,15 @@ func (e *WorkerEngine) runReaperProcessor(ctx context.Context) {
 
 // WorkerEngineBuilder provides fluent configuration for WorkerEngine.
 type WorkerEngineBuilder struct {
-	queueName     *string
-	maxWorkers    *int
-	pollInterval  *time.Duration
-	metrics       MetricsSink
-	backend       storage.Storage
-	activityTypes []string
+	queueName        *string
+	maxWorkers       *int
+	pollInterval     *time.Duration
+	metrics          MetricsSink
+	backend          storage.Storage
+	activityTypes    []string
+	suspendOnAwait   bool
+	suspendLeafTypes []string
+	suspendLeavesRes int
 }
 
 // Builder creates a new WorkerEngineBuilder.
@@ -592,6 +710,25 @@ func (b *WorkerEngineBuilder) Backend(backend storage.Storage) *WorkerEngineBuil
 	return b
 }
 
+// SuspendOnAwait toggles the semaphore-based dispatcher that releases a
+// parent activity's worker slot while it waits for child futures. Default
+// false (existing fixed-goroutine pool). See WorkerConfig.SuspendOnAwait for
+// the operational notes.
+func (b *WorkerEngineBuilder) SuspendOnAwait(enabled bool) *WorkerEngineBuilder {
+	b.suspendOnAwait = enabled
+	return b
+}
+
+// ReserveSlotsForLeaves reserves `n` slots out of MaxWorkers for the listed
+// "leaf" activity types when SuspendOnAwait is on. Prevents the wake-up
+// deadlock where every freed slot is immediately retaken by a waking parent
+// and no leaf can run. No effect when SuspendOnAwait is off.
+func (b *WorkerEngineBuilder) ReserveSlotsForLeaves(n int, leafTypes []string) *WorkerEngineBuilder {
+	b.suspendLeavesRes = n
+	b.suspendLeafTypes = leafTypes
+	return b
+}
+
 // Build creates the WorkerEngine with configured settings.
 func (b *WorkerEngineBuilder) Build() (*WorkerEngine, error) {
 	maxConcurrent := 10
@@ -627,6 +764,9 @@ func (b *WorkerEngineBuilder) Build() (*WorkerEngine, error) {
 		ReaperIntervalSeconds:       &reaperInterval,
 		ReaperBatchSize:             &reaperBatch,
 		ActivityTypes:               b.activityTypes,
+		SuspendOnAwait:              b.suspendOnAwait,
+		SuspendLeafActivityTypes:    b.suspendLeafTypes,
+		SuspendLeavesReserved:       b.suspendLeavesRes,
 	}
 
 	engine := NewWorkerEngineWithBackend(b.backend, config)

@@ -24,7 +24,24 @@ type ActivityFuture struct {
 
 // GetResult waits for and returns the completed activity result.
 // It polls every 100ms. The caller should use context for timeout control.
+//
+// When called from inside an activity handler with SuspendOnAwait enabled,
+// the host activity's worker slot is released for the duration of the wait
+// and reacquired before returning. This prevents the parent-blocking-on-
+// children starvation that pins worker slots on recursive fan-out
+// workloads — see WorkerConfig.SuspendOnAwait. Outside that context the
+// release/reacquire is a no-op and behaviour is identical to before.
 func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error) {
+	if h := suspendFromContext(ctx); h != nil {
+		h.release()
+		defer func() {
+			// Reacquire on the original ctx so a cancelled handler doesn't
+			// block forever waiting for a slot it'll never use. The error
+			// from reacquire is swallowed deliberately — if ctx is done the
+			// caller will see it on the next select below.
+			_ = h.reacquire(ctx)
+		}()
+	}
 	for {
 		result, err := f.queue.GetResult(ctx, f.activityID)
 		if err != nil {
