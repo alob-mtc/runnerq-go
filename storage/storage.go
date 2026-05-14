@@ -284,3 +284,24 @@ type Storage interface {
 type LeaseConfigurer interface {
 	SetLeaseMS(leaseMS int64)
 }
+
+// WorkerPoolInfo describes one engine instance's worker pool for cluster-wide
+// liveness tracking.
+type WorkerPoolInfo struct {
+	PoolID        uuid.UUID
+	QueueName     string
+	MaxWorkers    int
+	ActivityTypes []string
+}
+
+// WorkerPoolRegistrar is an optional interface backends can implement to
+// participate in cluster-wide worker-pool accounting. Engines that see this
+// interface on their backend will register on Start, heartbeat periodically,
+// and deregister on graceful shutdown. Backends that don't implement it
+// continue to work; the dashboard's Workers KPI just falls back to the
+// per-process value supplied via QueueInspector.WithMaxWorkers.
+type WorkerPoolRegistrar interface {
+	RegisterWorkerPool(ctx context.Context, pool WorkerPoolInfo) error
+	HeartbeatWorkerPool(ctx context.Context, poolID uuid.UUID) error
+	DeregisterWorkerPool(ctx context.Context, poolID uuid.UUID) error
+}

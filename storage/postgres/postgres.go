@@ -26,6 +26,12 @@ const notifyPayloadMax = 7900
 // load on the activities table.
 const statsCacheTTL = time.Second
 
+// workerPoolLivenessWindow is how stale a worker_pools row can be before
+// Stats() stops counting it toward cluster-wide max-workers. Engines should
+// heartbeat at roughly 1/6 this interval so a single missed heartbeat doesn't
+// drop them out.
+const workerPoolLivenessWindow = 60 * time.Second
+
 // PostgresBackend is a PostgreSQL-based storage backend for RunnerQ.
 type PostgresBackend struct {
 	pool           *pgxpool.Pool
@@ -907,6 +913,22 @@ func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error
 		}
 	}
 
+	// Cluster-wide max workers: sum max_workers across pools that have
+	// heartbeated within workerPoolLivenessWindow. A pool that crashes
+	// without deregistering drops out of the total once its row ages out.
+	var totalMax int
+	if err := b.pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(max_workers), 0)::int
+		FROM runnerq_worker_pools
+		WHERE queue_name = $1
+		  AND last_seen_at > NOW() - make_interval(secs => $2)`,
+		b.queueName, int(workerPoolLivenessWindow.Seconds())).Scan(&totalMax); err != nil {
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to compute cluster worker capacity: %v", err))
+	}
+	if totalMax > 0 {
+		stats.MaxWorkers = &totalMax
+	}
+
 	b.statsMu.Lock()
 	b.statsCache = stats
 	b.statsExpiry = time.Now().Add(statsCacheTTL)
@@ -1398,6 +1420,58 @@ func (r *activityRow) toSnapshot() storage.ActivitySnapshot {
 		RootActivityID:    r.rootActivityID,
 		Depth:             uint16(r.depth),
 	}
+}
+
+// ============================================================================
+// WorkerPoolRegistrar Implementation
+// ============================================================================
+
+// RegisterWorkerPool inserts (or refreshes, on UUID collision) the row that
+// identifies this engine instance's pool. The same call doubles as the first
+// heartbeat — last_seen_at is set to NOW() so it counts immediately.
+func (b *PostgresBackend) RegisterWorkerPool(ctx context.Context, pool storage.WorkerPoolInfo) error {
+	var types []string
+	if len(pool.ActivityTypes) > 0 {
+		types = pool.ActivityTypes
+	}
+	_, err := b.pool.Exec(ctx, `
+		INSERT INTO runnerq_worker_pools (pool_id, queue_name, max_workers, activity_types, started_at, last_seen_at)
+		VALUES ($1, $2, $3, $4, NOW(), NOW())
+		ON CONFLICT (pool_id) DO UPDATE
+		SET max_workers    = EXCLUDED.max_workers,
+		    activity_types = EXCLUDED.activity_types,
+		    last_seen_at   = NOW()`,
+		pool.PoolID, pool.QueueName, pool.MaxWorkers, types)
+	if err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to register worker pool: %v", err))
+	}
+	return nil
+}
+
+// HeartbeatWorkerPool refreshes last_seen_at. A pool that misses heartbeats
+// for longer than workerPoolLivenessWindow stops counting toward Stats()
+// max_workers but its row is left in place — registration on next start
+// reuses the same UUID slot via the upsert in RegisterWorkerPool, and dead
+// rows can be vacuumed independently.
+func (b *PostgresBackend) HeartbeatWorkerPool(ctx context.Context, poolID uuid.UUID) error {
+	_, err := b.pool.Exec(ctx, `
+		UPDATE runnerq_worker_pools SET last_seen_at = NOW() WHERE pool_id = $1`,
+		poolID)
+	if err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to heartbeat worker pool: %v", err))
+	}
+	return nil
+}
+
+// DeregisterWorkerPool removes the row on graceful shutdown. Best-effort —
+// callers should log but not fail on errors. Crashed pools are reaped
+// implicitly by the liveness window.
+func (b *PostgresBackend) DeregisterWorkerPool(ctx context.Context, poolID uuid.UUID) error {
+	_, err := b.pool.Exec(ctx, `DELETE FROM runnerq_worker_pools WHERE pool_id = $1`, poolID)
+	if err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to deregister worker pool: %v", err))
+	}
+	return nil
 }
 
 func (b *PostgresBackend) scanSnapshots(rows pgx.Rows) ([]storage.ActivitySnapshot, error) {
