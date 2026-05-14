@@ -16,6 +16,7 @@ A robust, scalable activity queue and worker system for Go applications with plu
 - **Activity metadata** - Support for custom metadata on activities
 - **Built-in observability console** - Real-time web UI for monitoring and managing activities
 - **Worker-level activity type filtering** - Isolate workloads by restricting each engine to specific activity types
+- **Parent-await suspension** - Optional `SuspendOnAwait` mode releases a parent's worker slot while it waits for child futures, eliminating the parent-blocking-on-children starvation pattern on recursive fan-out workloads
 - **Queue statistics** - Monitoring capabilities and metrics collection
 
 ## Storage Backends
@@ -531,6 +532,79 @@ future, err := executor.Activity("process_report").
 	Payload(reportPayload).
 	Delay(2 * time.Hour).
 	Execute(ctx)
+```
+
+### Parent-Await Suspension (`SuspendOnAwait`)
+
+**The problem.** When an activity handler spawns child activities and calls `fut.GetResult()` to wait for them, the parent's goroutine sits blocked inside `GetResult` while still holding its worker slot. With recursive fan-out (a parent spawns several children, each of which is itself a parent that fans out further), worker slots fill up with suspended parents and the leaf activities they're waiting on can't dequeue. The result is starvation: queue depth climbs, parent `awaitCtx` deadlines fire, activities fail and retry, and dead-letter grows.
+
+**The fix.** With `Builder.SuspendOnAwait(true)` the engine switches to a semaphore-based dispatcher. When a handler calls `GetResult`, the parent's slot is released for the duration of the wait and reacquired before the call returns. The handler's goroutine stays alive — only the slot moves. Other activities, including the children the parent is waiting on, can dispatch onto that slot immediately.
+
+```go
+engine, err := runnerq.Builder().
+    Backend(backend).
+    QueueName("my_app").
+    MaxWorkers(20).
+    SuspendOnAwait(true).
+    Build()
+```
+
+**No handler changes required.** The release/reacquire happens transparently inside `GetResult`. Outside a handler context (e.g. in `main()`) it's a no-op — behaviour is identical to before.
+
+#### Reserving slots for leaf activities
+
+When many parents wake up at once they all race to reacquire slots. In the worst case every freed slot is immediately retaken by another waking parent and no leaf can dispatch — a wake-up deadlock. Mitigate by reserving a fraction of slots for designated leaf activity types:
+
+```go
+engine, err := runnerq.Builder().
+    Backend(backend).
+    QueueName("my_app").
+    MaxWorkers(20).
+    SuspendOnAwait(true).
+    ReserveSlotsForLeaves(5, []string{"send_email", "fetch_data", "audit_log"}).
+    Build()
+```
+
+This carves the 20 slots into two independent pools:
+
+| Pool | Slots | Dequeues |
+|---|---|---|
+| Primary | 15 (= MaxWorkers − reserved) | Any activity type (subject to `ActivityTypes` filter, if set) |
+| Leaf reservation | 5 | Only the listed leaf types |
+
+A separate dispatcher goroutine drains the leaf pool. Leaves can never be starved by waking parents.
+
+#### Concurrency invariants
+
+`MaxWorkers(N)` means different things in the two modes:
+
+| Mode | Goroutine count | Bound on actively-computing handlers |
+|---|---|---|
+| Default | Fixed = `MaxWorkers` | The goroutine count itself |
+| `SuspendOnAwait(true)` | Unbounded (1 dispatcher + 1 per active activity + 1 per suspended parent) | The semaphore buffer capacity (`MaxWorkers`) |
+
+In suspend mode, suspended parents hold zero slots but their goroutines stay alive in `GetResult`'s poll loop. With deep fan-out you can have hundreds of suspended goroutines while only `MaxWorkers` are actively computing.
+
+#### Operational notes
+
+- **Activity timeouts and leases are unchanged.** The handler's `timeoutCtx` still fires at the activity's declared timeout. The dequeue lease is set to `max(defaultLeaseMS, (timeout_seconds+10)*1000)` and covers the full execution window — including suspended waits — so no separate lease-extension loop is needed.
+- **Crash recovery.** A process crash loses in-memory parent goroutines just as today; the reaper requeues the row and the new worker re-runs the handler from scratch. Plan handlers for idempotent re-execution.
+- **`GetResult` poll storm.** `GetResult` currently polls every 100ms. With many concurrent suspended parents this multiplies the query rate on `runnerq_results`. Size your DB connection pool to absorb it (rule of thumb: a few connections beyond `MaxWorkers` plus headroom proportional to expected concurrent waiters). Event-driven futures via the existing event hub are a planned follow-up.
+- **`active_workers` KPI semantics.** In suspend mode every dispatcher dequeues with the same `workerID`, so the cluster-wide `COUNT(DISTINCT current_worker_id)` doesn't reflect actual slot utilization. Treat it as a per-process activity indicator, not per-slot.
+
+#### Stress-testing the pattern
+
+The `examples/perf/suspend_stress` example reproduces the parent-blocking starvation pattern at configurable scale and reports drain time vs DLQ growth. Useful for tuning `MaxWorkers` and `ReserveSlotsForLeaves` for your specific workload shape:
+
+```bash
+# Baseline: classical fixed-goroutine pool. Expect stall + DLQ growth.
+SUSPEND=0 ROOTS=100 WORKERS=20 go run ./examples/perf/suspend_stress
+
+# Suspend on, no reservation: usually drains; small wake-up risk.
+SUSPEND=1 ROOTS=100 WORKERS=20 go run ./examples/perf/suspend_stress
+
+# Suspend on with reservation: clean drain.
+SUSPEND=1 LEAVES_RESERVED=4 ROOTS=100 WORKERS=20 go run ./examples/perf/suspend_stress
 ```
 
 ### Workload Isolation (Activity Type Filtering)
