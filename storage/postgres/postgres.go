@@ -508,6 +508,12 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		scheduledAt := now.Add(time.Duration(retryDelay) * time.Second)
 		newRetryCount := ar.retryCount + 1
 
+		// started_at reset to NULL alongside the flip to 'retrying' for the
+		// same reason as RequeueExpired: started_at carries "when did the
+		// current/last attempt start", and the failed attempt is no longer
+		// current. The next Dequeue (when scheduled_at fires) writes a
+		// fresh started_at for the new attempt. last_error_at preserves
+		// the failed-attempt timestamp for the runs-list sort.
 		_, err = tx.Exec(ctx, `
 			UPDATE runnerq_activities
 			SET status = 'retrying',
@@ -517,7 +523,8 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 				last_error_at = $3,
 				last_worker_id = $4,
 				current_worker_id = NULL,
-				lease_deadline_ms = NULL
+				lease_deadline_ms = NULL,
+				started_at = NULL
 			WHERE id = $5 AND queue_name = $6 AND status = 'processing' AND current_worker_id = $4`,
 			scheduledAt, errorMessage, now, workerID, activityID, b.queueName)
 		if err != nil {
@@ -582,11 +589,18 @@ func (b *PostgresBackend) SchedulesNatively() bool {
 func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (uint64, error) {
 	nowMS := time.Now().UTC().UnixMilli()
 
+	// started_at is reset to NULL alongside the status flip back to pending
+	// because it carries "when did the current/last attempt start". Leaving
+	// the previous attempt's value in place makes pending rows look like
+	// they're already running (GetActivity / console snapshot misleads
+	// readers, even though no sort uses started_at on pending rows). The
+	// next Dequeue will populate started_at fresh for the new attempt.
 	tag, err := b.pool.Exec(ctx, `
 		UPDATE runnerq_activities
 		SET status = 'pending',
 			current_worker_id = NULL,
-			lease_deadline_ms = NULL
+			lease_deadline_ms = NULL,
+			started_at = NULL
 		WHERE id IN (
 			SELECT id FROM runnerq_activities
 			WHERE queue_name = $1
