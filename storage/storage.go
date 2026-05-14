@@ -273,10 +273,22 @@ type InspectionStorage interface {
 	EventStream(ctx context.Context) (<-chan ActivityEvent, error)
 }
 
-// Storage combines QueueStorage and InspectionStorage.
+// WorkerPoolStorage tracks live engine instances for cluster-wide capacity
+// reporting. Engines call Register on Start, Heartbeat periodically, and
+// Deregister on graceful shutdown. Crashed pools age out of Stats() once
+// their last_seen_at falls outside the backend's liveness window.
+type WorkerPoolStorage interface {
+	RegisterWorkerPool(ctx context.Context, pool WorkerPoolInfo) error
+	HeartbeatWorkerPool(ctx context.Context, poolID uuid.UUID) error
+	DeregisterWorkerPool(ctx context.Context, poolID uuid.UUID) error
+}
+
+// Storage combines the queue, inspection, and worker-pool surfaces a backend
+// must provide.
 type Storage interface {
 	QueueStorage
 	InspectionStorage
+	WorkerPoolStorage
 }
 
 // LeaseConfigurer is an optional interface backends can implement to accept
@@ -292,16 +304,4 @@ type WorkerPoolInfo struct {
 	QueueName     string
 	MaxWorkers    int
 	ActivityTypes []string
-}
-
-// WorkerPoolRegistrar is an optional interface backends can implement to
-// participate in cluster-wide worker-pool accounting. Engines that see this
-// interface on their backend will register on Start, heartbeat periodically,
-// and deregister on graceful shutdown. Backends that don't implement it
-// continue to work; the dashboard's Workers KPI just falls back to the
-// per-process value supplied via QueueInspector.WithMaxWorkers.
-type WorkerPoolRegistrar interface {
-	RegisterWorkerPool(ctx context.Context, pool WorkerPoolInfo) error
-	HeartbeatWorkerPool(ctx context.Context, poolID uuid.UUID) error
-	DeregisterWorkerPool(ctx context.Context, poolID uuid.UUID) error
 }

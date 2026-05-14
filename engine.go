@@ -134,23 +134,21 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	e.cancelFunc = cancel
 	e.shutdownCh = make(chan struct{})
 
-	// Register this pool with the backend, if it supports cluster-wide
-	// accounting. Failure here is non-fatal — the engine still runs, the
-	// dashboard just falls back to the per-process MaxWorkers value.
-	if reg, ok := e.backend.(storage.WorkerPoolRegistrar); ok {
-		e.poolID = uuid.New()
-		info := storage.WorkerPoolInfo{
-			PoolID:        e.poolID,
-			QueueName:     e.config.QueueName,
-			MaxWorkers:    e.config.MaxConcurrentActivities,
-			ActivityTypes: e.config.ActivityTypes,
-		}
-		if err := reg.RegisterWorkerPool(engineCtx, info); err != nil {
-			slog.Warn("Failed to register worker pool", "error", err, "pool_id", e.poolID)
-			e.poolID = uuid.Nil
-		} else {
-			slog.Info("Registered worker pool", "pool_id", e.poolID, "max_workers", info.MaxWorkers)
-		}
+	// Register this pool so cluster-wide capacity reporting stays accurate.
+	// Registration failure is non-fatal — the engine still runs, the KPI just
+	// under-reports until a later heartbeat re-establishes the row.
+	e.poolID = uuid.New()
+	info := storage.WorkerPoolInfo{
+		PoolID:        e.poolID,
+		QueueName:     e.config.QueueName,
+		MaxWorkers:    e.config.MaxConcurrentActivities,
+		ActivityTypes: e.config.ActivityTypes,
+	}
+	if err := e.backend.RegisterWorkerPool(engineCtx, info); err != nil {
+		slog.Warn("Failed to register worker pool", "error", err, "pool_id", e.poolID)
+		e.poolID = uuid.Nil
+	} else {
+		slog.Info("Registered worker pool", "pool_id", e.poolID, "max_workers", info.MaxWorkers)
 	}
 
 	var wg sync.WaitGroup
@@ -215,13 +213,11 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	// context is already cancelled at this point, and crashed pools are reaped
 	// by the liveness window anyway.
 	if e.poolID != uuid.Nil {
-		if reg, ok := e.backend.(storage.WorkerPoolRegistrar); ok {
-			deregCtx, deregCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := reg.DeregisterWorkerPool(deregCtx, e.poolID); err != nil {
-				slog.Warn("Failed to deregister worker pool", "error", err, "pool_id", e.poolID)
-			}
-			deregCancel()
+		deregCtx, deregCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := e.backend.DeregisterWorkerPool(deregCtx, e.poolID); err != nil {
+			slog.Warn("Failed to deregister worker pool", "error", err, "pool_id", e.poolID)
 		}
+		deregCancel()
 	}
 
 	signal.Stop(sigCh)
@@ -503,10 +499,6 @@ func (e *WorkerEngine) runScheduledProcessor(ctx context.Context) {
 // A failure to heartbeat is logged but doesn't shut down the engine — the row
 // will simply age out of the liveness window until the next successful beat.
 func (e *WorkerEngine) runWorkerPoolHeartbeat(ctx context.Context) {
-	reg, ok := e.backend.(storage.WorkerPoolRegistrar)
-	if !ok {
-		return
-	}
 	ticker := time.NewTicker(workerPoolHeartbeatInterval)
 	defer ticker.Stop()
 	for e.running.Load() {
@@ -514,7 +506,7 @@ func (e *WorkerEngine) runWorkerPoolHeartbeat(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := reg.HeartbeatWorkerPool(ctx, e.poolID); err != nil {
+			if err := e.backend.HeartbeatWorkerPool(ctx, e.poolID); err != nil {
 				slog.Warn("Worker pool heartbeat failed", "error", err, "pool_id", e.poolID)
 			}
 		}
