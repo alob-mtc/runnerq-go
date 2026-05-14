@@ -29,6 +29,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -254,6 +255,18 @@ func work(maxMs int) {
 
 // ─────────────────────────────────────────────────────────────────────────
 
+// Activity type partitioning for the worker-mode env var. Parents are the
+// activities that fan out and then block on GetResult — keeping their worker
+// pool separate from leaves prevents the parent-await starvation pattern
+// that pinned every slot in the single-pool deployment.
+var (
+	parentActivityTypes = []string{"research_workflow", "analyze_data", "draft_report"}
+	leafActivityTypes   = []string{
+		"fetch_documents", "extract_facts", "verify_sources",
+		"outline", "write_intro", "audit_log",
+	}
+)
+
 func main() {
 	ctx := context.Background()
 
@@ -262,17 +275,43 @@ func main() {
 		databaseURL = "postgres://postgres:runnerq@localhost:5432/runnerq"
 	}
 
+	// WORKER_MODE selects which slice of activity types this process handles.
+	// Recommended deployment for high-fan-out load:
+	//   1 process: WORKER_MODE=spawner   (parents only, plus the spawner loop)
+	//   N procs:   WORKER_MODE=leaves    (leaf activities only)
+	// Default ("" or "all") preserves single-process behaviour.
+	mode := os.Getenv("WORKER_MODE")
+
 	backend, err := postgres.New(ctx, databaseURL, "lineage_demo")
 	if err != nil {
 		log.Fatalf("Failed to create backend: %v", err)
 	}
 	defer backend.Close()
 
-	engine, err := runnerq.Builder().
+	maxWorkers := 8
+	if v := os.Getenv("MAX_WORKERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxWorkers = n
+		}
+	}
+
+	builder := runnerq.Builder().
 		Backend(backend).
 		QueueName("lineage_demo").
-		MaxWorkers(8).
-		Build()
+		MaxWorkers(maxWorkers)
+
+	switch mode {
+	case "spawner":
+		builder = builder.ActivityTypes(parentActivityTypes)
+	case "leaves":
+		builder = builder.ActivityTypes(leafActivityTypes)
+	case "", "all":
+		// no filter — handle every type
+	default:
+		log.Fatalf("Unknown WORKER_MODE %q (expected one of: spawner, leaves, all)", mode)
+	}
+
+	engine, err := builder.Build()
 	if err != nil {
 		log.Fatalf("Failed to build engine: %v", err)
 	}
@@ -292,48 +331,66 @@ func main() {
 	executor := engine.GetActivityExecutor()
 
 	go func() {
-		fmt.Println("Worker engine starting (8 workers)...")
+		fmt.Printf("Worker engine starting (mode=%s, max_workers=%d)...\n", modeOrAll(mode), maxWorkers)
 		if err := engine.Start(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "Worker engine error: %v\n", err)
 		}
 	}()
 
-	// Kick off a new root research_workflow every 20 seconds.
-	go func() {
-		fmt.Println("Waiting 3 seconds before first run...")
-		time.Sleep(3 * time.Second)
+	// Spawner loop only runs in "spawner" or "all" mode — leaf-only processes
+	// shouldn't be enqueueing roots.
+	if mode == "spawner" || mode == "" || mode == "all" {
+		go func() {
+			fmt.Println("Waiting 3 seconds before first run...")
+			time.Sleep(3 * time.Second)
 
-		counter := 1
-		for {
-			payload, _ := json.Marshal(map[string]any{
-				"topic":     fmt.Sprintf("Q%d quarterly review", counter),
-				"depth":     "deep",
-				"timestamp": time.Now().UTC().Format(time.RFC3339),
-			})
-			_, err := executor.Activity("research_workflow").
-				Payload(payload).
-				Timeout(2 * time.Minute).
-				MaxRetries(1).
-				Execute(ctx)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to enqueue root: %v\n", err)
-			} else {
-				fmt.Printf("Root research_workflow #%d enqueued\n\n", counter)
+			counter := 1
+			for {
+				payload, _ := json.Marshal(map[string]any{
+					"topic":     fmt.Sprintf("Q%d quarterly review", counter),
+					"depth":     "deep",
+					"timestamp": time.Now().UTC().Format(time.RFC3339),
+				})
+				_, err := executor.Activity("research_workflow").
+					Payload(payload).
+					Timeout(2 * time.Minute).
+					MaxRetries(1).
+					Execute(ctx)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Failed to enqueue root: %v\n", err)
+				} else {
+					fmt.Printf("Root research_workflow #%d enqueued\n\n", counter)
+				}
+				counter++
+				time.Sleep(20 * time.Second)
 			}
-			counter++
-			time.Sleep(20 * time.Second)
-		}
-	}()
-
-	mux := http.NewServeMux()
-	mux.Handle("/console/", http.StripPrefix("/console", ui.RunnerQUI(inspector)))
-
-	addr := "0.0.0.0:8081"
-	fmt.Printf("RunnerQ Console: http://%s/console/\n", addr)
-	fmt.Println("   Click into a 'research_workflow' run to see the lineage tree.")
-	fmt.Println("   Press Ctrl+C to stop")
-
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("HTTP server failed: %v", err)
+		}()
 	}
+
+	// HTTP console: only when explicitly enabled. Leaf-only processes
+	// generally shouldn't bind a port.
+	if os.Getenv("CONSOLE_ADDR") != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/console/", http.StripPrefix("/console", ui.RunnerQUI(inspector)))
+
+		addr := os.Getenv("CONSOLE_ADDR")
+		fmt.Printf("RunnerQ Console: http://%s/console/\n", addr)
+		fmt.Println("   Click into a 'research_workflow' run to see the lineage tree.")
+		fmt.Println("   Press Ctrl+C to stop")
+
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			log.Fatalf("HTTP server failed: %v", err)
+		}
+		return
+	}
+
+	// Without a console, just block on the engine goroutine.
+	select {}
+}
+
+func modeOrAll(m string) string {
+	if m == "" {
+		return "all"
+	}
+	return m
 }
