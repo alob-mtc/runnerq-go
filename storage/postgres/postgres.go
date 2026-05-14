@@ -508,6 +508,12 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		scheduledAt := now.Add(time.Duration(retryDelay) * time.Second)
 		newRetryCount := ar.retryCount + 1
 
+		// started_at reset to NULL alongside the flip to 'retrying' for the
+		// same reason as RequeueExpired: started_at carries "when did the
+		// current/last attempt start", and the failed attempt is no longer
+		// current. The next Dequeue (when scheduled_at fires) writes a
+		// fresh started_at for the new attempt. last_error_at preserves
+		// the failed-attempt timestamp for the runs-list sort.
 		_, err = tx.Exec(ctx, `
 			UPDATE runnerq_activities
 			SET status = 'retrying',
@@ -517,7 +523,8 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 				last_error_at = $3,
 				last_worker_id = $4,
 				current_worker_id = NULL,
-				lease_deadline_ms = NULL
+				lease_deadline_ms = NULL,
+				started_at = NULL
 			WHERE id = $5 AND queue_name = $6 AND status = 'processing' AND current_worker_id = $4`,
 			scheduledAt, errorMessage, now, workerID, activityID, b.queueName)
 		if err != nil {
@@ -582,11 +589,18 @@ func (b *PostgresBackend) SchedulesNatively() bool {
 func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (uint64, error) {
 	nowMS := time.Now().UTC().UnixMilli()
 
+	// started_at is reset to NULL alongside the status flip back to pending
+	// because it carries "when did the current/last attempt start". Leaving
+	// the previous attempt's value in place makes pending rows look like
+	// they're already running (GetActivity / console snapshot misleads
+	// readers, even though no sort uses started_at on pending rows). The
+	// next Dequeue will populate started_at fresh for the new attempt.
 	tag, err := b.pool.Exec(ctx, `
 		UPDATE runnerq_activities
 		SET status = 'pending',
 			current_worker_id = NULL,
-			lease_deadline_ms = NULL
+			lease_deadline_ms = NULL,
+			started_at = NULL
 		WHERE id IN (
 			SELECT id FROM runnerq_activities
 			WHERE queue_name = $1
@@ -1158,6 +1172,33 @@ func (b *PostgresBackend) GetChildren(ctx context.Context, parentID uuid.UUID, o
 	return b.scanSnapshots(rows)
 }
 
+// statusOrderTimestampSQL picks the timestamp column that's most meaningful
+// for the active status filter so "newest first" actually means "most
+// recently transitioned into this state":
+//
+//	completed  -> completed_at
+//	failed     -> last_error_at
+//	processing -> started_at
+//	scheduled  -> scheduled_at
+//	retrying   -> last_error_at  (most recent failure that triggered the retry)
+//	dead_letter-> last_error_at
+//	pending / "all" -> created_at (no later timestamp exists yet)
+//
+// Wrapped in COALESCE so a NULL on the status-specific column (defensive —
+// shouldn't happen) and the unfiltered "all" case both fall back to
+// created_at, preserving the prior behaviour as the safe default.
+const statusOrderTimestampSQL = `COALESCE(
+		CASE $2
+			WHEN 'completed'   THEN completed_at
+			WHEN 'failed'      THEN last_error_at
+			WHEN 'processing'  THEN started_at
+			WHEN 'scheduled'   THEN scheduled_at
+			WHEN 'retrying'    THEN last_error_at
+			WHEN 'dead_letter' THEN last_error_at
+		END,
+		created_at
+	) DESC`
+
 func (b *PostgresBackend) ListRecentRoots(ctx context.Context, status string, offset, limit int) ([]storage.ActivitySnapshot, error) {
 	rows, err := b.pool.Query(ctx, `
 		SELECT id, activity_type, payload, priority, status, created_at,
@@ -1169,7 +1210,13 @@ func (b *PostgresBackend) ListRecentRoots(ctx context.Context, status string, of
 		FROM runnerq_activities
 		WHERE queue_name = $1 AND parent_activity_id IS NULL
 		  AND ($2 = '' OR status = $2)
-		ORDER BY created_at DESC
+		  -- The Schedules tab is the canonical home for cron runs; suppress
+		  -- them from the runs list when the user is browsing terminal
+		  -- statuses so the Completed/Failed views aren't dominated by
+		  -- recurring-job clutter. Other statuses (pending/processing/etc.)
+		  -- still surface cron rows so live cron work stays observable.
+		  AND ($2 NOT IN ('completed', 'failed') OR (metadata->>'source') IS DISTINCT FROM 'cron')
+		ORDER BY `+statusOrderTimestampSQL+`
 		LIMIT $3 OFFSET $4`,
 		b.queueName, status, limit, offset)
 	if err != nil {
@@ -1191,7 +1238,10 @@ func (b *PostgresBackend) ListRecentActivities(ctx context.Context, status strin
 		FROM runnerq_activities
 		WHERE queue_name = $1
 		  AND ($2 = '' OR status = $2)
-		ORDER BY created_at DESC
+		  -- See ListRecentRoots: cron runs live in the Schedules tab; hide
+		  -- them from the flattened runs list on terminal statuses.
+		  AND ($2 NOT IN ('completed', 'failed') OR (metadata->>'source') IS DISTINCT FROM 'cron')
+		ORDER BY `+statusOrderTimestampSQL+`
 		LIMIT $3 OFFSET $4`,
 		b.queueName, status, limit, offset)
 	if err != nil {
