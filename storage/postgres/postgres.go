@@ -1158,6 +1158,33 @@ func (b *PostgresBackend) GetChildren(ctx context.Context, parentID uuid.UUID, o
 	return b.scanSnapshots(rows)
 }
 
+// statusOrderTimestampSQL picks the timestamp column that's most meaningful
+// for the active status filter so "newest first" actually means "most
+// recently transitioned into this state":
+//
+//	completed  -> completed_at
+//	failed     -> last_error_at
+//	processing -> started_at
+//	scheduled  -> scheduled_at
+//	retrying   -> last_error_at  (most recent failure that triggered the retry)
+//	dead_letter-> last_error_at
+//	pending / "all" -> created_at (no later timestamp exists yet)
+//
+// Wrapped in COALESCE so a NULL on the status-specific column (defensive —
+// shouldn't happen) and the unfiltered "all" case both fall back to
+// created_at, preserving the prior behaviour as the safe default.
+const statusOrderTimestampSQL = `COALESCE(
+		CASE $2
+			WHEN 'completed'   THEN completed_at
+			WHEN 'failed'      THEN last_error_at
+			WHEN 'processing'  THEN started_at
+			WHEN 'scheduled'   THEN scheduled_at
+			WHEN 'retrying'    THEN last_error_at
+			WHEN 'dead_letter' THEN last_error_at
+		END,
+		created_at
+	) DESC`
+
 func (b *PostgresBackend) ListRecentRoots(ctx context.Context, status string, offset, limit int) ([]storage.ActivitySnapshot, error) {
 	rows, err := b.pool.Query(ctx, `
 		SELECT id, activity_type, payload, priority, status, created_at,
@@ -1175,7 +1202,7 @@ func (b *PostgresBackend) ListRecentRoots(ctx context.Context, status string, of
 		  -- recurring-job clutter. Other statuses (pending/processing/etc.)
 		  -- still surface cron rows so live cron work stays observable.
 		  AND ($2 NOT IN ('completed', 'failed') OR (metadata->>'source') IS DISTINCT FROM 'cron')
-		ORDER BY created_at DESC
+		ORDER BY `+statusOrderTimestampSQL+`
 		LIMIT $3 OFFSET $4`,
 		b.queueName, status, limit, offset)
 	if err != nil {
@@ -1200,7 +1227,7 @@ func (b *PostgresBackend) ListRecentActivities(ctx context.Context, status strin
 		  -- See ListRecentRoots: cron runs live in the Schedules tab; hide
 		  -- them from the flattened runs list on terminal statuses.
 		  AND ($2 NOT IN ('completed', 'failed') OR (metadata->>'source') IS DISTINCT FROM 'cron')
-		ORDER BY created_at DESC
+		ORDER BY `+statusOrderTimestampSQL+`
 		LIMIT $3 OFFSET $4`,
 		b.queueName, status, limit, offset)
 	if err != nil {
