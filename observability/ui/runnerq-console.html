@@ -1064,6 +1064,26 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
 .runs-table .queue { font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-2); }
 .runs-table .att { font-family: var(--font-mono); font-size: 11px; color: var(--fg-3); }
 .runs-table .att.high { color: var(--amber); }
+.runs-table .worker { font-family: var(--font-mono); font-size: 11px; color: var(--fg-2); }
+.runs-table .worker .none { color: var(--fg-4); }
+.runs-table .prio { font-size: 11px; font-weight: 500; }
+.runs-table .prio.critical { color: var(--rose); }
+.runs-table .prio.high { color: var(--amber); }
+.runs-table .prio.normal { color: var(--fg-2); }
+.runs-table .prio.low { color: var(--fg-3); }
+
+.runs-table thead th.sortable { cursor: pointer; user-select: none; }
+.runs-table thead th.sortable:hover { color: var(--fg-1); }
+.runs-table thead th .sort-arrow {
+  display: inline-block;
+  margin-left: 4px;
+  font-size: 9px;
+  vertical-align: middle;
+  color: var(--fg-3);
+}
+.runs-table thead th.sortable.active { color: var(--fg-0); }
+.runs-table thead th.sortable.active .sort-arrow { color: var(--accent); }
+.runs-table thead th .sort-arrow.placeholder { opacity: 0.35; }
 
 .copy-flash {
   position: fixed;
@@ -1173,7 +1193,10 @@ function fmtAgo(iso) {
 
 function fmtTsShort(iso) {
   if (!iso) return '—';
-  try { return new Date(iso).toISOString().slice(11, 23); } catch { return '—'; }
+  // en-US locale gives "M/D/YYYY, h:mm:ss AM/PM" — readable absolute timestamp
+  // matching what most operators expect from a server console. The browser
+  // applies the user's local timezone automatically.
+  try { return new Date(iso).toLocaleString('en-US'); } catch { return '—'; }
 }
 
 function activityDurationMs(a) {
@@ -1190,6 +1213,17 @@ function activityDurationMs(a) {
 function shortId(id) {
   if (!id) return '';
   return id.length > 8 ? id.slice(0, 8) : id;
+}
+
+// Priority constants mirror storage.PriorityLow..PriorityCritical (1..4).
+function priorityLabel(p) {
+  switch (Number(p)) {
+    case 4: return { label: 'Critical', cls: 'critical' };
+    case 3: return { label: 'High', cls: 'high' };
+    case 2: return { label: 'Normal', cls: 'normal' };
+    case 1: return { label: 'Low', cls: 'low' };
+    default: return { label: '—', cls: 'normal' };
+  }
 }
 
 // Pretty-print a value that may already be a parsed JS object (json.RawMessage
@@ -1498,6 +1532,17 @@ function FilterBar({ q, setQ, status, setStatus, type, setType, types, totalLoad
   );
 }
 
+function SortableHeader({ k, sortKey, sortDir, onSort, style, children }) {
+  const active = sortKey === k;
+  const arrow = active ? (sortDir === 'asc' ? '▲' : '▼') : '▲';
+  return (
+    <th style={style} className={'sortable' + (active ? ' active' : '')} onClick={() => onSort(k)}>
+      {children}
+      <span className={'sort-arrow' + (active ? '' : ' placeholder')}>{arrow}</span>
+    </th>
+  );
+}
+
 function RunsListPage({ manualTick, urlParams = {} }) {
   const [stats, setStats] = React.useState(null);
   const [roots, setRoots] = React.useState(null);
@@ -1510,22 +1555,41 @@ function RunsListPage({ manualTick, urlParams = {} }) {
   const [typeFilter, setTypeFilter] = React.useState(urlParams.type || 'all');
   const [limit, setLimit] = useStoredNum('runnerq.runsLimit', 200, RUNS_LIMIT_OPTIONS);
   const [flatten, setFlatten] = useStoredBool('runnerq.flatten', false);
+  const [sortKey, setSortKey] = React.useState(urlParams.sort || 'created_at');
+  const [sortDir, setSortDir] = React.useState(urlParams.dir === 'asc' ? 'asc' : 'desc');
 
-  // Mirror current filters into the URL hash with replaceState so we don't
-  // pollute browser history on every keystroke. When the user clicks a row,
-  // navTo pushes a new entry on top of this state — browser back lands them
-  // here with filters intact.
+  // Mirror current filters and sort into the URL hash with replaceState so we
+  // don't pollute browser history on every keystroke. When the user clicks a
+  // row, navTo pushes a new entry on top of this state — browser back lands
+  // them here with filters intact.
   React.useEffect(() => {
     const usp = new URLSearchParams();
     if (q) usp.set('q', q);
     if (statusFilter !== 'all') usp.set('status', statusFilter);
     if (typeFilter !== 'all') usp.set('type', typeFilter);
+    if (sortKey !== 'created_at' || sortDir !== 'desc') {
+      usp.set('sort', sortKey);
+      usp.set('dir', sortDir);
+    }
     const qs = usp.toString();
     const newHash = '#/' + (qs ? '?' + qs : '');
     if (window.location.hash !== newHash) {
       window.history.replaceState(null, '', newHash || '#');
     }
-  }, [q, statusFilter, typeFilter]);
+  }, [q, statusFilter, typeFilter, sortKey, sortDir]);
+
+  // Click a sortable column header: same key flips direction; new key resets
+  // to descending (the more useful default for time- and count-based columns).
+  const toggleSort = React.useCallback((key) => {
+    setSortKey(prev => {
+      if (prev === key) {
+        setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+        return prev;
+      }
+      setSortDir('desc');
+      return key;
+    });
+  }, []);
 
   // Any live event matters to the runs list — a new activity could appear or
   // an existing one could change status. No filter; refetch on any tick.
@@ -1617,6 +1681,35 @@ function RunsListPage({ manualTick, urlParams = {} }) {
     }
     return true;
   });
+
+  const sorted = React.useMemo(() => {
+    const extract = (r) => {
+      switch (sortKey) {
+        case 'activity_type': return (r.activity_type || '').toLowerCase();
+        case 'priority':      return Number(r.priority) || 0;
+        case 'status':        return (r.status || '').toLowerCase();
+        case 'created_at':    return new Date(r.created_at).getTime() || 0;
+        case 'duration':      return activityDurationMs(r) || 0;
+        case 'attempts':      return Number(r.retry_count) || 0;
+        case 'worker':        return (r.current_worker_id || r.last_worker_id || '').toLowerCase();
+        default:              return 0;
+      }
+    };
+    const copy = filtered.slice();
+    copy.sort((a, b) => {
+      const av = extract(a), bv = extract(b);
+      let cmp;
+      if (typeof av === 'number' && typeof bv === 'number') cmp = av - bv;
+      else cmp = String(av).localeCompare(String(bv));
+      if (cmp === 0) {
+        // Stable secondary sort by created_at desc so repeat columns don't shuffle.
+        cmp = (new Date(b.created_at).getTime() || 0) - (new Date(a.created_at).getTime() || 0);
+        return cmp; // direction-independent
+      }
+      return sortDir === 'asc' ? cmp : -cmp;
+    });
+    return copy;
+  }, [filtered, sortKey, sortDir]);
 
   return (
     <div className="list-page">
@@ -1737,19 +1830,30 @@ function RunsListPage({ manualTick, urlParams = {} }) {
           <table className="runs-table">
             <thead>
               <tr>
-                <th style={{ width: 110 }}>Status</th>
-                <th>Activity</th>
-                <th style={{ width: 160 }}>Started</th>
-                <th style={{ width: 110 }}>Duration</th>
-                <th style={{ width: 90 }}>Attempts</th>
+                <SortableHeader k="activity_type" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort}>Activity</SortableHeader>
+                <SortableHeader k="priority" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} style={{ width: 90 }}>Priority</SortableHeader>
+                <SortableHeader k="status" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} style={{ width: 110 }}>Status</SortableHeader>
+                <SortableHeader k="created_at" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} style={{ width: 200 }}>Created</SortableHeader>
+                <SortableHeader k="worker" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} style={{ width: 140 }}>Worker</SortableHeader>
+                <SortableHeader k="duration" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} style={{ width: 110 }}>Duration</SortableHeader>
+                <SortableHeader k="attempts" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} style={{ width: 90 }}>Attempts</SortableHeader>
               </tr>
             </thead>
             <tbody>
-              {filtered.map(r => {
+              {sorted.map(r => {
                 const sc = statusClass(r.status);
                 const dur = activityDurationMs(r);
+                const prio = priorityLabel(r.priority);
+                const worker = r.current_worker_id || r.last_worker_id;
                 return (
                   <tr key={r.id} onClick={() => navTo('#/run/' + r.id)}>
+                    <td>
+                      <div className="id-cell">
+                        <span className="typ">{r.activity_type}</span>
+                        <span className="uid">{r.id}</span>
+                      </div>
+                    </td>
+                    <td><span className={'prio ' + prio.cls}>{prio.label}</span></td>
                     <td>
                       <span className={'status-chip sm ' + sc}>
                         <span className="pip" />
@@ -1757,16 +1861,15 @@ function RunsListPage({ manualTick, urlParams = {} }) {
                       </span>
                     </td>
                     <td>
-                      <div className="id-cell">
-                        <span className="typ">{r.activity_type}</span>
-                        <span className="uid">{r.id}</span>
+                      <div className="ts-cell">
+                        <span className="at">{fmtTsShort(r.created_at)}</span>
+                        <span className="ago">{fmtAgo(r.created_at)}</span>
                       </div>
                     </td>
                     <td>
-                      <div className="ts-cell">
-                        <span className="at">{fmtTsShort(r.started_at || r.created_at)}</span>
-                        <span className="ago">{fmtAgo(r.started_at || r.created_at)}</span>
-                      </div>
+                      <span className="worker">
+                        {worker ? worker : <span className="none">—</span>}
+                      </span>
                     </td>
                     <td><span className="dur">{fmtDuration(dur)}</span></td>
                     <td>

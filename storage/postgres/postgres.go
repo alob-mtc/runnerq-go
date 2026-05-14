@@ -1169,6 +1169,12 @@ func (b *PostgresBackend) ListRecentRoots(ctx context.Context, status string, of
 		FROM runnerq_activities
 		WHERE queue_name = $1 AND parent_activity_id IS NULL
 		  AND ($2 = '' OR status = $2)
+		  -- The Schedules tab is the canonical home for cron runs; suppress
+		  -- them from the runs list when the user is browsing terminal
+		  -- statuses so the Completed/Failed views aren't dominated by
+		  -- recurring-job clutter. Other statuses (pending/processing/etc.)
+		  -- still surface cron rows so live cron work stays observable.
+		  AND ($2 NOT IN ('completed', 'failed') OR (metadata->>'source') IS DISTINCT FROM 'cron')
 		ORDER BY created_at DESC
 		LIMIT $3 OFFSET $4`,
 		b.queueName, status, limit, offset)
@@ -1191,6 +1197,9 @@ func (b *PostgresBackend) ListRecentActivities(ctx context.Context, status strin
 		FROM runnerq_activities
 		WHERE queue_name = $1
 		  AND ($2 = '' OR status = $2)
+		  -- See ListRecentRoots: cron runs live in the Schedules tab; hide
+		  -- them from the flattened runs list on terminal statuses.
+		  AND ($2 NOT IN ('completed', 'failed') OR (metadata->>'source') IS DISTINCT FROM 'cron')
 		ORDER BY created_at DESC
 		LIMIT $3 OFFSET $4`,
 		b.queueName, status, limit, offset)
