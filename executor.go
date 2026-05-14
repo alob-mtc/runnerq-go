@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"time"
 
@@ -154,9 +155,7 @@ func (b *ActivityBuilder) MetadataMap(metadata map[string]string) *ActivityBuild
 	if b.metadata == nil {
 		b.metadata = make(map[string]string, len(metadata))
 	}
-	for k, v := range metadata {
-		b.metadata[k] = v
-	}
+	maps.Copy(b.metadata, metadata)
 	return b
 }
 
@@ -197,9 +196,7 @@ func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) 
 			idempKey = &IdempotencyConfig{Key: prefixedKey, Behavior: b.idempotencyKey.Behavior}
 		}
 		metadata := make(map[string]string)
-		for k, v := range b.metadata {
-			metadata[k] = v
-		}
+		maps.Copy(metadata, b.metadata)
 		option = &ActivityOption{
 			Priority:             b.priority,
 			MaxRetries:           maxRetries,
@@ -224,8 +221,8 @@ type WorkerEngineWrapper struct {
 
 // lineageScope captures the parent context that this wrapper applies to spawns.
 type lineageScope struct {
-	parentID  uuid.UUID
-	rootID    uuid.UUID
+	parentID   uuid.UUID
+	rootID     uuid.UUID
 	childDepth uint16 // depth of the CHILD being spawned (parent.Depth + 1)
 }
 

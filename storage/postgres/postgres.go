@@ -716,7 +716,7 @@ func (b *PostgresBackend) CheckIdempotency(ctx context.Context, a *storage.Queue
 	behavior := a.IdempotencyKey.Behavior
 
 	const maxRetries = 3
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for range maxRetries {
 		result, err := b.tryClaimIdempotencyKey(ctx, a, key)
 		if err != nil {
 			return nil, err
@@ -1296,30 +1296,30 @@ func (b *PostgresBackend) EventStream(ctx context.Context) (<-chan storage.Activ
 // ============================================================================
 
 type activityRow struct {
-	id                uuid.UUID
-	activityType      string
-	payload           json.RawMessage
-	priority          int32
-	status            string
-	createdAt         time.Time
-	scheduledAt       *time.Time
-	startedAt         *time.Time
-	completedAt       *time.Time
-	currentWorkerID   *string
-	lastWorkerID      *string
+	id                   uuid.UUID
+	activityType         string
+	payload              json.RawMessage
+	priority             int32
+	status               string
+	createdAt            time.Time
+	scheduledAt          *time.Time
+	startedAt            *time.Time
+	completedAt          *time.Time
+	currentWorkerID      *string
+	lastWorkerID         *string
 	retryCount           int32
 	maxRetries           int32
 	timeoutSeconds       int64
 	retryDelaySeconds    int64
 	maxRetryDelaySeconds int64
 	lastError            *string
-	lastErrorAt       *time.Time
-	metadata          json.RawMessage
-	idempotencyKey    *string
-	leaseDeadlineMS   *int64
-	parentActivityID  *uuid.UUID
-	rootActivityID    *uuid.UUID
-	depth             int16
+	lastErrorAt          *time.Time
+	metadata             json.RawMessage
+	idempotencyKey       *string
+	leaseDeadlineMS      *int64
+	parentActivityID     *uuid.UUID
+	rootActivityID       *uuid.UUID
+	depth                int16
 }
 
 func (r *activityRow) toQueuedActivity() *storage.QueuedActivity {

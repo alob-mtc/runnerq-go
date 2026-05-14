@@ -146,7 +146,7 @@ func (h *stressRoot) Handle(ctx runnerq.ActivityContext, payload json.RawMessage
 		return nil, runnerq.NewRetryError(err.Error())
 	}
 	midFuts := make([]*runnerq.ActivityFuture, 0, 2)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		f, err := spawn(ctx, "stress_mid", payload, h.cfg)
 		if err != nil {
 			return nil, runnerq.NewRetryError(err.Error())
@@ -235,10 +235,7 @@ func main() {
 	// tuned to match expected concurrent-parent counts.
 	poolSize := int32(cfg.workers + 30)
 	if cfg.suspend {
-		extra := cfg.roots / 4
-		if extra < 30 {
-			extra = 30
-		}
+		extra := max(cfg.roots/4, 30)
 		poolSize = int32(cfg.workers + extra)
 	}
 	backend, err := postgres.WithConfig(ctx, databaseURL, cfg.queueName, 30_000, poolSize)

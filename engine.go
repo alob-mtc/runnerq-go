@@ -71,10 +71,7 @@ type WorkerEngine struct {
 func NewWorkerEngineWithBackend(backend storage.Storage, config WorkerConfig) *WorkerEngine {
 	// Propagate lease config to backends that support it.
 	if lc, ok := backend.(storage.LeaseConfigurer); ok && config.LeaseMS != nil {
-		leaseMS := *config.LeaseMS
-		if leaseMS > math.MaxInt64 {
-			leaseMS = math.MaxInt64
-		}
+		leaseMS := min(*config.LeaseMS, math.MaxInt64)
 		lc.SetLeaseMS(int64(leaseMS))
 	}
 
@@ -185,10 +182,7 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		// while it waits on a child future (see suspend.go) so leaves can
 		// keep dequeueing — eliminates the parent-blocking starvation
 		// pattern on recursive fan-out workloads.
-		primary := e.config.MaxConcurrentActivities - e.config.SuspendLeavesReserved
-		if primary < 1 {
-			primary = 1
-		}
+		primary := max(e.config.MaxConcurrentActivities-e.config.SuspendLeavesReserved, 1)
 		e.workerSem = make(chan struct{}, primary)
 		wg.Go(func() {
 			e.runSuspendDispatcher(engineCtx, e.queue, e.workerSem, "dispatcher")
@@ -497,16 +491,14 @@ func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result 
 	slog.Info("Activity completed successfully", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType)
 
 	// Async result storage — tracked for graceful shutdown
-	e.resultWg.Add(1)
-	go func() {
-		defer e.resultWg.Done()
+	e.resultWg.Go(func() {
 		storeCtx, storeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer storeCancel()
 		res := activityResult{Data: result, State: ResultOk}
 		if err := e.queue.StoreResult(storeCtx, act.ID, res); err != nil {
 			slog.Error("Failed to store activity result", "activity_id", activityID, "error", err)
 		}
-	}()
+	})
 }
 
 func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity, handler ActivityHandler, actCtx ActivityContext, payloadForDL json.RawMessage, reason string, workerLabel string, workerID int, activityID any, activityType string) {
@@ -543,9 +535,7 @@ func (e *WorkerEngine) handleNonRetryableFailure(ctx context.Context, act *activ
 	}
 
 	// Async result storage — tracked for graceful shutdown
-	e.resultWg.Add(1)
-	go func() {
-		defer e.resultWg.Done()
+	e.resultWg.Go(func() {
 		storeCtx, storeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer storeCancel()
 		errorResult, _ := json.Marshal(map[string]any{
@@ -557,7 +547,7 @@ func (e *WorkerEngine) handleNonRetryableFailure(ctx context.Context, act *activ
 		if err := e.queue.StoreResult(storeCtx, act.ID, res); err != nil {
 			slog.Error("Failed to store activity result", "activity_id", activityID, "error", err)
 		}
-	}()
+	})
 }
 
 func (e *WorkerEngine) handleTimeout(ctx context.Context, act *activity, handler ActivityHandler, actCtx ActivityContext, payloadForDL json.RawMessage, workerLabel string, workerID int, activityID any, activityType string, timeout time.Duration) {

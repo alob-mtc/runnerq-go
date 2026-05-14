@@ -2,6 +2,7 @@ package runnerq
 
 import (
 	"encoding/json"
+	"maps"
 	"time"
 
 	"github.com/google/uuid"
@@ -152,9 +153,7 @@ func newActivity(activityType string, payload json.RawMessage, option *ActivityO
 
 	metadata := make(map[string]string)
 	if option != nil && len(option.Metadata) > 0 {
-		for k, v := range option.Metadata {
-			metadata[k] = v
-		}
+		maps.Copy(metadata, option.Metadata)
 	}
 
 	id := uuid.New()
