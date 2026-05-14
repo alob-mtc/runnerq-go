@@ -55,6 +55,14 @@ type WorkerConfig struct {
 	// activity types when at-pressure. Only meaningful with SuspendOnAwait
 	// and SuspendLeafActivityTypes set. Default 0 (no reservation).
 	SuspendLeavesReserved int `json:"suspend_leaves_reserved,omitempty"`
+
+	// ShutdownGraceSeconds bounds the entire shutdown drain — worker loops,
+	// dispatchers, in-flight activity goroutines, result-storage goroutines,
+	// and worker-pool deregistration all run in parallel under this single
+	// budget. When the budget expires, Start() returns even if some
+	// goroutines are still in flight (those are then orphaned for the
+	// remaining process lifetime, which is fine on a SIGTERM). Default 30s.
+	ShutdownGraceSeconds *uint64 `json:"shutdown_grace_seconds,omitempty"`
 }
 
 // DefaultMaxActivityDepth is the default cap when MaxActivityDepth is unset.

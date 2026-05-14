@@ -268,44 +268,73 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 
 	e.stop()
 	cancel()
-	wg.Wait()
 
-	// In suspend mode the dispatcher hands work off to per-activity
-	// goroutines; wait for those before draining result-storage.
-	if e.config.SuspendOnAwait {
-		activityDone := make(chan struct{})
+	// Single shutdown grace covering everything in parallel — worker loops,
+	// dispatchers, in-flight activity goroutines, result-storage goroutines,
+	// and pool deregistration. Previous design ran them sequentially with
+	// per-stage timeouts (wg.Wait unbounded + 30s + 10s + 5s) which on a
+	// busy engine could push shutdown past a minute and time out the
+	// orchestrator's SIGTERM grace. Worst case is now ShutdownGraceSeconds
+	// regardless of how many goroutines are still in flight.
+	graceSec := uint64(30)
+	if e.config.ShutdownGraceSeconds != nil {
+		graceSec = max(*e.config.ShutdownGraceSeconds, 1)
+	}
+	graceCtx, graceCancel := context.WithTimeout(context.Background(), time.Duration(graceSec)*time.Second)
+	defer graceCancel()
+
+	type drainTask struct {
+		name string
+		fn   func()
+	}
+	tasks := []drainTask{
+		// Worker loops, dispatchers, reaper, scheduled processor, heartbeat —
+		// everything that wg.Add'd into the supervisor wg above.
+		{"workers", func() { wg.Wait() }},
+		// In-flight activity goroutines (suspend mode only — non-suspend
+		// activities are inside the worker goroutines covered by wg).
+		{"activities", func() {
+			if e.config.SuspendOnAwait {
+				e.activityWg.Wait()
+			}
+		}},
+		// Async result-storage goroutines spawned by handleSuccess /
+		// handleNonRetryableFailure.
+		{"results", func() { e.resultWg.Wait() }},
+		// Best-effort pool deregister — uses graceCtx so it can't outlive
+		// the budget on its own.
+		{"deregister", func() {
+			if e.poolID == uuid.Nil {
+				return
+			}
+			if err := e.backend.DeregisterWorkerPool(graceCtx, e.poolID); err != nil && graceCtx.Err() == nil {
+				slog.Warn("Failed to deregister worker pool", "error", err, "pool_id", e.poolID)
+			}
+		}},
+	}
+
+	done := make(chan string, len(tasks))
+	for _, t := range tasks {
+		t := t
 		go func() {
-			e.activityWg.Wait()
-			close(activityDone)
+			t.fn()
+			done <- t.name
 		}()
+	}
+
+	finished := 0
+	for finished < len(tasks) {
 		select {
-		case <-activityDone:
-		case <-time.After(30 * time.Second):
-			slog.Warn("Timed out waiting for in-flight activities to drain")
+		case name := <-done:
+			slog.Debug("Shutdown drain complete", "stage", name)
+			finished++
+		case <-graceCtx.Done():
+			pending := len(tasks) - finished
+			slog.Warn("Shutdown grace exceeded; returning with drains in flight",
+				"grace_seconds", graceSec, "pending_drains", pending)
+			signal.Stop(sigCh)
+			return nil
 		}
-	}
-
-	// Wait for any in-flight result storage goroutines to finish (bounded)
-	resultDone := make(chan struct{})
-	go func() {
-		e.resultWg.Wait()
-		close(resultDone)
-	}()
-	select {
-	case <-resultDone:
-	case <-time.After(10 * time.Second):
-		slog.Warn("Timed out waiting for result storage goroutines to drain")
-	}
-
-	// Best-effort deregistration. Use a fresh background context — the engine
-	// context is already cancelled at this point, and crashed pools are reaped
-	// by the liveness window anyway.
-	if e.poolID != uuid.Nil {
-		deregCtx, deregCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := e.backend.DeregisterWorkerPool(deregCtx, e.poolID); err != nil {
-			slog.Warn("Failed to deregister worker pool", "error", err, "pool_id", e.poolID)
-		}
-		deregCancel()
 	}
 
 	signal.Stop(sigCh)
@@ -701,6 +730,7 @@ type WorkerEngineBuilder struct {
 	suspendOnAwait   bool
 	suspendLeafTypes []string
 	suspendLeavesRes int
+	shutdownGrace    *time.Duration
 }
 
 // Builder creates a new WorkerEngineBuilder.
@@ -763,6 +793,16 @@ func (b *WorkerEngineBuilder) ReserveSlotsForLeaves(n int, leafTypes []string) *
 	return b
 }
 
+// ShutdownGrace bounds the entire shutdown drain — workers, dispatchers,
+// in-flight activity goroutines, result-storage goroutines, and pool
+// deregistration all run in parallel under this single budget. When the
+// budget expires Start() returns even if some goroutines remain in flight.
+// Defaults to 30s when not set; clamped to >= 1s.
+func (b *WorkerEngineBuilder) ShutdownGrace(d time.Duration) *WorkerEngineBuilder {
+	b.shutdownGrace = &d
+	return b
+}
+
 // Build creates the WorkerEngine with configured settings.
 func (b *WorkerEngineBuilder) Build() (*WorkerEngine, error) {
 	maxConcurrent := 10
@@ -801,6 +841,13 @@ func (b *WorkerEngineBuilder) Build() (*WorkerEngine, error) {
 		SuspendOnAwait:              b.suspendOnAwait,
 		SuspendLeafActivityTypes:    b.suspendLeafTypes,
 		SuspendLeavesReserved:       b.suspendLeavesRes,
+	}
+	if b.shutdownGrace != nil {
+		secs := uint64((*b.shutdownGrace).Seconds())
+		if secs == 0 {
+			secs = 1
+		}
+		config.ShutdownGraceSeconds = &secs
 	}
 
 	engine := NewWorkerEngineWithBackend(b.backend, config)
