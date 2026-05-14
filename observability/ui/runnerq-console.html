@@ -1653,6 +1653,48 @@ function RunsListPage({ manualTick, urlParams = {} }) {
     if (!stillThere) setTypeFilter('all');
   }, [typeFilter, roots]);
 
+  // Filter + sort lives in useMemo and must be declared before the early
+  // returns below — otherwise React sees a different hook count between the
+  // loading render (early return, hook skipped) and the loaded render (hook
+  // called) and throws #310.
+  const sorted = React.useMemo(() => {
+    if (!roots) return [];
+    const qLower = q.trim().toLowerCase();
+    const filtered = roots.filter(r => {
+      if (statusFilter !== 'all' && statusClass(r.status) !== statusFilter) return false;
+      if (typeFilter !== 'all' && r.activity_type !== typeFilter) return false;
+      if (qLower) {
+        const hay = (r.activity_type + ' ' + r.id).toLowerCase();
+        if (!hay.includes(qLower)) return false;
+      }
+      return true;
+    });
+    const extract = (r) => {
+      switch (sortKey) {
+        case 'activity_type': return (r.activity_type || '').toLowerCase();
+        case 'priority':      return Number(r.priority) || 0;
+        case 'status':        return (r.status || '').toLowerCase();
+        case 'created_at':    return new Date(r.created_at).getTime() || 0;
+        case 'duration':      return activityDurationMs(r) || 0;
+        case 'attempts':      return Number(r.retry_count) || 0;
+        case 'worker':        return (r.current_worker_id || r.last_worker_id || '').toLowerCase();
+        default:              return 0;
+      }
+    };
+    filtered.sort((a, b) => {
+      const av = extract(a), bv = extract(b);
+      let cmp;
+      if (typeof av === 'number' && typeof bv === 'number') cmp = av - bv;
+      else cmp = String(av).localeCompare(String(bv));
+      if (cmp === 0) {
+        // Stable secondary sort by created_at desc so repeat columns don't shuffle.
+        return (new Date(b.created_at).getTime() || 0) - (new Date(a.created_at).getTime() || 0);
+      }
+      return sortDir === 'asc' ? cmp : -cmp;
+    });
+    return filtered;
+  }, [roots, q, statusFilter, typeFilter, sortKey, sortDir]);
+
   // Block the page only on initial-load failure. Once we've rendered data at
   // least once, transient failures (backend restart, network blip) keep the
   // last good state and surface as a small banner.
@@ -1671,45 +1713,7 @@ function RunsListPage({ manualTick, urlParams = {} }) {
     .map(([name, count]) => ({ name, count }))
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
 
-  const qLower = q.trim().toLowerCase();
-  const filtered = roots.filter(r => {
-    if (statusFilter !== 'all' && statusClass(r.status) !== statusFilter) return false;
-    if (typeFilter !== 'all' && r.activity_type !== typeFilter) return false;
-    if (qLower) {
-      const hay = (r.activity_type + ' ' + r.id).toLowerCase();
-      if (!hay.includes(qLower)) return false;
-    }
-    return true;
-  });
-
-  const sorted = React.useMemo(() => {
-    const extract = (r) => {
-      switch (sortKey) {
-        case 'activity_type': return (r.activity_type || '').toLowerCase();
-        case 'priority':      return Number(r.priority) || 0;
-        case 'status':        return (r.status || '').toLowerCase();
-        case 'created_at':    return new Date(r.created_at).getTime() || 0;
-        case 'duration':      return activityDurationMs(r) || 0;
-        case 'attempts':      return Number(r.retry_count) || 0;
-        case 'worker':        return (r.current_worker_id || r.last_worker_id || '').toLowerCase();
-        default:              return 0;
-      }
-    };
-    const copy = filtered.slice();
-    copy.sort((a, b) => {
-      const av = extract(a), bv = extract(b);
-      let cmp;
-      if (typeof av === 'number' && typeof bv === 'number') cmp = av - bv;
-      else cmp = String(av).localeCompare(String(bv));
-      if (cmp === 0) {
-        // Stable secondary sort by created_at desc so repeat columns don't shuffle.
-        cmp = (new Date(b.created_at).getTime() || 0) - (new Date(a.created_at).getTime() || 0);
-        return cmp; // direction-independent
-      }
-      return sortDir === 'asc' ? cmp : -cmp;
-    });
-    return copy;
-  }, [filtered, sortKey, sortDir]);
+  const filtered = sorted; // backwards-compat name used in the empty-state hint below
 
   return (
     <div className="list-page">
