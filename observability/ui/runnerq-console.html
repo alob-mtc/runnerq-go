@@ -1108,6 +1108,69 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
 .runs-table thead th.sortable.active .sort-arrow { color: var(--accent); }
 .runs-table thead th .sort-arrow.placeholder { opacity: 0.35; }
 
+.hover-preview {
+  position: fixed;
+  z-index: 100;
+  width: 460px;
+  max-height: 60vh;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+  /* Fade in lets the 2s hover feel intentional rather than abrupt. */
+  animation: previewFadeIn 0.12s ease-out;
+}
+.hover-preview .head {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--fg-1);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 6px;
+}
+.hover-preview .head .uid {
+  color: var(--fg-3);
+  font-size: 10.5px;
+}
+.hover-preview .section .label {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+  margin-bottom: 4px;
+}
+.hover-preview .section pre {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--fg-1);
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre;
+  line-height: 1.5;
+}
+.hover-preview .section pre.dim { color: var(--fg-3); font-style: italic; }
+.hover-preview .section pre.err {
+  color: var(--red);
+  background: var(--red-soft);
+  border-color: var(--red-line);
+}
+@keyframes previewFadeIn {
+  from { opacity: 0; transform: translateY(-2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
 .copy-flash {
   position: fixed;
   bottom: 24px; left: 50%;
@@ -1570,6 +1633,133 @@ function FilterBar({ q, setQ, status, setStatus, type, setType, types, totalLoad
   );
 }
 
+// HoverPreview is a fixed-position floating card the runs list shows
+// after a 2s hover on a row. Read-only peek at the activity's input
+// payload + most recent result so an operator can scan without clicking
+// in. pointer-events: none lets clicks pass through to the underlying
+// row — moving the mouse off the row dismisses the preview.
+function HoverPreview({ row, result, pos }) {
+  const inputStr = formatJsonField(row.payload);
+  const resultStr = result && result.data != null ? formatJsonField(result.data) : null;
+  const lastError = row.last_error || null;
+  return (
+    <div className="hover-preview" style={{ left: pos.x, top: pos.y }}>
+      <div className="head">
+        <span>{row.activity_type}</span>
+        <span className="uid">{shortId(row.id)}</span>
+      </div>
+      <div className="section">
+        <div className="label">Input</div>
+        <pre>{inputStr}</pre>
+      </div>
+      <div className="section">
+        <div className="label">Result</div>
+        {resultStr ? (
+          <pre>{resultStr}</pre>
+        ) : (
+          <pre className="dim">No result yet</pre>
+        )}
+        {lastError && (
+          <pre className="err" style={{ marginTop: 6 }}>{lastError}</pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// useRowHoverPreview wires up the hover-delay → fetch → show flow used by
+// the runs table. Returns the active preview state plus three handlers
+// rows need (onMouseEnter / onMouseMove / onMouseLeave). Result responses
+// are cached in a ref Map for the lifetime of the page so re-hovering the
+// same row doesn't refetch.
+//
+// Position anchors to the cursor at the moment the 2s timer fires, not to
+// the row's right edge — feels more natural when you stop reading on a
+// specific column. Doesn't follow the cursor after that to keep the card
+// stable while you read it.
+function useRowHoverPreview(delayMs = 2000) {
+  const [preview, setPreview] = React.useState(null);
+  const timerRef = React.useRef(null);
+  const cursorRef = React.useRef({ x: 0, y: 0 });
+  const cacheRef = React.useRef(new Map());
+  // Monotonic counter incremented on every enter and leave. Captures the
+  // hover "generation" the timer was scheduled in — when the async fetch
+  // resolves we check it still matches before calling setPreview, so a
+  // late /result response from row A can't open the preview for a row
+  // the user already left or moved away from.
+  const hoverSeqRef = React.useRef(0);
+
+  React.useEffect(() => () => {
+    hoverSeqRef.current += 1;
+    if (timerRef.current) clearTimeout(timerRef.current);
+  }, []);
+
+  const computePos = (cursor) => {
+    // Default: down-right of cursor (standard tooltip convention). Flip
+    // each axis when too close to the corresponding viewport edge so the
+    // card stays fully on-screen regardless of mouse position.
+    //
+    // previewHeight uses the actual CSS cap (60vh) rather than a fixed
+    // constant — a hardcoded 380 was wrong on shorter viewports, where
+    // 60vh < 380 and the popup could still spill.
+    const previewWidth = 460;
+    const previewHeight = Math.floor(window.innerHeight * 0.6);
+    const offset = 14;
+    const margin = 8;
+    let x = cursor.x + offset;
+    if (x + previewWidth + margin > window.innerWidth) {
+      x = Math.max(margin, cursor.x - previewWidth - offset);
+    }
+    let y = cursor.y + offset;
+    if (y + previewHeight + margin > window.innerHeight) {
+      y = Math.max(margin, cursor.y - previewHeight - offset);
+    }
+    return { x, y };
+  };
+
+  const onMouseEnter = React.useCallback((row, evt) => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    cursorRef.current = { x: evt.clientX, y: evt.clientY };
+    const seq = ++hoverSeqRef.current;
+    timerRef.current = setTimeout(async () => {
+      timerRef.current = null;
+      let result = cacheRef.current.get(row.id);
+      if (result === undefined) {
+        try {
+          result = await api('/activities/' + row.id + '/result');
+        } catch (_) {
+          result = null;
+        }
+        cacheRef.current.set(row.id, result);
+      }
+      // Bail out if a newer hover/leave happened while we awaited the
+      // fetch — without this guard, a slow /result for row A could open
+      // its preview after the user already moved to row B.
+      if (seq !== hoverSeqRef.current) return;
+      setPreview({ row, pos: computePos(cursorRef.current), result });
+    }, delayMs);
+  }, [delayMs]);
+
+  // Track the cursor while the user is still on the row but the timer
+  // hasn't fired yet — when it does fire, the popup anchors to the
+  // most-recent cursor position, not the entry point. Once the popup is
+  // visible we leave it pinned so it doesn't jitter as the mouse moves.
+  const onMouseMove = React.useCallback((evt) => {
+    cursorRef.current = { x: evt.clientX, y: evt.clientY };
+  }, []);
+
+  const onMouseLeave = React.useCallback(() => {
+    hoverSeqRef.current += 1;
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    setPreview(null);
+  }, []);
+
+  return { preview, onMouseEnter, onMouseMove, onMouseLeave };
+}
+
 function SortableHeader({ k, sortKey, sortDir, onSort, style, children }) {
   const active = sortKey === k;
   const arrow = active ? (sortDir === 'asc' ? '▲' : '▼') : '▲';
@@ -1733,6 +1923,11 @@ function RunsListPage({ manualTick, urlParams = {} }) {
     return filtered;
   }, [roots, q, statusFilter, typeFilter, sortKey, sortDir]);
 
+  // Row hover-preview hook. Must sit above the early returns to keep hook
+  // count stable across loading/loaded renders (same lesson as the sort
+  // useMemo above).
+  const hoverPreview = useRowHoverPreview(2000);
+
   // Block the page only on initial-load failure. Once we've rendered data at
   // least once, transient failures (backend restart, network blip) keep the
   // last good state and surface as a small banner.
@@ -1888,7 +2083,13 @@ function RunsListPage({ manualTick, urlParams = {} }) {
                 const prio = priorityLabel(r.priority);
                 const worker = r.current_worker_id || r.last_worker_id;
                 return (
-                  <tr key={r.id} onClick={() => navTo('#/run/' + r.id)}>
+                  <tr
+                    key={r.id}
+                    onClick={() => navTo('#/run/' + r.id)}
+                    onMouseEnter={(e) => hoverPreview.onMouseEnter(r, e)}
+                    onMouseMove={hoverPreview.onMouseMove}
+                    onMouseLeave={hoverPreview.onMouseLeave}
+                  >
                     <td>
                       <div className="id-cell">
                         <span className="typ">{r.activity_type}</span>
@@ -1927,6 +2128,13 @@ function RunsListPage({ manualTick, urlParams = {} }) {
         )}
         </div>
       </div>
+      {hoverPreview.preview && (
+        <HoverPreview
+          row={hoverPreview.preview.row}
+          result={hoverPreview.preview.result}
+          pos={hoverPreview.preview.pos}
+        />
+      )}
     </div>
   );
 }
