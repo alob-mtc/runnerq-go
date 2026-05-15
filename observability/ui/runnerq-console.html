@@ -1113,6 +1113,10 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
   z-index: 100;
   width: 460px;
   max-height: 60vh;
+  /* Keep oversized content inside the card instead of spilling past the
+     viewport — the inner <pre>s have their own scroll for long lines,
+     this is the safety net for outlier payloads. */
+  overflow: auto;
   background: var(--bg-1);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -1717,13 +1721,18 @@ function useRowHoverPreview(delayMs = 2000, dismissGraceMs = 200) {
 
   const computePos = (cursor) => {
     // Default: down-right of cursor (standard tooltip convention). Flip
-    // each axis when too close to the corresponding viewport edge so the
-    // card stays fully on-screen regardless of mouse position. Offset is
-    // generous (16px) so the cursor doesn't immediately overlap the card
-    // edge, leaving room to move toward it without crossing into a
-    // sibling row.
+    // each axis when there isn't room below/right so the card stays
+    // fully on-screen.
+    //
+    // The vertical flip uses a *typical* rendered height (~320px), NOT
+    // the 60vh max-height cap. Anchoring against the worst case meant
+    // the flip fired for cursors below ~40% of the viewport even when
+    // actual content was small, pinning the card to the top of the
+    // page regardless of cursor position. The card's max-height +
+    // overflow: auto handles oversized content gracefully if a payload
+    // ever does exceed the estimate.
     const previewWidth = 460;
-    const previewHeight = Math.floor(window.innerHeight * 0.6);
+    const previewHeight = 320;
     const offset = 16;
     const margin = 8;
     let x = cursor.x + offset;
@@ -1794,19 +1803,14 @@ function useRowHoverPreview(delayMs = 2000, dismissGraceMs = 200) {
     }, delayMs);
   }, [delayMs]);
 
+  // Update the cursor ref while the user is still moving over the row
+  // pre-show — when the 2s timer fires, the popup anchors at the
+  // most-recent cursor position rather than wherever the mouse first
+  // entered the row. Once the popup is visible the position is pinned;
+  // moving the mouse around the row (or onto the popup) does NOT
+  // reposition the card.
   const onRowMouseMove = React.useCallback((evt) => {
     cursorRef.current = { x: evt.clientX, y: evt.clientY };
-    // If popup is visible and cursor is still on the row (not over the
-    // popup), update its position so it follows. We update via a
-    // functional setState that bails if no row is showing yet — keeps
-    // the move handler cheap.
-    setPreview(prev => {
-      if (!prev) return prev;
-      // When the mouse is over the popup, freeze position so it doesn't
-      // slide while the user is reading. overPreviewRef gates this.
-      if (overPreviewRef.current) return prev;
-      return { ...prev, pos: computePos(cursorRef.current) };
-    });
   }, []);
 
   const onRowMouseLeave = React.useCallback(() => {
