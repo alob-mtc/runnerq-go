@@ -51,7 +51,9 @@ import (
 //   └─ audit_log (.AsRoot — detached, becomes its own root)
 // ─────────────────────────────────────────────────────────────────────────
 
-type ResearchWorkflow struct{ runnerq.DefaultDeadLetterHandler }
+type ResearchWorkflow struct {
+	runnerq.DefaultDeadLetterHandler
+}
 
 func (h *ResearchWorkflow) ActivityType() string { return "research_workflow" }
 
@@ -104,7 +106,9 @@ func (h *ResearchWorkflow) Handle(ctx runnerq.ActivityContext, payload json.RawM
 
 // ─────────────────────────────────────────────────────────────────────────
 
-type FetchDocuments struct{ runnerq.DefaultDeadLetterHandler }
+type FetchDocuments struct {
+	runnerq.DefaultDeadLetterHandler
+}
 
 func (h *FetchDocuments) ActivityType() string { return "fetch_documents" }
 
@@ -116,7 +120,9 @@ func (h *FetchDocuments) Handle(ctx runnerq.ActivityContext, _ json.RawMessage) 
 
 // ─────────────────────────────────────────────────────────────────────────
 
-type AnalyzeData struct{ runnerq.DefaultDeadLetterHandler }
+type AnalyzeData struct {
+	runnerq.DefaultDeadLetterHandler
+}
 
 func (h *AnalyzeData) ActivityType() string { return "analyze_data" }
 
@@ -144,7 +150,9 @@ func (h *AnalyzeData) Handle(ctx runnerq.ActivityContext, payload json.RawMessag
 
 // ─────────────────────────────────────────────────────────────────────────
 
-type ExtractFacts struct{ runnerq.DefaultDeadLetterHandler }
+type ExtractFacts struct {
+	runnerq.DefaultDeadLetterHandler
+}
 
 func (h *ExtractFacts) ActivityType() string { return "extract_facts" }
 
@@ -175,7 +183,9 @@ func (h *VerifySources) Handle(ctx runnerq.ActivityContext, _ json.RawMessage) (
 
 // ─────────────────────────────────────────────────────────────────────────
 
-type DraftReport struct{ runnerq.DefaultDeadLetterHandler }
+type DraftReport struct {
+	runnerq.DefaultDeadLetterHandler
+}
 
 func (h *DraftReport) ActivityType() string { return "draft_report" }
 
@@ -203,7 +213,9 @@ func (h *DraftReport) Handle(ctx runnerq.ActivityContext, payload json.RawMessag
 
 // ─────────────────────────────────────────────────────────────────────────
 
-type Outline struct{ runnerq.DefaultDeadLetterHandler }
+type Outline struct {
+	runnerq.DefaultDeadLetterHandler
+}
 
 func (h *Outline) ActivityType() string { return "outline" }
 
@@ -215,7 +227,9 @@ func (h *Outline) Handle(ctx runnerq.ActivityContext, _ json.RawMessage) (json.R
 
 // ─────────────────────────────────────────────────────────────────────────
 
-type WriteIntro struct{ runnerq.DefaultDeadLetterHandler }
+type WriteIntro struct {
+	runnerq.DefaultDeadLetterHandler
+}
 
 func (h *WriteIntro) ActivityType() string { return "write_intro" }
 
@@ -227,7 +241,9 @@ func (h *WriteIntro) Handle(ctx runnerq.ActivityContext, _ json.RawMessage) (jso
 
 // ─────────────────────────────────────────────────────────────────────────
 
-type AuditLog struct{ runnerq.DefaultDeadLetterHandler }
+type AuditLog struct {
+	runnerq.DefaultDeadLetterHandler
+}
 
 func (h *AuditLog) ActivityType() string { return "audit_log" }
 
