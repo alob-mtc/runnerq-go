@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Re-runs release-drafter against the just-pushed tag — release-drafter
+      # detects the existing draft, replaces its tag/name with the actual
+      # tag, and publishes it. Net effect: the draft accumulated by every
+      # main-merge becomes the real release the moment the maintainer pushes
+      # `git tag vX.Y.Z && git push --tags`.
+      - uses: release-drafter/release-drafter@v6
+        with:
+          publish: true
+          tag: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

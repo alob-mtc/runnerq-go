@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # `go build ./...` compiles every package + every `main` in examples,
+      # which is the bar we already enforce locally before each commit.
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # gofmt check — fails the job if any tracked .go file would be
+      # rewritten. Cheap and catches accidental mis-formatting before review.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # No test files in the repo today — keep this step around so we
+      # don't have to revisit CI when the first test lands.
+      - name: Test
+        run: go test ./... -count=1 -timeout=2m

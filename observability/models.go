@@ -82,19 +82,19 @@ type DeadLetterRecord struct {
 
 // QueueStats provides queue monitoring statistics.
 type QueueStats struct {
-	PendingActivities    uint64               `json:"pending_activities"`
-	ProcessingActivities uint64               `json:"processing_activities"`
-	CriticalPriority     uint64               `json:"critical_priority"`
-	HighPriority         uint64               `json:"high_priority"`
-	NormalPriority       uint64               `json:"normal_priority"`
-	LowPriority          uint64               `json:"low_priority"`
-	ScheduledActivities  uint64               `json:"scheduled_activities"`
-	RetryingActivities   uint64               `json:"retrying_activities"`
-	FailedActivities     uint64               `json:"failed_activities"`
-	DeadLetterActivities uint64               `json:"dead_letter_activities"`
-	MaxWorkers           *int                 `json:"max_workers,omitempty"`
-	ActiveWorkers        uint64               `json:"active_workers"`
-	Roots                RootStatusBreakdown  `json:"roots"`
+	PendingActivities    uint64              `json:"pending_activities"`
+	ProcessingActivities uint64              `json:"processing_activities"`
+	CriticalPriority     uint64              `json:"critical_priority"`
+	HighPriority         uint64              `json:"high_priority"`
+	NormalPriority       uint64              `json:"normal_priority"`
+	LowPriority          uint64              `json:"low_priority"`
+	ScheduledActivities  uint64              `json:"scheduled_activities"`
+	RetryingActivities   uint64              `json:"retrying_activities"`
+	FailedActivities     uint64              `json:"failed_activities"`
+	DeadLetterActivities uint64              `json:"dead_letter_activities"`
+	MaxWorkers           *int                `json:"max_workers,omitempty"`
+	ActiveWorkers        uint64              `json:"active_workers"`
+	Roots                RootStatusBreakdown `json:"roots"`
 }
 
 // RootStatusBreakdown is per-status counts limited to root activities.
