@@ -1113,6 +1113,10 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
   z-index: 100;
   width: 460px;
   max-height: 60vh;
+  /* Keep oversized content inside the card instead of spilling past the
+     viewport — the inner <pre>s have their own scroll for long lines,
+     this is the safety net for outlier payloads. */
+  overflow: auto;
   background: var(--bg-1);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -1121,7 +1125,10 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
   display: flex;
   flex-direction: column;
   gap: 8px;
-  pointer-events: none;
+  /* pointer-events: auto (default) so the operator can move the cursor
+     onto the card to scroll its content, copy text, etc. The hook gates
+     dismissal on cursor-over-row OR cursor-over-popup, with a 200ms
+     grace period for crossing the gap. */
   /* Fade in lets the 2s hover feel intentional rather than abrupt. */
   animation: previewFadeIn 0.12s ease-out;
 }
@@ -1634,16 +1641,22 @@ function FilterBar({ q, setQ, status, setStatus, type, setType, types, totalLoad
 }
 
 // HoverPreview is a fixed-position floating card the runs list shows
-// after a 2s hover on a row. Read-only peek at the activity's input
-// payload + most recent result so an operator can scan without clicking
-// in. pointer-events: none lets clicks pass through to the underlying
-// row — moving the mouse off the row dismisses the preview.
-function HoverPreview({ row, result, pos }) {
+// after a 2s hover on a row. Interactive: pointer-events are enabled so
+// the operator can move the cursor onto the card to scroll long
+// payloads, copy text, etc. Dismissal happens when the cursor leaves
+// both the row AND the card (with a short grace period for crossing
+// the gap between them).
+function HoverPreview({ row, result, pos, onMouseEnter, onMouseLeave }) {
   const inputStr = formatJsonField(row.payload);
   const resultStr = result && result.data != null ? formatJsonField(result.data) : null;
   const lastError = row.last_error || null;
   return (
-    <div className="hover-preview" style={{ left: pos.x, top: pos.y }}>
+    <div
+      className="hover-preview"
+      style={{ left: pos.x, top: pos.y }}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+    >
       <div className="head">
         <span>{row.activity_type}</span>
         <span className="uid">{shortId(row.id)}</span>
@@ -1668,43 +1681,59 @@ function HoverPreview({ row, result, pos }) {
 }
 
 // useRowHoverPreview wires up the hover-delay → fetch → show flow used by
-// the runs table. Returns the active preview state plus three handlers
-// rows need (onMouseEnter / onMouseMove / onMouseLeave). Result responses
-// are cached in a ref Map for the lifetime of the page so re-hovering the
-// same row doesn't refetch.
+// the runs table. Returns the active preview state plus the row and
+// preview event handlers. Result responses are cached in a ref Map for
+// the lifetime of the page so re-hovering the same row doesn't refetch.
 //
-// Position anchors to the cursor at the moment the 2s timer fires, not to
-// the row's right edge — feels more natural when you stop reading on a
-// specific column. Doesn't follow the cursor after that to keep the card
-// stable while you read it.
-function useRowHoverPreview(delayMs = 2000) {
+// Behaviour:
+//   - 2s hover delay before show.
+//   - Position tracks the cursor while the mouse is still moving over
+//     the row, so the card lands wherever the cursor settled and slides
+//     with it as the user moves across columns.
+//   - Once the cursor enters the popup itself, position freezes — the
+//     card doesn't flee from the cursor while the operator is reading.
+//   - 200ms grace period before dismiss when the mouse leaves the row
+//     or the popup, so brief jitter while crossing the gap between
+//     them doesn't tear down the preview.
+//   - Mouse on either the row OR the popup keeps it open. Dismissal
+//     requires leaving both for longer than the grace.
+function useRowHoverPreview(delayMs = 2000, dismissGraceMs = 200) {
   const [preview, setPreview] = React.useState(null);
-  const timerRef = React.useRef(null);
+  const showTimerRef = React.useRef(null);
+  const dismissTimerRef = React.useRef(null);
   const cursorRef = React.useRef({ x: 0, y: 0 });
   const cacheRef = React.useRef(new Map());
-  // Monotonic counter incremented on every enter and leave. Captures the
-  // hover "generation" the timer was scheduled in — when the async fetch
-  // resolves we check it still matches before calling setPreview, so a
-  // late /result response from row A can't open the preview for a row
-  // the user already left or moved away from.
-  const hoverSeqRef = React.useRef(0);
+  // Track whether we're "over" the row vs the popup. Either being true
+  // keeps the preview alive; both false (after grace) dismisses.
+  const overRowRef = React.useRef(false);
+  const overPreviewRef = React.useRef(false);
+  // Monotonic counter incremented on every meaningful state change.
+  // Captures the "generation" the async fetch was scheduled in so a
+  // late /result response can't reopen a preview the user already
+  // dismissed or moved past.
+  const seqRef = React.useRef(0);
 
   React.useEffect(() => () => {
-    hoverSeqRef.current += 1;
-    if (timerRef.current) clearTimeout(timerRef.current);
+    seqRef.current += 1;
+    if (showTimerRef.current) clearTimeout(showTimerRef.current);
+    if (dismissTimerRef.current) clearTimeout(dismissTimerRef.current);
   }, []);
 
   const computePos = (cursor) => {
     // Default: down-right of cursor (standard tooltip convention). Flip
-    // each axis when too close to the corresponding viewport edge so the
-    // card stays fully on-screen regardless of mouse position.
+    // each axis when there isn't room below/right so the card stays
+    // fully on-screen.
     //
-    // previewHeight uses the actual CSS cap (60vh) rather than a fixed
-    // constant — a hardcoded 380 was wrong on shorter viewports, where
-    // 60vh < 380 and the popup could still spill.
+    // The vertical flip uses a *typical* rendered height (~320px), NOT
+    // the 60vh max-height cap. Anchoring against the worst case meant
+    // the flip fired for cursors below ~40% of the viewport even when
+    // actual content was small, pinning the card to the top of the
+    // page regardless of cursor position. The card's max-height +
+    // overflow: auto handles oversized content gracefully if a payload
+    // ever does exceed the estimate.
     const previewWidth = 460;
-    const previewHeight = Math.floor(window.innerHeight * 0.6);
-    const offset = 14;
+    const previewHeight = 320;
+    const offset = 16;
     const margin = 8;
     let x = cursor.x + offset;
     if (x + previewWidth + margin > window.innerWidth) {
@@ -1717,12 +1746,49 @@ function useRowHoverPreview(delayMs = 2000) {
     return { x, y };
   };
 
-  const onMouseEnter = React.useCallback((row, evt) => {
-    if (timerRef.current) clearTimeout(timerRef.current);
+  const cancelDismiss = () => {
+    if (dismissTimerRef.current) {
+      clearTimeout(dismissTimerRef.current);
+      dismissTimerRef.current = null;
+    }
+  };
+
+  const scheduleDismiss = () => {
+    cancelDismiss();
+    dismissTimerRef.current = setTimeout(() => {
+      dismissTimerRef.current = null;
+      // Re-check liveness in case mouse came back into row/popup during
+      // the grace window (handled by cancelDismiss, but defensive here).
+      if (!overRowRef.current && !overPreviewRef.current) {
+        seqRef.current += 1;
+        setPreview(null);
+      }
+    }, dismissGraceMs);
+  };
+
+  const onRowMouseEnter = React.useCallback((row, evt) => {
+    overRowRef.current = true;
+    cancelDismiss();
     cursorRef.current = { x: evt.clientX, y: evt.clientY };
-    const seq = ++hoverSeqRef.current;
-    timerRef.current = setTimeout(async () => {
-      timerRef.current = null;
+    // If the popup is already showing for some other row, swap to the
+    // new row immediately (no extra 2s wait — the user already chose to
+    // engage with the preview UI).
+    setPreview(prev => {
+      if (prev && prev.row.id !== row.id) {
+        const cached = cacheRef.current.get(row.id);
+        // Cache miss kicks off the fetch and shows "loading" via a quick
+        // re-render below; cache hit shows the new row instantly.
+        if (cached !== undefined) {
+          return { row, pos: computePos(cursorRef.current), result: cached };
+        }
+      }
+      return prev;
+    });
+    // If popup not yet shown, schedule the standard 2s show timer.
+    if (showTimerRef.current) clearTimeout(showTimerRef.current);
+    const seq = ++seqRef.current;
+    showTimerRef.current = setTimeout(async () => {
+      showTimerRef.current = null;
       let result = cacheRef.current.get(row.id);
       if (result === undefined) {
         try {
@@ -1732,32 +1798,53 @@ function useRowHoverPreview(delayMs = 2000) {
         }
         cacheRef.current.set(row.id, result);
       }
-      // Bail out if a newer hover/leave happened while we awaited the
-      // fetch — without this guard, a slow /result for row A could open
-      // its preview after the user already moved to row B.
-      if (seq !== hoverSeqRef.current) return;
+      if (seq !== seqRef.current) return;
       setPreview({ row, pos: computePos(cursorRef.current), result });
     }, delayMs);
   }, [delayMs]);
 
-  // Track the cursor while the user is still on the row but the timer
-  // hasn't fired yet — when it does fire, the popup anchors to the
-  // most-recent cursor position, not the entry point. Once the popup is
-  // visible we leave it pinned so it doesn't jitter as the mouse moves.
-  const onMouseMove = React.useCallback((evt) => {
+  // Update the cursor ref while the user is still moving over the row
+  // pre-show — when the 2s timer fires, the popup anchors at the
+  // most-recent cursor position rather than wherever the mouse first
+  // entered the row. Once the popup is visible the position is pinned;
+  // moving the mouse around the row (or onto the popup) does NOT
+  // reposition the card.
+  const onRowMouseMove = React.useCallback((evt) => {
     cursorRef.current = { x: evt.clientX, y: evt.clientY };
   }, []);
 
-  const onMouseLeave = React.useCallback(() => {
-    hoverSeqRef.current += 1;
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
+  const onRowMouseLeave = React.useCallback(() => {
+    overRowRef.current = false;
+    if (showTimerRef.current) {
+      // Pre-show: just cancel; nothing to dismiss.
+      clearTimeout(showTimerRef.current);
+      showTimerRef.current = null;
+      seqRef.current += 1;
+      // Only clear the preview if there isn't one already shown — leaving
+      // mid-pre-show shouldn't kill an existing visible card.
+      if (!preview) return;
     }
-    setPreview(null);
+    if (preview) scheduleDismiss();
+  }, [preview]);
+
+  const onPreviewMouseEnter = React.useCallback(() => {
+    overPreviewRef.current = true;
+    cancelDismiss();
   }, []);
 
-  return { preview, onMouseEnter, onMouseMove, onMouseLeave };
+  const onPreviewMouseLeave = React.useCallback(() => {
+    overPreviewRef.current = false;
+    scheduleDismiss();
+  }, []);
+
+  return {
+    preview,
+    onRowMouseEnter,
+    onRowMouseMove,
+    onRowMouseLeave,
+    onPreviewMouseEnter,
+    onPreviewMouseLeave,
+  };
 }
 
 function SortableHeader({ k, sortKey, sortDir, onSort, style, children }) {
@@ -2086,9 +2173,9 @@ function RunsListPage({ manualTick, urlParams = {} }) {
                   <tr
                     key={r.id}
                     onClick={() => navTo('#/run/' + r.id)}
-                    onMouseEnter={(e) => hoverPreview.onMouseEnter(r, e)}
-                    onMouseMove={hoverPreview.onMouseMove}
-                    onMouseLeave={hoverPreview.onMouseLeave}
+                    onMouseEnter={(e) => hoverPreview.onRowMouseEnter(r, e)}
+                    onMouseMove={hoverPreview.onRowMouseMove}
+                    onMouseLeave={hoverPreview.onRowMouseLeave}
                   >
                     <td>
                       <div className="id-cell">
@@ -2133,6 +2220,8 @@ function RunsListPage({ manualTick, urlParams = {} }) {
           row={hoverPreview.preview.row}
           result={hoverPreview.preview.result}
           pos={hoverPreview.preview.pos}
+          onMouseEnter={hoverPreview.onPreviewMouseEnter}
+          onMouseLeave={hoverPreview.onPreviewMouseLeave}
         />
       )}
     </div>
