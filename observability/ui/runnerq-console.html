@@ -1682,8 +1682,15 @@ function useRowHoverPreview(delayMs = 2000) {
   const timerRef = React.useRef(null);
   const cursorRef = React.useRef({ x: 0, y: 0 });
   const cacheRef = React.useRef(new Map());
+  // Monotonic counter incremented on every enter and leave. Captures the
+  // hover "generation" the timer was scheduled in — when the async fetch
+  // resolves we check it still matches before calling setPreview, so a
+  // late /result response from row A can't open the preview for a row
+  // the user already left or moved away from.
+  const hoverSeqRef = React.useRef(0);
 
   React.useEffect(() => () => {
+    hoverSeqRef.current += 1;
     if (timerRef.current) clearTimeout(timerRef.current);
   }, []);
 
@@ -1691,8 +1698,12 @@ function useRowHoverPreview(delayMs = 2000) {
     // Default: down-right of cursor (standard tooltip convention). Flip
     // each axis when too close to the corresponding viewport edge so the
     // card stays fully on-screen regardless of mouse position.
+    //
+    // previewHeight uses the actual CSS cap (60vh) rather than a fixed
+    // constant — a hardcoded 380 was wrong on shorter viewports, where
+    // 60vh < 380 and the popup could still spill.
     const previewWidth = 460;
-    const previewHeight = 380;
+    const previewHeight = Math.floor(window.innerHeight * 0.6);
     const offset = 14;
     const margin = 8;
     let x = cursor.x + offset;
@@ -1709,7 +1720,9 @@ function useRowHoverPreview(delayMs = 2000) {
   const onMouseEnter = React.useCallback((row, evt) => {
     if (timerRef.current) clearTimeout(timerRef.current);
     cursorRef.current = { x: evt.clientX, y: evt.clientY };
+    const seq = ++hoverSeqRef.current;
     timerRef.current = setTimeout(async () => {
+      timerRef.current = null;
       let result = cacheRef.current.get(row.id);
       if (result === undefined) {
         try {
@@ -1719,6 +1732,10 @@ function useRowHoverPreview(delayMs = 2000) {
         }
         cacheRef.current.set(row.id, result);
       }
+      // Bail out if a newer hover/leave happened while we awaited the
+      // fetch — without this guard, a slow /result for row A could open
+      // its preview after the user already moved to row B.
+      if (seq !== hoverSeqRef.current) return;
       setPreview({ row, pos: computePos(cursorRef.current), result });
     }, delayMs);
   }, [delayMs]);
@@ -1732,6 +1749,7 @@ function useRowHoverPreview(delayMs = 2000) {
   }, []);
 
   const onMouseLeave = React.useCallback(() => {
+    hoverSeqRef.current += 1;
     if (timerRef.current) {
       clearTimeout(timerRef.current);
       timerRef.current = null;
