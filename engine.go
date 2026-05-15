@@ -461,9 +461,18 @@ func (e *WorkerEngine) runSuspendDispatcher(ctx context.Context, q activityQueue
 			defer e.activityWg.Done()
 			defer holder.release() // safety net — release() is idempotent
 
-			workerLabel := fmt.Sprintf("%s-%s", label, act.ID.String()[:8])
+			// MUST pass the same label that was sent to Dequeue above. The
+			// AckSuccess/AckFailure SQL guards on `current_worker_id = $2`,
+			// which was set to `label` at dequeue time. Using a per-activity
+			// label here (e.g. "<label>-<short-uuid>") would always fail
+			// the WHERE clause: handler completes, MarkCompleted returns
+			// "not in a claimable state", handleSuccess logs
+			// activity_lost_completion, the reaper requeues the row, and
+			// the activity re-runs forever. Activity identity for slog is
+			// already covered by the activity_id field on every log line
+			// processActivity emits.
 			ctxWithSlot := withSuspendSlot(ctx, holder)
-			e.processActivity(ctxWithSlot, act, workerLabel, 0)
+			e.processActivity(ctxWithSlot, act, label, 0)
 		}(act)
 	}
 	slog.Debug("Suspend dispatcher stopped", "label", label)
