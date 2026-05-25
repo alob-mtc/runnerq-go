@@ -540,7 +540,10 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
   letter-spacing: 0;
 }
 
-.gantt-card { margin-bottom: 14px; }
+.gantt-card {
+  margin-bottom: 14px;
+  overflow: hidden;
+}
 .gantt-controls { display: flex; align-items: center; gap: 6px; }
 .seg {
   display: inline-flex;
@@ -601,7 +604,12 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
 .gantt .row:hover .name { color: var(--fg-0); }
 .gantt .row .name .pip { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
 .gantt .row .name .depth-prefix { color: var(--fg-4); white-space: pre; }
-.gantt .row .track { position: relative; height: 100%; border-radius: 4px; }
+.gantt .row .track {
+  position: relative;
+  height: 100%;
+  border-radius: 4px;
+  overflow: hidden;
+}
 .gantt .row .duration {
   text-align: right;
   font-size: 11px;
@@ -2635,8 +2643,12 @@ function Gantt({ tree, startMs, totalMs, selectedAct, onSelect }) {
         {visible.map(a => {
           const aStart = new Date(a.started_at || a.created_at).getTime() - startMs;
           const aEnd = a.completed_at ? new Date(a.completed_at).getTime() - startMs : Math.max(aStart, Date.now() - startMs);
-          const left = (aStart / totalMs) * 100;
-          const width = Math.max(0.4, ((aEnd - aStart) / totalMs) * 100);
+          const rawLeft = (aStart / totalMs) * 100;
+          const rawRight = (aEnd / totalMs) * 100;
+          const leftBound = Math.max(0, Math.min(100, rawLeft));
+          const rightBound = Math.max(0, Math.min(100, rawRight));
+          const width = Math.min(100, Math.max(0.4, rightBound - leftBound));
+          const left = Math.min(leftBound, 100 - width);
           const sc = statusClass(a.status);
           const dur = activityDurationMs(a);
           const depthPrefix = '  '.repeat(Math.min(a.depth || 0, 6));
