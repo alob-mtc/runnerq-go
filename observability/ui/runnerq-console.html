@@ -318,6 +318,7 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
 .status-chip.failed .pip { background: var(--red); }
 .status-chip.deadletter .pip { background: var(--red); }
 .status-chip.retrying .pip { background: var(--amber); animation: pulse 1.4s ease-in-out infinite; }
+.status-chip.scheduled .pip { background: var(--purple); }
 .status-chip.pending .pip { background: var(--fg-3); }
 
 @keyframes pulse {
@@ -514,7 +515,12 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
   background: var(--red-soft);
   border-color: var(--red-line);
 }
-.io-pill.err pre.text { color: var(--red); }
+.io-pill.err pre.text {
+  color: var(--red);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 .io-pill.err .label {
   font-family: var(--font-sans);
   font-size: 10.5px;
@@ -1318,6 +1324,38 @@ function activityDurationMs(a) {
   return null;
 }
 
+function runWindowMs(tree) {
+  if (!tree || tree.length === 0) return null;
+  const starts = [];
+  const ends = [];
+  tree.forEach(a => {
+    const startIso = a.started_at || a.created_at;
+    const start = new Date(startIso).getTime();
+    if (!isNaN(start)) starts.push(start);
+
+    let end = null;
+    if (a.completed_at) {
+      end = new Date(a.completed_at).getTime();
+    } else if (a.status === 'Running' || a.status === 'Retrying') {
+      end = Date.now();
+    }
+    if (end != null && !isNaN(end)) ends.push(end);
+  });
+  if (starts.length === 0 || ends.length === 0) return null;
+  return Math.max(1, Math.max.apply(null, ends) - Math.min.apply(null, starts));
+}
+
+function resultPayload(result) {
+  if (result == null) return null;
+  if (typeof result === 'object' && !Array.isArray(result) && Object.prototype.hasOwnProperty.call(result, 'data')) {
+    const keys = Object.keys(result);
+    const looksWrapped = keys.length === 1 || (keys.length === 2 && keys.includes('state'));
+    if (!looksWrapped) return result;
+    return result.data;
+  }
+  return result;
+}
+
 function shortId(id) {
   if (!id) return '';
   return id.length > 8 ? id.slice(0, 8) : id;
@@ -1648,7 +1686,8 @@ function FilterBar({ q, setQ, status, setStatus, type, setType, types, totalLoad
 // the gap between them).
 function HoverPreview({ row, result, pos, onMouseEnter, onMouseLeave }) {
   const inputStr = formatJsonField(row.payload);
-  const resultStr = result && result.data != null ? formatJsonField(result.data) : null;
+  const resultData = resultPayload(result);
+  const resultStr = resultData != null ? formatJsonField(resultData) : null;
   const lastError = row.last_error || null;
   return (
     <div
@@ -2338,10 +2377,15 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
   const root = tree.find(a => !a.parent_activity_id) || activity;
 
   const startTimes = tree.map(a => new Date(a.started_at || a.created_at).getTime());
-  const endTimes = tree.map(a => a.completed_at ? new Date(a.completed_at).getTime() : Date.now());
+  const endTimes = tree.map(a => {
+    if (a.completed_at) return new Date(a.completed_at).getTime();
+    if (a.status === 'Running' || a.status === 'Retrying') return Date.now();
+    return new Date(a.started_at || a.created_at).getTime();
+  });
   const startMs = Math.min.apply(null, startTimes);
   const endMs = Math.max.apply(null, endTimes);
   const totalMs = Math.max(1, endMs - startMs);
+  const durationMs = activityDurationMs(root) ?? runWindowMs(tree);
 
   const eventCount = events ? events.length : 0;
   const workerSet = new Set();
@@ -2377,7 +2421,7 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
       </div>
 
       <RunHeader activity={root} onCopy={onCopy} />
-      <Details activity={root} stats={{ events: eventCount, workers: workerSet.size, pending: pending, treeSize: tree.length, durationMs: totalMs }} onCopy={onCopy} />
+      <Details activity={root} stats={{ events: eventCount, workers: workerSet.size, pending: pending, treeSize: tree.length, durationMs: durationMs }} onCopy={onCopy} />
       <Tabs items={tabs} active={activeTab} onChange={setActiveTab} />
 
       <div className="layout">
@@ -2486,7 +2530,8 @@ function Tabs({ items, active, onChange }) {
 
 function IORow({ activity, result, onCopy }) {
   const inputStr = formatJsonField(activity.payload);
-  const resultStr = result && result.data != null ? formatJsonField(result.data) : null;
+  const resultData = resultPayload(result);
+  const resultStr = resultData != null ? formatJsonField(resultData) : null;
   const lastError = activity.last_error || null;
   const lastErrorAt = activity.last_error_at || null;
 
