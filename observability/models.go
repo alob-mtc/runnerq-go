@@ -23,6 +23,7 @@ type ActivityStatus = string
 const (
 	StatusPending    ActivityStatus = "Pending"
 	StatusRunning    ActivityStatus = "Running"
+	StatusScheduled  ActivityStatus = "Scheduled"
 	StatusCompleted  ActivityStatus = "Completed"
 	StatusFailed     ActivityStatus = "Failed"
 	StatusRetrying   ActivityStatus = "Retrying"

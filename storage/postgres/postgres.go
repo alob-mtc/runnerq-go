@@ -1425,7 +1425,7 @@ func (r *activityRow) toSnapshot() storage.ActivitySnapshot {
 	case "completed":
 		status = "Completed"
 	case "scheduled":
-		status = "Pending"
+		status = "Scheduled"
 	case "retrying":
 		status = "Retrying"
 	case "failed":
