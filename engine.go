@@ -126,6 +126,18 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		}
 	}
 
+	// Retention config sanity: a negative TTL would silently behave like
+	// "keep forever" (the backend treats <= 0 as disabled), which is the
+	// opposite of what a misconfigured caller intended. Fail fast instead.
+	if r := e.config.Retention; r != nil {
+		if r.Completed < 0 || r.Failed < 0 || r.Interval < 0 || r.BatchSize < 0 {
+			return &WorkerError{
+				Kind:    ErrConfiguration,
+				Message: "Retention TTLs, Interval, and BatchSize must be >= 0 (zero = keep forever / use default)",
+			}
+		}
+	}
+
 	// SuspendOnAwait config sanity. Fail fast on the misconfigurations that
 	// would otherwise silently degrade capacity, waste reserved slots, or
 	// (worst case) cause this engine's leaf dispatcher to dequeue activities
@@ -227,6 +239,14 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	wg.Go(func() {
 		e.runReaperProcessor(intakeCtx)
 	})
+
+	// Retention sweeper (opt-in). Safe to run on every engine: the backend
+	// elects one sweeper per queue via an advisory lock.
+	if e.config.Retention != nil {
+		wg.Go(func() {
+			e.runRetentionProcessor(intakeCtx)
+		})
+	}
 
 	if e.config.SuspendOnAwait {
 		// Semaphore-based dispatcher model. A parent's slot is released
@@ -776,6 +796,53 @@ func (e *WorkerEngine) runReaperProcessor(ctx context.Context) {
 	slog.Debug("Reaper processor stopped")
 }
 
+// runRetentionProcessor periodically asks the backend to delete terminal
+// workflow trees older than the configured TTLs. Each tick drains: it keeps
+// sweeping until a batch comes back short, so a backlog accumulated while the
+// engine was down clears quickly instead of one batch per interval.
+func (e *WorkerEngine) runRetentionProcessor(ctx context.Context) {
+	cfg := e.config.Retention
+	interval := cfg.Interval
+	if interval <= 0 {
+		interval = 10 * time.Minute
+	}
+	batchSize := cfg.BatchSize
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	policy := storage.RetentionPolicy{Completed: cfg.Completed, Failed: cfg.Failed}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	slog.Debug("Starting retention sweeper", "completed_ttl", cfg.Completed, "failed_ttl", cfg.Failed, "interval", interval)
+	for e.running.Load() {
+		select {
+		case <-ctx.Done():
+			slog.Debug("Retention sweeper stopped")
+			return
+		case <-ticker.C:
+			for {
+				n, err := e.backend.CleanupExpired(ctx, policy, batchSize)
+				if err != nil {
+					if ctx.Err() == nil {
+						slog.Error("Retention sweep failed", "error", err)
+					}
+					break
+				}
+				if n > 0 {
+					e.metrics.IncCounter("activity_trees_swept", n)
+					slog.Debug("Retention sweep deleted workflow trees", "trees", n)
+				}
+				if int(n) < batchSize {
+					break
+				}
+			}
+		}
+	}
+	slog.Debug("Retention sweeper stopped")
+}
+
 // WorkerEngineBuilder provides fluent configuration for WorkerEngine.
 type WorkerEngineBuilder struct {
 	queueName        *string
@@ -788,6 +855,7 @@ type WorkerEngineBuilder struct {
 	suspendLeafTypes []string
 	suspendLeavesRes int
 	shutdownGrace    *time.Duration
+	retention        *RetentionConfig
 }
 
 // Builder creates a new WorkerEngineBuilder.
@@ -855,6 +923,14 @@ func (b *WorkerEngineBuilder) ReserveSlotsForLeaves(n int, leafTypes []string) *
 // deregistration all run in parallel under this single budget. When the
 // budget expires Start() returns even if some goroutines remain in flight.
 // Defaults to 30s when not set; clamped to >= 1s.
+// Retention opts the engine into deleting old terminal workflow trees —
+// see RetentionConfig. Safe to set on every engine in a cluster; the backend
+// elects one sweeper per queue.
+func (b *WorkerEngineBuilder) Retention(cfg RetentionConfig) *WorkerEngineBuilder {
+	b.retention = &cfg
+	return b
+}
+
 func (b *WorkerEngineBuilder) ShutdownGrace(d time.Duration) *WorkerEngineBuilder {
 	b.shutdownGrace = &d
 	return b
@@ -898,6 +974,7 @@ func (b *WorkerEngineBuilder) Build() (*WorkerEngine, error) {
 		SuspendOnAwait:              b.suspendOnAwait,
 		SuspendLeafActivityTypes:    b.suspendLeafTypes,
 		SuspendLeavesReserved:       b.suspendLeavesRes,
+		Retention:                   b.retention,
 	}
 	if b.shutdownGrace != nil {
 		secs := uint64((*b.shutdownGrace).Seconds())

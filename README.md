@@ -567,6 +567,29 @@ metrics.ObserveDuration("activity_execution", 5*time.Second)
 
 ## Advanced Features
 
+### Retention
+
+By default every activity, event, result, and idempotency key is kept forever. Opt into
+cleanup with `Retention`:
+
+```go
+engine, err := runnerq.Builder().
+	Backend(backend).
+	QueueName("my_app").
+	MaxWorkers(8).
+	Retention(runnerq.RetentionConfig{
+		Completed: 7 * 24 * time.Hour,  // completed workflows kept 7 days
+		Failed:    30 * 24 * time.Hour, // failed/dead-letter kept 30 days for inspection
+	}).
+	Build()
+```
+
+The deletion unit is a whole workflow tree: a root that has been terminal past its TTL and has
+no still-running descendants. The tree's activities, events, results (including `ctx.Run`/
+`ctx.Sleep` checkpoints), and idempotency keys are deleted together, so a retried handler can
+never find its checkpoints missing. Safe to enable on every engine in a cluster — the backend
+elects one sweeper per queue via an advisory lock. Zero TTL means "keep forever" for that class.
+
 ### Activity Scheduling
 
 RunnerQ supports scheduling activities for future execution:

@@ -122,7 +122,8 @@ CREATE INDEX IF NOT EXISTS idx_runnerq_events_activity
 CREATE INDEX IF NOT EXISTS idx_runnerq_events_queue_seq
     ON runnerq_events(queue_name, id);
 
--- Results table (permanent)
+-- Results table. Rows live until the retention sweeper deletes their
+-- workflow tree (or forever when retention is not configured).
 CREATE TABLE IF NOT EXISTS runnerq_results (
     activity_id UUID PRIMARY KEY,
     queue_name TEXT NOT NULL,
@@ -130,6 +131,23 @@ CREATE TABLE IF NOT EXISTS runnerq_results (
     data JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- owner_activity_id ties every result row to the activity whose lifetime
+-- governs it. For normal activity results it equals activity_id; for Run/
+-- Sleep checkpoints (whose activity_id is a synthetic UUIDv5 matching no
+-- activity row) it is the handler's activity — without it, checkpoint rows
+-- could never be garbage-collected. NULL on legacy rows (never swept).
+ALTER TABLE runnerq_results
+    ADD COLUMN IF NOT EXISTS owner_activity_id UUID;
+CREATE INDEX IF NOT EXISTS idx_runnerq_results_owner
+    ON runnerq_results(queue_name, owner_activity_id)
+    WHERE owner_activity_id IS NOT NULL;
+
+-- Retention sweep: find roots that have been terminal longer than the TTL.
+CREATE INDEX IF NOT EXISTS idx_runnerq_root_terminal_age
+    ON runnerq_activities(queue_name, status, completed_at)
+    WHERE parent_activity_id IS NULL
+      AND status IN ('completed', 'failed', 'dead_letter');
 
 -- Worker pools: one row per live engine instance. Heartbeats let us tell
 -- which pools are still alive for cluster-wide capacity reporting.
