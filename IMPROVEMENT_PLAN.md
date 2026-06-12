@@ -184,7 +184,10 @@ already exist (idempotency table, permanent results table, lineage columns):
    checkpoint rows via the new `owner_activity_id` column — + idempotency keys) in batched
    transactions, with per-queue advisory-lock leadership so only one engine sweeps. Tree-level
    deletion (terminal root, no non-terminal descendants) guarantees retries never find their
-   children's results missing. Still open: time-based partitioning for very high volumes, and
+   children's results missing. Caveat: result rows written before the owner column existed have
+   a NULL owner_activity_id and are never swept — pre-upgrade checkpoint rows must be cleaned
+   manually if reclaiming that space matters. Still open: time-based partitioning for very high
+   volumes, and
    fillfactor/autovacuum tuning for UPDATE-churn bloat (status flips across 5 partial indexes
    are never HOT).
 6. **Suspend-mode dispatcher is single-threaded** (engine.go:421-457): serial

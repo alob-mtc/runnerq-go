@@ -937,9 +937,15 @@ func (b *PostgresBackend) CleanupExpired(ctx context.Context, policy storage.Ret
 			FOR UPDATE SKIP LOCKED
 		),
 		tree AS (
+			-- Roots are included by their own id as well as by lineage:
+			-- legacy rows from before lineage columns existed can have a
+			-- NULL root_activity_id, and matching only on lineage would
+			-- count such a root as swept without deleting it — the sweeper
+			-- would then re-select it on every pass, forever.
 			SELECT a.id FROM runnerq_activities a
-			JOIN roots ON a.root_activity_id = roots.id
 			WHERE a.queue_name = $1
+			  AND (a.id IN (SELECT id FROM roots)
+				OR a.root_activity_id IN (SELECT id FROM roots))
 		),
 		del_results AS (
 			DELETE FROM runnerq_results

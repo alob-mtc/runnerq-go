@@ -199,6 +199,47 @@ func TestCleanupExpiredLeadership(t *testing.T) {
 	assertTreeGone(t, b, tree, "tree after release")
 }
 
+// Legacy roots from before lineage columns existed have a NULL
+// root_activity_id. They must be deleted by their own id — matching only on
+// lineage would count them as swept without removing them, and the sweeper
+// would re-select the same roots on every pass forever.
+func TestCleanupExpiredHandlesLegacyNullRootID(t *testing.T) {
+	b := testBackend(t)
+	ctx := context.Background()
+
+	legacyID := uuid.New()
+	completedAt := time.Now().UTC().Add(-2 * time.Hour)
+	if _, err := b.pool.Exec(ctx, `
+		INSERT INTO runnerq_activities (id, queue_name, activity_type, payload, priority, status,
+			created_at, completed_at, parent_activity_id, root_activity_id, depth)
+		VALUES ($1, $2, 'legacy', '{}'::jsonb, 2, 'completed', $3, $3, NULL, NULL, 0)`,
+		legacyID, b.queueName, completedAt); err != nil {
+		t.Fatalf("insert legacy root: %v", err)
+	}
+
+	n, err := b.CleanupExpired(ctx, storage.RetentionPolicy{Completed: time.Hour}, 100)
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("swept %d roots, want 1", n)
+	}
+	var remaining int
+	if err := b.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM runnerq_activities WHERE id = $1`, legacyID).Scan(&remaining); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatal("legacy NULL-root row was counted as swept but not deleted — the sweeper would loop on it forever")
+	}
+
+	// And the pass after it must find nothing — no perpetual re-selection.
+	n, err = b.CleanupExpired(ctx, storage.RetentionPolicy{Completed: time.Hour}, 100)
+	if err != nil || n != 0 {
+		t.Fatalf("second pass: n=%d err=%v, want 0", n, err)
+	}
+}
+
 // Batch size limits roots per call; repeated calls drain the backlog.
 func TestCleanupExpiredBatches(t *testing.T) {
 	b := testBackend(t)

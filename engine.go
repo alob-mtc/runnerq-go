@@ -126,6 +126,18 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		}
 	}
 
+	// Retention config sanity: a negative TTL would silently behave like
+	// "keep forever" (the backend treats <= 0 as disabled), which is the
+	// opposite of what a misconfigured caller intended. Fail fast instead.
+	if r := e.config.Retention; r != nil {
+		if r.Completed < 0 || r.Failed < 0 || r.Interval < 0 || r.BatchSize < 0 {
+			return &WorkerError{
+				Kind:    ErrConfiguration,
+				Message: "Retention TTLs, Interval, and BatchSize must be >= 0 (zero = keep forever / use default)",
+			}
+		}
+	}
+
 	// SuspendOnAwait config sanity. Fail fast on the misconfigurations that
 	// would otherwise silently degrade capacity, waste reserved slots, or
 	// (worst case) cause this engine's leaf dispatcher to dequeue activities
