@@ -16,7 +16,7 @@ type RetentionConfig struct {
 	// a separate clock so failures can be held longer for inspection.
 	// Zero keeps them forever.
 	Failed time.Duration `json:"failed,omitempty"`
-	// Interval is the sweep cadence. Defaults to 1 minute.
+	// Interval is the sweep cadence. Defaults to 10 minutes.
 	Interval time.Duration `json:"interval,omitempty"`
 	// BatchSize is the max root trees deleted per sweep transaction.
 	// Defaults to 100.

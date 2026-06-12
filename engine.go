@@ -804,7 +804,7 @@ func (e *WorkerEngine) runRetentionProcessor(ctx context.Context) {
 	cfg := e.config.Retention
 	interval := cfg.Interval
 	if interval <= 0 {
-		interval = time.Minute
+		interval = 10 * time.Minute
 	}
 	batchSize := cfg.BatchSize
 	if batchSize <= 0 {
