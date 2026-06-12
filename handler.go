@@ -3,6 +3,7 @@ package runnerq
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -47,12 +48,17 @@ type ActivityContext struct {
 	queue activityQueue
 }
 
-// checkpointID derives the stable identity of a named checkpoint of THIS
-// activity. UUIDv5 over (activity ID, kind:name) — the same activity row
-// retried on any worker derives the same ID, which is what lets a retry find
-// the previous attempt's stored value.
+// deriveCheckpointID derives the stable identity of a named checkpoint of an
+// activity. UUIDv5 over (activity ID, kind:name) — any process deriving the
+// same (activity, kind, name) gets the same ID, which is what lets a retried
+// handler find a previous attempt's stored value, and an external process
+// address a signal at a waiting activity.
+func deriveCheckpointID(activityID uuid.UUID, kind, name string) uuid.UUID {
+	return uuid.NewSHA1(activityID, []byte(kind+":"+name))
+}
+
 func (c ActivityContext) checkpointID(kind, name string) uuid.UUID {
-	return uuid.NewSHA1(c.ActivityID, []byte(kind+":"+name))
+	return deriveCheckpointID(c.ActivityID, kind, name)
 }
 
 // Run executes fn as a named, checkpointed step: its successful result (or
@@ -125,16 +131,18 @@ func (c ActivityContext) Run(name string, fn func() (json.RawMessage, error)) (j
 // spurious timeout-retry.
 const yieldMargin = 2 * time.Second
 
-// yieldSleep is the sentinel error a yielding Sleep returns. The engine
-// intercepts it and reschedules the activity row to wake at wakeAt — without
-// counting a retry — instead of treating it as a failure.
-type yieldSleep struct {
+// yieldPark is the sentinel error a yielding durable wait (Sleep or
+// WaitForSignal) returns. The engine intercepts it and reschedules the
+// activity row to wake at wakeAt — without counting a retry — instead of
+// treating it as a failure. A parked signal wait is additionally woken early
+// by signal delivery.
+type yieldPark struct {
 	wakeAt time.Time
 	step   string
 }
 
-func (y *yieldSleep) Error() string {
-	return fmt.Sprintf("durable sleep %q yields until %s", y.step, y.wakeAt.Format(time.RFC3339))
+func (y *yieldPark) Error() string {
+	return fmt.Sprintf("durable wait %q yields until %s", y.step, y.wakeAt.Format(time.RFC3339))
 }
 
 // Sleep is a durable timer: the wake deadline is persisted under the step
@@ -208,7 +216,7 @@ func (c ActivityContext) Sleep(name string, d time.Duration) error {
 			margin = 0
 		}
 		if wakeAt.After(deadline.Add(-margin)) {
-			return &yieldSleep{wakeAt: wakeAt, step: name}
+			return &yieldPark{wakeAt: wakeAt, step: name}
 		}
 	}
 
@@ -222,6 +230,139 @@ func (c ActivityContext) Sleep(name string, d time.Duration) error {
 	case <-c.Ctx.Done():
 		return c.Ctx.Err()
 	}
+}
+
+// signalParkHorizon is the park deadline for WaitForSignal calls with no
+// timeout — effectively "until signalled". The parked row's scheduled_at is
+// never reached; delivery flips it to pending early.
+const signalParkHorizon = 100 * 365 * 24 * time.Hour
+
+// WaitForSignal blocks until an external signal named name is delivered to
+// THIS activity (via WorkerEngine.Signal or runnerq.SignalActivity from any
+// process sharing the database) and returns its payload. timeout bounds the
+// wait, measured from the FIRST attempt that reached this call — replays
+// share the persisted deadline, they don't restart it; 0 means wait forever.
+// On timeout it returns a non-retryable error (check with IsSignalTimeout).
+//
+// Signals are buffered: one delivered before the handler reaches this call —
+// or before the activity even started — is returned immediately, including on
+// replay. Repeated signals with the same name overwrite the payload
+// (last write wins).
+//
+// Like Sleep, a wait that doesn't fit the handler's timeout budget YIELDS:
+// the sentinel error MUST be propagated unchanged; the engine parks the
+// activity (no retry consumed, no worker held) until delivery wakes it or the
+// wait deadline passes. Signal names must be stable across retries and
+// unique within the handler.
+func (c ActivityContext) WaitForSignal(name string, timeout time.Duration) (json.RawMessage, error) {
+	if name == "" {
+		// An empty name would alias every unnamed wait onto one checkpoint
+		// key, delivering the wrong signal on retry.
+		return nil, NewNonRetryError("WaitForSignal requires a non-empty signal name")
+	}
+	if timeout < 0 {
+		// A computed negative duration silently becoming "wait forever"
+		// would be a surprising and hard-to-debug outcome — fail fast
+		// before the wait checkpoint is written.
+		return nil, NewNonRetryError("WaitForSignal timeout must be >= 0 (0 = wait forever)")
+	}
+	if c.queue == nil {
+		return nil, NewNonRetryError("WaitForSignal requires engine checkpoint storage; it cannot run on a hand-constructed ActivityContext")
+	}
+	sigID := c.checkpointID("signal", name)
+
+	// Persist the wait deadline on first arrival so timeout is measured from
+	// the first wait, not restarted by every replay. nil deadline = forever.
+	var deadline *time.Time
+	waitID := c.checkpointID("signalwait", name)
+	if stored, err := c.queue.GetResult(c.Ctx, waitID); err != nil {
+		return nil, err
+	} else if stored != nil {
+		var cp struct {
+			Deadline *time.Time `json:"deadline"`
+		}
+		if err := json.Unmarshal(stored.Data, &cp); err != nil {
+			return nil, NewNonRetryError(fmt.Sprintf("corrupt signal-wait checkpoint %q: %v", name, err))
+		}
+		deadline = cp.Deadline
+	} else {
+		if timeout > 0 {
+			d := time.Now().UTC().Add(timeout)
+			deadline = &d
+		}
+		cpJSON, _ := json.Marshal(map[string]*time.Time{"deadline": deadline})
+		if err := c.queue.StoreResult(c.Ctx, waitID, c.ActivityID, activityResult{Data: cpJSON, State: ResultOk}); err != nil {
+			return nil, err
+		}
+	}
+
+	for {
+		stored, err := c.queue.GetResult(c.Ctx, sigID)
+		if err != nil {
+			return nil, err
+		}
+		if stored != nil {
+			return stored.Data, nil
+		}
+
+		if deadline != nil && !time.Now().Before(*deadline) {
+			// One final check before declaring a timeout: a signal that
+			// committed between the lookup above and this deadline check
+			// would otherwise be misreported as missing. Ties go to the
+			// signal.
+			if stored, err := c.queue.GetResult(c.Ctx, sigID); err != nil {
+				return nil, err
+			} else if stored != nil {
+				return stored.Data, nil
+			}
+			return nil, &WorkerError{
+				Kind:    ErrSignalTimeoutW,
+				Message: fmt.Sprintf("signal %q was not delivered within the wait deadline", name),
+			}
+		}
+
+		wake := time.Now().UTC().Add(signalParkHorizon)
+		if deadline != nil {
+			wake = *deadline
+		}
+
+		// Same yield policy as Sleep: don't burn this attempt on a wait that
+		// would end in a timeout-retry. Parked waits are woken early by
+		// delivery (SignalActivity flips the scheduled row to pending).
+		if ctxDeadline, ok := c.Ctx.Deadline(); ok {
+			margin := min(yieldMargin, time.Until(ctxDeadline)/2)
+			if margin < 0 {
+				margin = 0
+			}
+			if wake.After(ctxDeadline.Add(-margin)) {
+				return nil, &yieldPark{wakeAt: wake, step: name}
+			}
+		}
+
+		// In-process wait on the signal's result row — notification-driven
+		// across processes, with the backend's fallback re-checks — bounded
+		// by the wait deadline so the timeout error above can fire.
+		stored, err = c.waitForCheckpoint(sigID, wake)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) && c.Ctx.Err() == nil {
+				continue // wait deadline reached → loop re-checks and times out
+			}
+			return nil, err
+		}
+		return stored.Data, nil
+	}
+}
+
+// waitForCheckpoint blocks on a checkpoint row until it exists or wake
+// passes, releasing the suspend slot (if any) for the duration.
+func (c ActivityContext) waitForCheckpoint(id uuid.UUID, wake time.Time) (*activityResult, error) {
+	waitCtx, cancel := context.WithDeadline(c.Ctx, wake)
+	defer cancel()
+	if h := suspendFromContext(c.Ctx); h != nil {
+		h.release()
+		defer func() { _ = h.reacquire(c.Ctx) }()
+	}
+	return c.queue.WaitForResult(waitCtx, id)
 }
 
 // ActivityHandler is the interface that all activity handlers must implement.

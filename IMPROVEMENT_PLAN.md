@@ -123,8 +123,15 @@ already exist (idempotency table, permanent results table, lineage columns):
    timeout budget wait in-process (releasing the suspend slot); longer sleeps YIELD — a new
    fenced `Yield` storage op parks the row as scheduled until the wake time WITHOUT consuming
    retry_count, and the handler resumes after the wake (records an `EventYielded`).
-4. **Signals** — awaitable external-event rows; no API exists today to deliver data into a running
-   workflow.
+4. ✅ **DONE — signals.** `ctx.WaitForSignal(name, timeout)` blocks (in-process when it fits the
+   handler budget, otherwise yield-parked — no worker held, no retry consumed) until
+   `WorkerEngine.Signal` / `runnerq.SignalActivity` delivers a payload from any process sharing
+   the database. Signals are buffered (delivery before the wait — or before the activity runs —
+   resolves instantly, including on replay), wait deadlines persist across parks, timeouts
+   surface as a typed non-retryable error (`IsSignalTimeout`), and signal rows are
+   retention-collected with their tree. Caveat (documented): delivery wakes ANY scheduled row
+   early, including Delay-scheduled ones. Per-name semantics are last-write-wins (DBOS
+   setEvent-style), not a message queue.
 5. **Decouple parent lifetime from a single lease (the largest piece).** Park the parent as a
    `waiting` status row when all awaited children are pending; re-dispatch it on child completion
    instead of holding a goroutine + lease for the whole await. This replaces the suspend.go

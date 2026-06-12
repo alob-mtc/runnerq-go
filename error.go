@@ -70,6 +70,11 @@ const (
 	ErrIdempotencyConflictW
 	ErrDepthExceeded
 	ErrUnknown
+	// ErrSignalTimeoutW means WaitForSignal's timeout elapsed before the
+	// signal was delivered. Not retryable: retrying replays the persisted
+	// wait deadline and times out again immediately — the handler must
+	// decide what a missing signal means.
+	ErrSignalTimeoutW
 )
 
 // WorkerError represents an error from the worker engine.
@@ -114,6 +119,8 @@ func (e *WorkerError) Error() string {
 		prefix = "Activity depth limit exceeded"
 	case ErrUnknown:
 		prefix = "Unknown error"
+	case ErrSignalTimeoutW:
+		prefix = "Signal wait timed out"
 	}
 	return fmt.Sprintf("%s: %s", prefix, e.Message)
 }
@@ -160,6 +167,12 @@ func WorkerErrorFromStorage(err error) *WorkerError {
 	default:
 		return &WorkerError{Kind: ErrUnknown, Message: se.Message, Cause: err}
 	}
+}
+
+// IsSignalTimeout reports whether err is a WaitForSignal timeout.
+func IsSignalTimeout(err error) bool {
+	we, ok := IsWorkerError(err)
+	return ok && we.Kind == ErrSignalTimeoutW
 }
 
 // IsWorkerError extracts a *WorkerError from err (if any).

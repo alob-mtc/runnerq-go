@@ -202,9 +202,11 @@ const (
 	// EventRequeued records the reaper returning an expired-lease activity to
 	// the pending state for another attempt.
 	EventRequeued ActivityEventType = "Requeued"
-	// EventYielded records a durable Sleep parking the activity until its
-	// wake time without consuming a retry.
-	EventYielded       ActivityEventType = "Yielded"
+	// EventYielded records a durable Sleep or signal wait parking the
+	// activity until its wake time without consuming a retry.
+	EventYielded ActivityEventType = "Yielded"
+	// EventSignaled records an external signal delivered to an activity.
+	EventSignaled      ActivityEventType = "Signaled"
 	EventLeaseExtended ActivityEventType = "LeaseExtended"
 	EventResultStored  ActivityEventType = "ResultStored"
 	// EventSpawnLinked records a secondary parent's link to an existing activity
@@ -276,6 +278,16 @@ type QueueStorage interface {
 	// activityID is synthetic. The retention sweeper deletes result rows
 	// together with their owner's workflow tree.
 	StoreResult(ctx context.Context, activityID uuid.UUID, ownerActivityID uuid.UUID, result ActivityResult) error
+	// SignalActivity delivers an external signal to an activity: it stores
+	// payload as a result row under signalID (owned by activityID, so the
+	// retention sweeper collects it with the tree) and, if the target is
+	// parked as scheduled (yielded waiting for the signal), makes it
+	// immediately runnable. Must return a not-found error when no activity
+	// row matches activityID — silently storing signals for nonexistent
+	// activities would leak uncollectable rows. Atomic: store + wake commit
+	// together. Repeated signals with the same signalID overwrite the
+	// payload (last write wins).
+	SignalActivity(ctx context.Context, activityID uuid.UUID, signalID uuid.UUID, payload json.RawMessage) error
 	// CleanupExpired deletes terminal workflow trees older than the policy's
 	// TTLs, up to batchSize roots per call, and returns the number of root
 	// trees deleted. Implementations must (a) only delete trees whose root is

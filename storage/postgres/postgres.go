@@ -872,6 +872,71 @@ func (b *PostgresBackend) Yield(ctx context.Context, activityID uuid.UUID, wakeA
 	return nil
 }
 
+// SignalActivity delivers an external signal: stores the payload under
+// signalID (owned by the target activity for retention) and wakes the target
+// if it is parked as scheduled — a yielded WaitForSignal resumes immediately
+// instead of waiting out its park deadline. Store + wake commit atomically.
+func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UUID, signalID uuid.UUID, payload json.RawMessage) error {
+	now := time.Now().UTC()
+
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+	}
+	defer tx.Rollback(ctx)
+
+	// Reject signals for activities that don't exist: their result rows
+	// could never be retention-collected (no tree to die with), so a typo'd
+	// ID would leak rows forever.
+	var exists bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM runnerq_activities WHERE id = $1 AND queue_name = $2)`,
+		activityID, b.queueName).Scan(&exists); err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to look up signal target: %v", err))
+	}
+	if !exists {
+		return storage.NewNotFoundError(fmt.Sprintf("Activity %s not found for signal delivery", activityID))
+	}
+
+	res := &storage.ActivityResult{Data: payload, State: storage.ResultOk}
+	if err := b.storeResultTx(ctx, tx, signalID, activityID, res, now); err != nil {
+		return err
+	}
+
+	// Wake a parked (yielded) waiter. Rows in other states are untouched:
+	// pending/processing activities will see the stored signal when their
+	// handler reaches (or replays past) WaitForSignal; retrying rows keep
+	// their backoff.
+	tag, err := tx.Exec(ctx, `
+		UPDATE runnerq_activities
+		SET status = 'pending', scheduled_at = NULL
+		WHERE id = $1 AND queue_name = $2 AND status = 'scheduled'`,
+		activityID, b.queueName)
+	if err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to wake signaled activity: %v", err))
+	}
+	woke := tag.RowsAffected() > 0
+
+	if err := b.recordEvent(ctx, tx, activityID, storage.EventSignaled, nil,
+		toDetail(map[string]any{"signal_id": signalID, "woke": woke})); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to commit signal: %v", err))
+	}
+
+	b.signalEvent()
+	// Wake in-process waiters (WaitForResult on the signal's checkpoint ID —
+	// possibly in a different process) and, if we flipped a parked row to
+	// pending, blocked dequeuers.
+	b.signalResult(signalID)
+	if woke {
+		b.signalWork()
+	}
+	return nil
+}
+
 // cleanupLockClass namespaces the per-queue advisory lock that elects a
 // single retention sweeper across all processes. Arbitrary but stable.
 const cleanupLockClass = int32(1381913428) // "RQCT"
