@@ -62,7 +62,7 @@ type IdempotencyKeyConfig struct {
 	Behavior IdempotencyBehavior
 }
 
-// IdempotencyResult is returned by CheckIdempotency when an existing activity
+// IdempotencyResult is returned by EnqueueIdempotent when an existing activity
 // already owns the idempotency key. ExistingParentID is the parent recorded on
 // that activity (may be nil for legacy or root activities).
 type IdempotencyResult struct {
@@ -178,13 +178,16 @@ type ActivitySnapshot struct {
 type ActivityEventType = string
 
 const (
-	EventEnqueued      ActivityEventType = "Enqueued"
-	EventScheduled     ActivityEventType = "Scheduled"
-	EventDequeued      ActivityEventType = "Dequeued"
-	EventCompleted     ActivityEventType = "Completed"
-	EventFailed        ActivityEventType = "Failed"
-	EventRetrying      ActivityEventType = "Retrying"
-	EventDeadLetter    ActivityEventType = "DeadLetter"
+	EventEnqueued   ActivityEventType = "Enqueued"
+	EventScheduled  ActivityEventType = "Scheduled"
+	EventDequeued   ActivityEventType = "Dequeued"
+	EventCompleted  ActivityEventType = "Completed"
+	EventFailed     ActivityEventType = "Failed"
+	EventRetrying   ActivityEventType = "Retrying"
+	EventDeadLetter ActivityEventType = "DeadLetter"
+	// EventRequeued records the reaper returning an expired-lease activity to
+	// the pending state for another attempt.
+	EventRequeued      ActivityEventType = "Requeued"
 	EventLeaseExtended ActivityEventType = "LeaseExtended"
 	EventResultStored  ActivityEventType = "ResultStored"
 	// EventSpawnLinked records a secondary parent's link to an existing activity
@@ -219,6 +222,10 @@ type QueueStorage interface {
 
 	Enqueue(ctx context.Context, activity QueuedActivity) error
 	Dequeue(ctx context.Context, workerID string, timeout time.Duration, activityTypes []string) (*QueuedActivity, error)
+	// AckSuccess marks an activity as completed and persists its result.
+	// Implementations MUST store the result atomically with the status change
+	// and MUST write a result record even when result is nil, so callers
+	// awaiting the result can always resolve once the activity completes.
 	AckSuccess(ctx context.Context, activityID uuid.UUID, result json.RawMessage, workerID string) error
 	// AckFailure marks an activity as failed. Returns true if moved to dead letter queue.
 	AckFailure(ctx context.Context, activityID uuid.UUID, failure FailureKind, workerID string) (bool, error)
@@ -226,11 +233,18 @@ type QueueStorage interface {
 	RequeueExpired(ctx context.Context, batchSize int) (uint64, error)
 	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
 	StoreResult(ctx context.Context, activityID uuid.UUID, result ActivityResult) error
-	// CheckIdempotency claims the activity's idempotency key, or — if a row
-	// already owns the key — returns a result describing the existing
-	// activity (its id and the parent_activity_id recorded on it). A nil
-	// result with a nil error means the caller's new activity has the claim.
-	CheckIdempotency(ctx context.Context, activity *QueuedActivity) (*IdempotencyResult, error)
+	// EnqueueIdempotent claims the activity's idempotency key AND enqueues the
+	// activity in a single atomic operation. A nil result with a nil error
+	// means the activity was enqueued (the caller MUST NOT call Enqueue
+	// separately — doing so would double-enqueue). If a row already owns the
+	// key and the configured behavior keeps it, the result describes the
+	// existing activity (its id and the parent_activity_id recorded on it)
+	// and nothing was enqueued.
+	//
+	// The claim and the enqueue MUST be atomic: a crash can never leave a
+	// claimed key pointing at an activity that was never enqueued, which
+	// would permanently brick the key.
+	EnqueueIdempotent(ctx context.Context, activity *QueuedActivity) (*IdempotencyResult, error)
 	// RecordSpawnLinked records that parentID logically spawned childID, even
 	// though no new activity row was created (idempotency reuse). Best-effort:
 	// callers should log but not fail on errors.

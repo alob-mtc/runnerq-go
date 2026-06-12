@@ -1,0 +1,234 @@
+# RunnerQ Improvement Plan
+
+Audit date: 2026-06-12. Full-codebase review (~5,100 lines core + storage + console) against the goal:
+**production-grade durable execution engine at massive scale.**
+
+## Verdict
+
+RunnerQ today is a well-built Postgres task queue with parent/child futures — not yet a durable
+execution engine. Solid foundations: correct `FOR UPDATE SKIP LOCKED` claims, fenced acks, SSE
+console, good release hygiene. But the category-defining guarantee — a workflow survives process
+death without redoing completed work — is absent, several correctness bugs can permanently wedge
+workflows, throughput is capped well below "massive scale" by per-transition NOTIFY serialization
+and polling loops, and the repo has effectively no tests (one 30-line unit test).
+
+Reference comparison: Temporal, Inngest, Restate, DBOS, Azure Durable Functions.
+
+---
+
+## Tier 0 — Correctness bugs that wedge workflows (fix first; days)
+
+### 0.1 Result storage is non-atomic with completion (critical)
+- `MarkCompleted` calls `AckSuccess(ctx, id, nil, …)` with a **nil** result (queue.go:179); the
+  real result is stored later by a separate async goroutine in a second transaction
+  (engine.go:576-583).
+- Crash or `StoreResult` failure between the two: activity is `completed` forever, result row never
+  exists, parent's `GetResult` polls until its own timeout → parent retried → re-spawns subtree.
+  This is a direct input to the DLQ death spiral documented in PERF_FIX_PLAN.md.
+- The backend already supports atomic result-with-ack (postgres.go:400-405) — the engine just
+  doesn't use it. Fix: pass the result through `AckSuccess`; delete the async success-path
+  `StoreResult`. Also remove the double-store on the non-retryable failure path (in-tx at
+  postgres.go:471-474 and again async at engine.go:620-632).
+
+### 0.2 Worker identity is not unique — stale acks land (critical)
+- Acks fence on `current_worker_id = $2` (postgres.go:388-390, 441) but IDs are `"worker-%d"`
+  (engine.go:365) and the constants `"dispatcher"` / `"dispatcher-leaf"` (engine.go:232, 243) —
+  identical across every engine process and attempt.
+- Sequence: engine A claims as "dispatcher" → lease expires → reaper requeues → engine B claims,
+  also as "dispatcher" → A's slow handler finishes → A's `AckSuccess` matches B's claim and marks
+  it completed while B is still running.
+- Fix: make worker IDs unique per process (pool UUID exists at engine.go:189, unused for claims) —
+  ideally a per-attempt fencing token returned by `Dequeue`.
+
+### 0.3 Idempotency claim and enqueue are non-atomic (critical)
+- `EvaluateIdempotencyRule` claims the key in one autocommit op (executor.go:286;
+  postgres.go:755-759), then `Enqueue` runs in its own transaction (executor.go:312).
+- Crash between them permanently bricks the key: `ReturnExisting` forever returns a future for an
+  activity that doesn't exist (LEFT JOIN status NULL, postgres.go:773-778, unchecked at
+  postgres.go:799-801); `AllowReuseOnFailure` errors forever (postgres.go:814-837).
+- Related race: `BehaviorAllowReuse` does an unguarded read-then-write update
+  (postgres.go:803-812).
+- Fix: claim + enqueue in one transaction, or detect/repair orphaned keys in
+  `resolveIdempotencyBehavior`.
+
+### 0.4 Reaper never increments retry_count — poison pills loop forever (high)
+- `RequeueExpired` flips expired rows straight back to `pending` (postgres.go:598-611): no
+  `retry_count` bump, no `max_retries` check, no event recorded.
+- An activity whose handler crashes the process (OOM, segfault) is re-claimed and re-crashes
+  workers forever, never reaches the DLQ, and is invisible in the console timeline.
+- Fix: increment `retry_count` on requeue, route to dead-letter when exhausted, record a
+  `Requeued` event.
+
+### 0.5 Leases use application clocks (high)
+- Lease deadline = caller's `time.Now()` (postgres.go:289-290, 313); reaper compares against its
+  own `time.Now()` (postgres.go:590, 609); `scheduled_at <= $6` likewise (postgres.go:319).
+- One fast-clocked node in a cluster prematurely reclaims every other node's leases → systematic
+  double execution. Fix: compute deadlines and comparisons server-side with the Postgres clock.
+
+### 0.6 Graceful shutdown can't complete in-flight work; Start/Stop races (high/medium)
+- `stop()` cancels `engineCtx` immediately (engine.go:269-270, 353-355); in-flight handlers that
+  finish during the drain ack with a cancelled context → `activity_lost_completion` → guaranteed
+  rerun (engine.go:562-570). The drain (engine.go:286-338) waits for goroutines whose acks are
+  already doomed.
+- Fix: two-phase shutdown — stop dequeueing, let in-flight handlers finish and ack on a live
+  context, then cancel.
+- Also: `cancelFunc`/`shutdownCh` written in `Start` (engine.go:183-184) and read/closed in
+  `stop()` (engine.go:353-360) with no synchronization; the `select`/`default`/`close` idiom can
+  double-close → panic on concurrent `Stop()`.
+
+### Other Tier-0-adjacent correctness issues
+- Engines without an `ActivityTypes` filter mark unregistered types failed **non-retryably**
+  (`handler_not_found`, engine.go:489-493) — destroying work a sibling engine could process.
+- Handler success exactly at the deadline is discarded and retried (engine.go:517-523); timeout is
+  only checked after the handler returns, so a ctx-ignoring handler blocks a slot forever.
+- `canRetry` off-by-one: `(retry_count+1) < max_retries` (postgres.go:487-509) — `MaxRetries=3`
+  yields only 2 retries.
+- `RegisterActivity` after `Start` races the unsynchronized handlers map (engine.go:108-110).
+- Library installs process-wide SIGINT/SIGTERM handlers inside `Start` (engine.go:257-258).
+
+---
+
+## Tier 1 — Earn the "durable execution" label (headline feature; weeks)
+
+### Current reality
+- No event-sourced history, no replay, no checkpointing. A handler is one function invocation per
+  attempt (engine.go:481-540); `runnerq_events` is observability-only.
+- Parent crash/timeout → lease expires → reaper requeues → handler **restarts from line 1**,
+  minting fresh child UUIDs (activity.go:159-161) → **already-completed children re-execute as
+  duplicates** unless the user hand-rolled idempotency keys (no example does this correctly;
+  examples/basic/main.go:128 uses `uuid.New()` as the key, defeating dedup entirely).
+- `SuspendOnAwait` persists **nothing** — it only releases the in-process semaphore slot
+  (suspend.go:32-68). A "workflow" cannot outlive one process's single handler invocation bounded
+  by `timeout_seconds`. The defining durable-execution capability (months-long workflows surviving
+  deploys) is absent. PERF_FIX_PLAN.md Tier 5 acknowledges this as unbuilt.
+
+### Recommended direction: Inngest/DBOS-style step memoization
+Not Temporal-style full event-sourced replay — that replaces the current core (a rewrite, months+).
+Step memoization delivers ~90% of user-visible durability semantics on top of building blocks that
+already exist (idempotency table, permanent results table, lineage columns):
+
+1. **Auto-key every child spawn** as `(root_activity_id, parent_activity_id, step_seq_or_name)`
+   with `ReturnExisting` behavior. On parent retry the handler re-runs, re-issues identical
+   spawns, each dedupes against the existing child, and `GetResult` returns the memoized result
+   instantly — the parent fast-forwards through completed steps. Determinism requirement becomes
+   the mild Inngest-style one (same step names/order across retries), not full replay determinism.
+2. **`ctx.Run(name, fn)`** — checkpoint arbitrary local side effects into the results table the
+   same way (covers non-activity work between spawns).
+3. **`ctx.Sleep(d)`** — durable timer as a memoized scheduled child. Today the only timer is
+   spawn-time `Delay` (executor.go:120-123).
+4. **Signals** — awaitable external-event rows; no API exists today to deliver data into a running
+   workflow.
+5. **Decouple parent lifetime from a single lease (the largest piece).** Park the parent as a
+   `waiting` status row when all awaited children are pending; re-dispatch it on child completion
+   instead of holding a goroutine + lease for the whole await. This replaces the suspend.go
+   slot-juggling machinery and simultaneously fixes the unbounded-goroutine growth and waker/
+   dispatcher slot races (suspend.go:55-68 vs engine.go:424).
+
+### Also required for the category
+- **Cancellation API** — none exists at any layer (storage, inspector, engine). Add cancel with
+  best-effort propagation to descendants via `root_activity_id`.
+- **`ctx.Heartbeat()`** — `ExtendLease` is fully plumbed (queue.go:218-220, postgres.go:618-651)
+  but never called and not exposed to handlers; long activities are silently reaped and
+  double-executed. Add a worker/fencing guard to its WHERE clause when exposing it.
+- **Engine-native cron/schedules** — the console Schedules tab only lists rows the user tagged
+  `metadata.source='cron'` (postgres.go:1255-1274); nothing in core creates them.
+- **Future rehydration** — `ActivityFuture` fields are package-private (executor.go:21-24); a
+  future cannot be reconstructed after restart. Add a public get-result-by-ID API and a `WaitAll`.
+- **Workflow versioning** story once memoization lands (step-name compatibility across deploys).
+
+---
+
+## Tier 2 — Scale ceilings (blocks 10k/sec regardless of Tier 1)
+
+1. **`pg_notify` + event INSERT inside every lifecycle transaction** (postgres.go:141-167, called
+   from enqueue/dequeue/ack/result). Postgres serializes NOTIFY-ing commits on a global queue
+   lock — a hard cluster-wide commit-rate cap, paid even with zero listeners. Make event recording
+   and NOTIFY optional/batched/async-outbox; gate NOTIFY on listener presence.
+2. **Dequeue ORDER BY cannot use the index.** Index keyed
+   `(queue_name, activity_type, priority DESC, …)` (schema.go:31-39) but the query orders by
+   `priority DESC, retry_count DESC, COALESCE(...)` without pinning `activity_type`
+   (postgres.go:314-327) → top-1 sort over the entire eligible backlog per claim, per worker.
+   The `($7::text[] IS NULL OR …)` OR-pattern further degrades plans. Reorder the index to match
+   the ORDER BY; split the nil-filter and typed-filter queries.
+3. **Polling everywhere despite NOTIFY already firing on every transition.**
+   - Workers: 100ms→5s backoff (engine.go:366, 390-398); `Dequeue`'s timeout param is ignored
+     (postgres.go:288) — no blocking dequeue; up to 5s pickup latency.
+   - Futures: fixed 100ms SELECT loop per waiter (executor.go:46-66); in suspend mode waiter count
+     is unbounded — 10k suspended parents = 100k queries/sec (the "poll storm" the project's own
+     stress example works around, examples/perf/suspend_stress/main.go:17-25).
+   - Fix: LISTEN/NOTIFY-driven wakeups for both paths, with polling as fallback.
+4. **No batching.** Enqueue is one transaction per child (postgres.go:218-286 — a fanout-100
+   handler does 100 sequential round-trips); dequeue claims one row per round-trip → O(workers²)
+   skip-locked scanning; no batch ack. ~20 statements / 4 transactions per successful activity
+   today. Add batch claim, batch enqueue, batch ack.
+5. **Unbounded table growth.** `runnerq_activities`, `runnerq_events`, `runnerq_results`,
+   `runnerq_idempotency` are all "permanent — no TTL" (schema.go:4, 81-88, 90-91, 104-105) with no
+   archival/cleanup anywhere. ~1B event rows/day at 10k/sec. Need a retention/archival job and
+   time- or status-based partitioning. UPDATE churn on indexed columns (status flips across 5
+   partial indexes, lease_deadline_ms) means no HOT updates → bloat; tune fillfactor/autovacuum.
+6. **Suspend-mode dispatcher is single-threaded** (engine.go:421-457): serial
+   acquire→dequeue→spawn caps the engine at roughly 200-500 dispatches/sec regardless of
+   `MaxConcurrentActivities`.
+7. **Every engine runs its own reaper** every 5s against the same rows (engine.go:703-729) — no
+   leader election; duplicated cluster work.
+8. **Connection pool sizing is uncoordinated.** Default 25 conns/process (postgres.go:46-52),
+   never validated against worker count or suspend-mode poll load; the PERF_FIX_PLAN "too many
+   clients" failure is structural. Each SSE consumer also pins a pool connection for its lifetime
+   (postgres.go:1297-1312). Validate pool vs workers at Build; document PgBouncer.
+
+---
+
+## Tier 3 — Production operability
+
+### Metrics (high)
+- Total emitted surface today: **5 counters** (engine.go:569-636); `ObserveDuration` is declared
+  (metrics.go:9) and never called anywhere; no labels; no shipped sink (no Prometheus/OTel dep).
+- Add: handler duration, queue-wait latency, dequeue/enqueue latency + counters, in-flight and
+  suspended-waiter gauges, backlog/DLQ depth, reaper requeue count, dead-letter counter, pool
+  saturation — all labeled by activity type. Ship a Prometheus implementation.
+
+### Console security (high)
+- Console + API are completely unauthenticated (routes.go:19-52) and the SSE stream sets
+  `Access-Control-Allow-Origin: *` (routes.go:339) — any website in an operator's browser can read
+  the live event stream of an intranet console, including full payloads. Add an auth seam
+  (middleware hook + token) before stabilizing the HTTP API.
+
+### Console functionality & query cost
+- No mutation endpoints: operators can't retry/cancel/requeue DLQ items from the console.
+- `ListRecentRoots`/`ListRecentActivities` sort on a computed CASE/COALESCE expression no index can
+  serve (postgres.go:1190-1253) — top-N sort over the whole queue on every SSE-triggered refetch.
+- `ListCronActivities` (postgres.go:1255-1274) matches no index — full scan.
+- `Stats()` runs 14 scalar COUNT(*)s, several over all historical rows (postgres.go:851-899), with
+  a 1s cache and no singleflight.
+- `GetSubtree` is unbounded (postgres.go:1276-1294); search is client-side over the current page
+  only; pagination is OFFSET-based with no totals.
+
+### Misc
+- No OpenTelemetry trace propagation across the enqueue→dequeue boundary.
+- No injectable logger — everything uses the global slog default.
+- `GetActivityEvents`/`GetResult` don't filter by queue_name (postgres.go:709, 1122-1128).
+
+---
+
+## Tier 4 — Engineering hygiene (cheap; prerequisite for everything above)
+
+- **One 30-line test in the entire repo** (storage/postgres/postgres_test.go — a status-string
+  mapping test). Zero coverage of dequeue SQL, SKIP LOCKED concurrency, lease/reaper recovery,
+  idempotency races, retry math, ack fencing, shutdown. Add a testcontainers-based Postgres
+  integration suite with crash-recovery invariant tests; every Tier 0 fix lands with a regression
+  test.
+- CI runs `go test` without `-race` despite heavy mutex/channel code; add `-race`.
+- No golangci-lint config; CI is build + vet + gofmt only.
+- No benchmarks; the PERF_FIX_PLAN meltdown was discovered by hand. Promote
+  examples/perf/suspend_stress into a repeatable benchmark harness.
+
+---
+
+## Suggested order
+
+1. **Tier 4 harness + Tier 0 fixes together** — each Tier 0 item is small and needs a regression
+   test; the harness pays for itself immediately.
+2. **Tier 2 items 1-3** (NOTIFY cost, dequeue index, event-driven wakeups) — they make the current
+   model viable at scale and are prerequisites for Tier 1's re-dispatch design.
+3. **Tier 1 step memoization** — the headline feature that earns "durable execution".
+4. **Tier 3** alongside, with console auth before any API stabilization.

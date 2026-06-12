@@ -47,15 +47,31 @@ func (b *backoff) next() time.Duration {
 
 // WorkerEngine is the main activity processing engine.
 type WorkerEngine struct {
-	queue      activityQueue
-	backend    storage.Storage
-	handlers   map[string]ActivityHandler
-	config     WorkerConfig
-	running    atomic.Bool
-	cancelFunc context.CancelFunc
-	shutdownCh chan struct{}
-	metrics    MetricsSink
-	resultWg   sync.WaitGroup // tracks in-flight result storage goroutines
+	queue    activityQueue
+	backend  storage.Storage
+	handlers map[string]ActivityHandler
+	config   WorkerConfig
+	running  atomic.Bool
+	metrics  MetricsSink
+
+	// mu guards the shutdown machinery below. Start writes these fields and
+	// Stop reads them, typically from different goroutines (`go engine.Start`
+	// then `engine.Stop` from main is the documented usage), so unsynchronized
+	// access is a data race; the mutex also makes closing shutdownCh
+	// idempotent under concurrent Stop calls.
+	mu           sync.Mutex
+	cancelFunc   context.CancelFunc // cancels the engine context (handlers, acks) — phase 3
+	intakeCancel context.CancelFunc // cancels only the dequeue/poll loops — phase 1
+	shutdownCh   chan struct{}
+
+	// instanceID makes worker labels unique per engine instance, and claimSeq
+	// makes dispatcher claims unique per attempt. Both feed the
+	// current_worker_id ack fence: without them, every process claims work as
+	// "worker-N"/"dispatcher", so a stale worker whose lease expired could ack
+	// (and mark completed/failed) a row that a different process had since
+	// reclaimed and was still running.
+	instanceID string
+	claimSeq   atomic.Uint64
 
 	poolID uuid.UUID // identity used for worker_pools registration; zero if backend doesn't support it
 
@@ -84,6 +100,7 @@ func NewWorkerEngineWithBackend(backend storage.Storage, config WorkerConfig) *W
 		config:     config,
 		shutdownCh: shutdownCh,
 		metrics:    NoopMetrics{},
+		instanceID: uuid.New().String()[:8],
 	}
 }
 
@@ -179,9 +196,19 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 
 	slog.Info("Starting worker engine", "max_concurrent_activities", e.config.MaxConcurrentActivities)
 
-	engineCtx, cancel := context.WithCancel(ctx)
-	e.cancelFunc = cancel
+	// Two nested contexts implement two-phase shutdown: intakeCtx is cancelled
+	// first (stops dequeue/poll loops), engineCtx stays live through the drain
+	// so in-flight handlers can complete and ack, and is cancelled last.
+	engineCtx, engineCancel := context.WithCancel(ctx)
+	defer engineCancel()
+	intakeCtx, intakeCancel := context.WithCancel(engineCtx)
+
+	e.mu.Lock()
+	e.cancelFunc = engineCancel
+	e.intakeCancel = intakeCancel
 	e.shutdownCh = make(chan struct{})
+	shutdownCh := e.shutdownCh
+	e.mu.Unlock()
 
 	// Register this pool so cluster-wide capacity reporting stays accurate.
 	// Registration failure is non-fatal — the engine still runs, the KPI just
@@ -205,20 +232,20 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	// Heartbeat the worker_pools row so we keep counting toward cluster capacity.
 	if e.poolID != uuid.Nil {
 		wg.Go(func() {
-			e.runWorkerPoolHeartbeat(engineCtx)
+			e.runWorkerPoolHeartbeat(intakeCtx)
 		})
 	}
 
 	// Scheduled activities processor (skipped if backend handles it natively)
 	if !e.queue.SchedulesNatively() {
 		wg.Go(func() {
-			e.runScheduledProcessor(engineCtx)
+			e.runScheduledProcessor(intakeCtx)
 		})
 	}
 
 	// Reaper processor
 	wg.Go(func() {
-		e.runReaperProcessor(engineCtx)
+		e.runReaperProcessor(intakeCtx)
 	})
 
 	if e.config.SuspendOnAwait {
@@ -229,7 +256,7 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		primary := max(e.config.MaxConcurrentActivities-e.config.SuspendLeavesReserved, 1)
 		e.workerSem = make(chan struct{}, primary)
 		wg.Go(func() {
-			e.runSuspendDispatcher(engineCtx, e.queue, e.workerSem, "dispatcher")
+			e.runSuspendDispatcher(intakeCtx, engineCtx, e.queue, e.workerSem, "dispatcher")
 		})
 
 		// Optional reservation: a separate dispatcher with its own slot
@@ -240,7 +267,7 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 			e.leafSem = make(chan struct{}, e.config.SuspendLeavesReserved)
 			e.leafQueue = newBackendQueueAdapter(e.backend, e.config.SuspendLeafActivityTypes)
 			wg.Go(func() {
-				e.runSuspendDispatcher(engineCtx, e.leafQueue, e.leafSem, "dispatcher-leaf")
+				e.runSuspendDispatcher(intakeCtx, engineCtx, e.leafQueue, e.leafSem, "dispatcher-leaf")
 			})
 		}
 	} else {
@@ -248,7 +275,7 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		for i := 0; i < e.config.MaxConcurrentActivities; i++ {
 			workerID := i
 			wg.Go(func() {
-				e.runWorkerLoop(engineCtx, workerID)
+				e.runWorkerLoop(intakeCtx, engineCtx, workerID)
 			})
 		}
 	}
@@ -257,21 +284,34 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	select {
-	case sig := <-sigCh:
-		slog.Info("Received shutdown signal", "signal", sig)
-	case <-ctx.Done():
-		slog.Info("Context cancelled")
-	case <-e.shutdownCh:
-		slog.Info("Shutdown requested")
+	// A Stop that ran to completion between the running CAS and the mu block
+	// above closed the previous shutdownCh, not the one published there — so
+	// re-check the flag instead of waiting on a signal that already fired.
+	// Any Stop after the mu block closes the published channel and wakes the
+	// select normally.
+	if !e.running.Load() {
+		slog.Info("Shutdown requested during startup")
+	} else {
+		select {
+		case sig := <-sigCh:
+			slog.Info("Received shutdown signal", "signal", sig)
+		case <-ctx.Done():
+			slog.Info("Context cancelled")
+		case <-shutdownCh:
+			slog.Info("Shutdown requested")
+		}
 	}
 
+	// Phase 1: stop intake. Loops unwind; in-flight handlers keep running on
+	// the still-live engineCtx so they can complete and ack instead of being
+	// guaranteed to fail their ack and rerun. engineCtx is cancelled by the
+	// deferred engineCancel once the drain below finishes (or the grace
+	// budget expires).
 	e.stop()
-	cancel()
 
-	// Single shutdown grace covering everything in parallel — worker loops,
-	// dispatchers, in-flight activity goroutines, result-storage goroutines,
-	// and pool deregistration. Previous design ran them sequentially with
+	// Phase 2: drain. Single shutdown grace covering everything in parallel —
+	// worker loops, dispatchers, in-flight activity goroutines, and pool
+	// deregistration. Previous design ran them sequentially with
 	// per-stage timeouts (wg.Wait unbounded + 30s + 10s + 5s) which on a
 	// busy engine could push shutdown past a minute and time out the
 	// orchestrator's SIGTERM grace. Worst case is now ShutdownGraceSeconds
@@ -298,9 +338,6 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 				e.activityWg.Wait()
 			}
 		}},
-		// Async result-storage goroutines spawned by handleSuccess /
-		// handleNonRetryableFailure.
-		{"results", func() { e.resultWg.Wait() }},
 		// Best-effort pool deregister — uses graceCtx so it can't outlive
 		// the budget on its own.
 		{"deregister", func() {
@@ -347,22 +384,38 @@ func (e *WorkerEngine) Stop() {
 	e.stop()
 }
 
+// stop is phase 1 of shutdown: it stops work intake (dequeue/poll loops) but
+// deliberately leaves the engine context alive so in-flight handlers can
+// finish and ack. Cancelling everything here — as earlier versions did — meant
+// a handler that completed during the drain acked with a dead context, failed,
+// and was guaranteed to rerun on another worker. Start performs the drain
+// (phase 2) and the final engine-context cancel (phase 3).
 func (e *WorkerEngine) stop() {
 	slog.Info("Stopping worker engine")
 	e.running.Store(false)
-	if e.cancelFunc != nil {
-		e.cancelFunc()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.intakeCancel != nil {
+		e.intakeCancel()
 	}
-	select {
-	case <-e.shutdownCh:
-	default:
-		close(e.shutdownCh)
+	if e.shutdownCh != nil {
+		select {
+		case <-e.shutdownCh:
+		default:
+			close(e.shutdownCh)
+		}
 	}
 }
 
-func (e *WorkerEngine) runWorkerLoop(ctx context.Context, workerID int) {
+// runWorkerLoop polls for work on ctx (the intake context, cancelled first
+// during shutdown) but executes claimed activities on handlerCtx (the engine
+// context, which outlives intake so a draining handler can still ack).
+func (e *WorkerEngine) runWorkerLoop(ctx, handlerCtx context.Context, workerID int) {
 	slog.Debug("Starting worker loop", "worker_id", workerID)
-	workerLabel := fmt.Sprintf("worker-%d", workerID)
+	// instanceID prefix keeps the label unique across engine processes; the
+	// loop itself is synchronous (claim → handle → ack), so one label per
+	// worker can never have two attempts in flight.
+	workerLabel := fmt.Sprintf("%s:worker-%d", e.instanceID, workerID)
 	bo := newBackoff(100*time.Millisecond, 5*time.Second)
 
 	for e.running.Load() {
@@ -398,7 +451,7 @@ func (e *WorkerEngine) runWorkerLoop(ctx context.Context, workerID int) {
 		}
 
 		bo.reset()
-		e.processActivity(ctx, act, workerLabel, workerID)
+		e.processActivity(handlerCtx, act, workerLabel, workerID)
 	}
 
 	slog.Debug("Worker loop stopped", "worker_id", workerID)
@@ -414,9 +467,13 @@ func (e *WorkerEngine) runWorkerLoop(ctx context.Context, workerID int) {
 // Two dispatchers can run concurrently against different (queue, sem) pairs
 // to implement leaf-slot reservation; they share the engine's activityWg so
 // shutdown waits for both.
-func (e *WorkerEngine) runSuspendDispatcher(ctx context.Context, q activityQueue, sem chan struct{}, label string) {
+// ctx is the intake context (cancelled first during shutdown); handlerCtx is
+// the engine context activities execute on, which outlives intake so draining
+// handlers can still ack — see runWorkerLoop.
+func (e *WorkerEngine) runSuspendDispatcher(ctx, handlerCtx context.Context, q activityQueue, sem chan struct{}, label string) {
 	slog.Debug("Starting suspend dispatcher", "label", label, "slots", cap(sem))
 	bo := newBackoff(100*time.Millisecond, 5*time.Second)
+	baseLabel := fmt.Sprintf("%s:%s", e.instanceID, label)
 
 	for e.running.Load() {
 		// Acquire a slot before dequeueing — keeps in-flight activities
@@ -428,7 +485,13 @@ func (e *WorkerEngine) runSuspendDispatcher(ctx context.Context, q activityQueue
 			return
 		}
 
-		act, err := q.Dequeue(ctx, time.Second, label)
+		// Unlike runWorkerLoop, this dispatcher has many attempts in flight at
+		// once, so the claim label must be unique per attempt: if every claim
+		// shared one label, a stale goroutine whose lease expired could ack a
+		// row this same dispatcher had since reclaimed for a fresh attempt.
+		claimLabel := fmt.Sprintf("%s#%d", baseLabel, e.claimSeq.Add(1))
+
+		act, err := q.Dequeue(ctx, time.Second, claimLabel)
 		if err != nil {
 			<-sem
 			if ctx.Err() != nil {
@@ -463,16 +526,11 @@ func (e *WorkerEngine) runSuspendDispatcher(ctx context.Context, q activityQueue
 
 			// MUST pass the same label that was sent to Dequeue above. The
 			// AckSuccess/AckFailure SQL guards on `current_worker_id = $2`,
-			// which was set to `label` at dequeue time. Using a per-activity
-			// label here (e.g. "<label>-<short-uuid>") would always fail
-			// the WHERE clause: handler completes, MarkCompleted returns
-			// "not in a claimable state", handleSuccess logs
-			// activity_lost_completion, the reaper requeues the row, and
-			// the activity re-runs forever. Activity identity for slog is
-			// already covered by the activity_id field on every log line
-			// processActivity emits.
-			ctxWithSlot := withSuspendSlot(ctx, holder)
-			e.processActivity(ctxWithSlot, act, label, 0)
+			// which was set to the claim label at dequeue time — acking with
+			// any other label fails the WHERE clause and the activity is
+			// requeued and re-run.
+			ctxWithSlot := withSuspendSlot(handlerCtx, holder)
+			e.processActivity(ctxWithSlot, act, claimLabel, 0)
 		}(act)
 	}
 	slog.Debug("Suspend dispatcher stopped", "label", label)
@@ -559,11 +617,15 @@ func (e *WorkerEngine) safeHandle(handler ActivityHandler, ctx ActivityContext, 
 }
 
 func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result json.RawMessage, workerLabel string, workerID int, activityID any, activityType string) {
-	if err := e.queue.MarkCompleted(ctx, act, workerLabel); err != nil {
+	// Result is persisted in the same transaction as the status flip: a crash
+	// here either leaves the row 'processing' (lease expires, activity reruns)
+	// or 'completed' with its result row present. There is no window where the
+	// activity is completed but the result is missing, which previously left
+	// awaiting parents polling until their own timeout.
+	if err := e.queue.MarkCompleted(ctx, act, result, workerLabel); err != nil {
 		// MarkCompleted failed — the row was no longer in 'processing' with
 		// this worker (lease likely expired and the reaper requeued it).
 		// Don't claim success: another worker will rerun the activity.
-		// Don't store the result either, since the rerun will produce its own.
 		slog.Warn("Activity completed in handler but row was no longer claimable; another worker will rerun it",
 			"worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "error", err)
 		e.metrics.IncCounter("activity_lost_completion", 1)
@@ -571,16 +633,6 @@ func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result 
 	}
 	e.metrics.IncCounter("activity_completed", 1)
 	slog.Info("Activity completed successfully", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType)
-
-	// Async result storage — tracked for graceful shutdown
-	e.resultWg.Go(func() {
-		storeCtx, storeCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer storeCancel()
-		res := activityResult{Data: result, State: ResultOk}
-		if err := e.queue.StoreResult(storeCtx, act.ID, res); err != nil {
-			slog.Error("Failed to store activity result", "activity_id", activityID, "error", err)
-		}
-	})
 }
 
 func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity, handler ActivityHandler, actCtx ActivityContext, payloadForDL json.RawMessage, reason string, workerLabel string, workerID int, activityID any, activityType string) {
@@ -612,24 +664,11 @@ func (e *WorkerEngine) handleNonRetryableFailure(ctx context.Context, act *activ
 	e.metrics.IncCounter("activity_failed_non_retry", 1)
 	slog.Error("Activity failed", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "reason", reason)
 
+	// The error result row is written inside the AckFailure transaction by the
+	// backend, so no separate result-storage step is needed here.
 	if _, err := e.queue.MarkFailed(ctx, act, reason, false, workerLabel); err != nil {
 		slog.Error("Failed to mark activity as failed", "worker_id", workerID, "activity_id", activityID, "error", err)
 	}
-
-	// Async result storage — tracked for graceful shutdown
-	e.resultWg.Go(func() {
-		storeCtx, storeCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer storeCancel()
-		errorResult, _ := json.Marshal(map[string]any{
-			"error":     reason,
-			"type":      "non_retryable",
-			"failed_at": time.Now().UTC().Format(time.RFC3339),
-		})
-		res := activityResult{Data: errorResult, State: ResultErr}
-		if err := e.queue.StoreResult(storeCtx, act.ID, res); err != nil {
-			slog.Error("Failed to store activity result", "activity_id", activityID, "error", err)
-		}
-	})
 }
 
 func (e *WorkerEngine) handleTimeout(ctx context.Context, act *activity, handler ActivityHandler, actCtx ActivityContext, payloadForDL json.RawMessage, workerLabel string, workerID int, activityID any, activityType string, timeout time.Duration) {

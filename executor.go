@@ -283,11 +283,16 @@ func (w *WorkerEngineWrapper) executeActivity(ctx context.Context, activityType 
 
 	activityID := a.ID
 
-	existing, err := w.queue.EvaluateIdempotencyRule(ctx, a)
-	if err != nil {
-		return nil, WorkerErrorFromStorage(err)
-	}
-	if existing != nil {
+	if a.IdempotencyKey != nil {
+		// Claim + enqueue happen atomically in the backend; a crash can't
+		// leave the key pointing at an activity that was never enqueued.
+		existing, err := w.queue.EnqueueIdempotent(ctx, a)
+		if err != nil {
+			return nil, WorkerErrorFromStorage(err)
+		}
+		if existing == nil {
+			return &ActivityFuture{queue: w.queue, activityID: activityID}, nil
+		}
 		// Idempotency reuse: a different parent is logically spawning the same
 		// child. The row's parent_activity_id stays as the original spawner;
 		// we record this secondary link as an event for full audit attribution.
