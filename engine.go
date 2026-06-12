@@ -24,27 +24,6 @@ import (
 // doesn't drop the pool out of cluster-wide capacity reporting.
 const workerPoolHeartbeatInterval = 10 * time.Second
 
-// backoff implements simple exponential backoff for idle polls.
-type backoff struct {
-	current time.Duration
-	base    time.Duration
-	max     time.Duration
-}
-
-func newBackoff(base, max time.Duration) *backoff {
-	return &backoff{current: base, base: base, max: max}
-}
-
-func (b *backoff) reset() {
-	b.current = b.base
-}
-
-func (b *backoff) next() time.Duration {
-	n := b.current
-	b.current = min(b.current*2, b.max)
-	return n
-}
-
 // WorkerEngine is the main activity processing engine.
 type WorkerEngine struct {
 	queue    activityQueue
@@ -407,6 +386,18 @@ func (e *WorkerEngine) stop() {
 	}
 }
 
+// workerDequeueBlock is how long a worker's Dequeue call parks waiting for
+// work. The backend wakes parked dequeuers on new-work notifications and
+// re-probes internally, so this only bounds how often the loop comes up for
+// air; ctx cancellation aborts the wait immediately for shutdown.
+const workerDequeueBlock = 15 * time.Second
+
+// dispatcherDequeueBlock is the suspend-dispatcher equivalent. It is short
+// because the dispatcher holds a semaphore slot while blocked in Dequeue, and
+// a waking suspended parent may need that slot to resume — a long block here
+// would delay parents on an otherwise idle engine.
+const dispatcherDequeueBlock = time.Second
+
 // runWorkerLoop polls for work on ctx (the intake context, cancelled first
 // during shutdown) but executes claimed activities on handlerCtx (the engine
 // context, which outlives intake so a draining handler can still ack).
@@ -416,7 +407,6 @@ func (e *WorkerEngine) runWorkerLoop(ctx, handlerCtx context.Context, workerID i
 	// loop itself is synchronous (claim → handle → ack), so one label per
 	// worker can never have two attempts in flight.
 	workerLabel := fmt.Sprintf("%s:worker-%d", e.instanceID, workerID)
-	bo := newBackoff(100*time.Millisecond, 5*time.Second)
 
 	for e.running.Load() {
 		select {
@@ -426,7 +416,10 @@ func (e *WorkerEngine) runWorkerLoop(ctx, handlerCtx context.Context, workerID i
 		default:
 		}
 
-		act, err := e.queue.Dequeue(ctx, time.Second, workerLabel)
+		// Blocking dequeue: parks inside the backend until work is signalled
+		// or the block window elapses. No idle sleep/backoff needed here —
+		// an empty return means the window expired and we simply re-enter.
+		act, err := e.queue.Dequeue(ctx, workerDequeueBlock, workerLabel)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -441,16 +434,9 @@ func (e *WorkerEngine) runWorkerLoop(ctx, handlerCtx context.Context, workerID i
 		}
 
 		if act == nil {
-			sleepFor := bo.next()
-			select {
-			case <-time.After(sleepFor):
-			case <-ctx.Done():
-				return
-			}
 			continue
 		}
 
-		bo.reset()
 		e.processActivity(handlerCtx, act, workerLabel, workerID)
 	}
 
@@ -472,7 +458,6 @@ func (e *WorkerEngine) runWorkerLoop(ctx, handlerCtx context.Context, workerID i
 // handlers can still ack — see runWorkerLoop.
 func (e *WorkerEngine) runSuspendDispatcher(ctx, handlerCtx context.Context, q activityQueue, sem chan struct{}, label string) {
 	slog.Debug("Starting suspend dispatcher", "label", label, "slots", cap(sem))
-	bo := newBackoff(100*time.Millisecond, 5*time.Second)
 	baseLabel := fmt.Sprintf("%s:%s", e.instanceID, label)
 
 	for e.running.Load() {
@@ -491,7 +476,10 @@ func (e *WorkerEngine) runSuspendDispatcher(ctx, handlerCtx context.Context, q a
 		// row this same dispatcher had since reclaimed for a fresh attempt.
 		claimLabel := fmt.Sprintf("%s#%d", baseLabel, e.claimSeq.Add(1))
 
-		act, err := q.Dequeue(ctx, time.Second, claimLabel)
+		// Short block (see dispatcherDequeueBlock): we hold a semaphore slot
+		// during the wait, and an empty return releases it below so waking
+		// parents can reacquire. No idle sleep — the block IS the idle wait.
+		act, err := q.Dequeue(ctx, dispatcherDequeueBlock, claimLabel)
 		if err != nil {
 			<-sem
 			if ctx.Err() != nil {
@@ -508,16 +496,9 @@ func (e *WorkerEngine) runSuspendDispatcher(ctx, handlerCtx context.Context, q a
 
 		if act == nil {
 			<-sem
-			sleepFor := bo.next()
-			select {
-			case <-time.After(sleepFor):
-			case <-ctx.Done():
-				return
-			}
 			continue
 		}
 
-		bo.reset()
 		holder := newSlotHolder(sem)
 		e.activityWg.Add(1)
 		go func(act *activity) {

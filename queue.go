@@ -50,6 +50,8 @@ type activityQueue interface {
 	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
 	StoreResult(ctx context.Context, activityID uuid.UUID, result activityResult) error
 	GetResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error)
+	// WaitForResult blocks until the activity's result exists or ctx is done.
+	WaitForResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error)
 	RecordSpawnLinked(ctx context.Context, childID, parentID uuid.UUID) error
 	SchedulesNatively() bool
 }
@@ -252,6 +254,38 @@ func (a *backendQueueAdapter) GetResult(ctx context.Context, activityID uuid.UUI
 		Data:  data,
 		State: ResultState(backendResult.State),
 	}, nil
+}
+
+// WaitForResult blocks until the activity's result exists. Backends that
+// implement storage.ResultWaiter (the Postgres backend does) provide an
+// efficient notification-driven wait that works across processes; for other
+// backends this falls back to the legacy 100ms poll.
+func (a *backendQueueAdapter) WaitForResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error) {
+	if rw, ok := a.backend.(storage.ResultWaiter); ok {
+		backendResult, err := rw.WaitForResult(ctx, activityID)
+		if err != nil {
+			return nil, err
+		}
+		return &activityResult{
+			Data:  backendResult.Data,
+			State: ResultState(backendResult.State),
+		}, nil
+	}
+
+	for {
+		result, err := a.GetResult(ctx, activityID)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil {
+			return result, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 func (a *backendQueueAdapter) RecordSpawnLinked(ctx context.Context, childID, parentID uuid.UUID) error {

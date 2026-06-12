@@ -28,10 +28,28 @@ CREATE TABLE IF NOT EXISTS runnerq_activities (
 );
 
 -- Indexes for efficient queries
+--
+-- idx_runnerq_dequeue_effective serves the single-type dequeue form: with
+-- activity_type pinned by equality, the remaining key columns match the
+-- dequeue ORDER BY exactly, so the claim is an index walk that stops at the
+-- first unlocked row.
 CREATE INDEX IF NOT EXISTS idx_runnerq_dequeue_effective
     ON runnerq_activities (
         queue_name,
         activity_type,
+        priority DESC,
+        retry_count DESC,
+        COALESCE(scheduled_at, created_at) ASC
+    )
+    WHERE status IN ('pending', 'scheduled', 'retrying');
+-- idx_runnerq_dequeue_order serves the untyped and multi-type dequeue forms.
+-- Its key order IS the dequeue ORDER BY, so Postgres never has to sort the
+-- whole eligible backlog to find the top row — without it, every claim is a
+-- top-1 sort over every live row in the queue, i.e. O(backlog) per dequeue
+-- per worker, which degrades superlinearly exactly when a backlog builds.
+CREATE INDEX IF NOT EXISTS idx_runnerq_dequeue_order
+    ON runnerq_activities (
+        queue_name,
         priority DESC,
         retry_count DESC,
         COALESCE(scheduled_at, created_at) ASC
@@ -100,6 +118,9 @@ CREATE TABLE IF NOT EXISTS runnerq_events (
 
 CREATE INDEX IF NOT EXISTS idx_runnerq_events_activity
     ON runnerq_events(activity_id, created_at DESC);
+-- Cursor tailing for the live event stream (EventStream reads id > cursor).
+CREATE INDEX IF NOT EXISTS idx_runnerq_events_queue_seq
+    ON runnerq_events(queue_name, id);
 
 -- Results table (permanent)
 CREATE TABLE IF NOT EXISTS runnerq_results (

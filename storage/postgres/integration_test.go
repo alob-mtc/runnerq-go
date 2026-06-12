@@ -24,11 +24,17 @@ import (
 
 func testBackend(t *testing.T) *PostgresBackend {
 	t.Helper()
+	return testBackendNamed(t, "t_"+strings.ReplaceAll(uuid.New().String(), "-", "")[:16])
+}
+
+// testBackendNamed connects a backend to a specific queue. Two backends on
+// the same queue name simulate separate processes sharing a database.
+func testBackendNamed(t *testing.T, queueName string) *PostgresBackend {
+	t.Helper()
 	dsn := os.Getenv("RUNNERQ_TEST_DSN")
 	if dsn == "" {
 		t.Skip("RUNNERQ_TEST_DSN not set; skipping integration test")
 	}
-	queueName := "t_" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
 	b, err := WithConfig(context.Background(), dsn, queueName, 30_000, 5)
 	if err != nil {
 		t.Fatalf("connect backend: %v", err)

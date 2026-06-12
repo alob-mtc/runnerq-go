@@ -23,8 +23,11 @@ type ActivityFuture struct {
 	activityID uuid.UUID
 }
 
-// GetResult waits for and returns the completed activity result.
-// It polls every 100ms. The caller should use context for timeout control.
+// GetResult waits for and returns the completed activity result. The wait is
+// notification-driven when the backend supports it (the Postgres backend
+// does), with a slow table re-check as fallback — including when the caller
+// is a different process from the worker producing the result. The caller
+// should use context for timeout control.
 //
 // When called from inside an activity handler with SuspendOnAwait enabled,
 // the host activity's worker slot is released for the duration of the wait
@@ -39,30 +42,21 @@ func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error)
 			// Reacquire on the original ctx so a cancelled handler doesn't
 			// block forever waiting for a slot it'll never use. The error
 			// from reacquire is swallowed deliberately — if ctx is done the
-			// caller will see it on the next select below.
+			// caller sees the ctx error from the wait itself.
 			_ = h.reacquire(ctx)
 		}()
 	}
-	for {
-		result, err := f.queue.GetResult(ctx, f.activityID)
-		if err != nil {
-			return nil, err
-		}
-		if result != nil {
-			switch result.State {
-			case ResultOk:
-				return result.Data, nil
-			case ResultErr:
-				resultJSON, _ := json.Marshal(result.Data)
-				return nil, &WorkerError{Kind: ErrCustom, Message: string(resultJSON)}
-			}
-		}
 
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
+	result, err := f.queue.WaitForResult(ctx, f.activityID)
+	if err != nil {
+		return nil, err
+	}
+	switch result.State {
+	case ResultOk:
+		return result.Data, nil
+	default:
+		resultJSON, _ := json.Marshal(result.Data)
+		return nil, &WorkerError{Kind: ErrCustom, Message: string(resultJSON)}
 	}
 }
 

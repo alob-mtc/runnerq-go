@@ -140,23 +140,30 @@ already exist (idempotency table, permanent results table, lineage columns):
 
 ## Tier 2 — Scale ceilings (blocks 10k/sec regardless of Tier 1)
 
-1. **`pg_notify` + event INSERT inside every lifecycle transaction** (postgres.go:141-167, called
-   from enqueue/dequeue/ack/result). Postgres serializes NOTIFY-ing commits on a global queue
-   lock — a hard cluster-wide commit-rate cap, paid even with zero listeners. Make event recording
-   and NOTIFY optional/batched/async-outbox; gate NOTIFY on listener presence.
-2. **Dequeue ORDER BY cannot use the index.** Index keyed
-   `(queue_name, activity_type, priority DESC, …)` (schema.go:31-39) but the query orders by
-   `priority DESC, retry_count DESC, COALESCE(...)` without pinning `activity_type`
-   (postgres.go:314-327) → top-1 sort over the entire eligible backlog per claim, per worker.
-   The `($7::text[] IS NULL OR …)` OR-pattern further degrades plans. Reorder the index to match
-   the ORDER BY; split the nil-filter and typed-filter queries.
-3. **Polling everywhere despite NOTIFY already firing on every transition.**
-   - Workers: 100ms→5s backoff (engine.go:366, 390-398); `Dequeue`'s timeout param is ignored
-     (postgres.go:288) — no blocking dequeue; up to 5s pickup latency.
-   - Futures: fixed 100ms SELECT loop per waiter (executor.go:46-66); in suspend mode waiter count
-     is unbounded — 10k suspended parents = 100k queries/sec (the "poll storm" the project's own
-     stress example works around, examples/perf/suspend_stress/main.go:17-25).
-   - Fix: LISTEN/NOTIFY-driven wakeups for both paths, with polling as fallback.
+1. ✅ **DONE — `pg_notify` + event INSERT inside every lifecycle transaction.** Postgres
+   serializes NOTIFY-ing commits on a global queue lock — a hard cluster-wide commit-rate cap,
+   paid even with zero listeners. Fixed: transactions now only insert rows; a per-backend
+   signaler batches post-commit signals (~50ms windows) into tiny notifications on three
+   channels — work edge, event edge, and batched result activity-IDs (storage/postgres/
+   signals.go). The console event stream is fed by a cursor tailer over `runnerq_events`
+   (full rows — also removes the 8KB NOTIFY truncation), with one shared LISTEN connection
+   per process instead of one per SSE subscriber.
+2. ✅ **DONE — Dequeue ORDER BY cannot use the index.** Fixed: new
+   `idx_runnerq_dequeue_order` keyed exactly like the ORDER BY; the query is split into three
+   static forms (untyped / single-type / multi-type) replacing the
+   `($7 IS NULL OR …)` OR-pattern, and the eligibility predicate is restructured as
+   `status IN (...) AND (status='pending' OR scheduled_at <= NOW())` so the planner can prove
+   the partial-index predicate for ORDERED scans (verified: 0.2ms index walk vs external merge
+   sort on a 200k-row backlog). Residual (acceptable for now): future-scheduled rows still sit
+   in the same index and are filtered in-scan.
+3. ✅ **DONE — Polling everywhere despite NOTIFY firing on every transition.** Fixed:
+   `Dequeue` is now genuinely blocking (parks on the work signal, re-probes every 2s as
+   fallback, honors the timeout param); engine loops dropped their idle backoff. Futures use
+   `WaitForResult` — notification-driven with a 5s table re-check fallback — exposed as the
+   optional `storage.ResultWaiter` capability and **working across processes** (the awaiting
+   server process and the producing worker only share the database; verified by integration
+   tests with two separate backend instances: ~100-200ms wakes). Custom backends without the
+   capability fall back to the legacy 100ms poll.
 4. **No batching.** Enqueue is one transaction per child (postgres.go:218-286 — a fanout-100
    handler does 100 sequential round-trips); dequeue claims one row per round-trip → O(workers²)
    skip-locked scanning; no batch ack. ~20 statements / 4 transactions per successful activity
