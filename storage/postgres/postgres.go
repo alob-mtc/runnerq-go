@@ -163,6 +163,96 @@ func (b *PostgresBackend) initSchema(ctx context.Context) error {
 	if _, err := conn.Exec(ctx, schemaSql); err != nil {
 		return storage.NewInternalError(fmt.Sprintf("Failed to initialize schema: %v", err))
 	}
+
+	if err := b.ensureDequeueIndexes(ctx, conn); err != nil {
+		return err
+	}
+	return nil
+}
+
+// dequeueIndexes are the hot claim-path indexes, built CONCURRENTLY (outside
+// schemaSql) so their creation never takes the SHARE lock that would block
+// every write on runnerq_activities during the build. dropAfter names the
+// previous version, removed only once the replacement is valid.
+var dequeueIndexes = []struct {
+	name      string
+	ddl       string
+	dropAfter string
+}{
+	{
+		// Serves the single-type dequeue form: with activity_type pinned by
+		// equality, the remaining key columns match the dequeue ORDER BY
+		// exactly, so the claim is an index walk that stops at the first
+		// unlocked row.
+		name: "idx_runnerq_dequeue_effective_v2",
+		ddl: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_dequeue_effective_v2
+			ON runnerq_activities (
+				queue_name,
+				activity_type,
+				priority DESC,
+				retry_count DESC,
+				COALESCE(scheduled_at, created_at) ASC
+			)
+			WHERE status IN ('pending', 'scheduled', 'retrying', 'waiting')`,
+		dropAfter: "idx_runnerq_dequeue_effective",
+	},
+	{
+		// Serves the untyped and multi-type dequeue forms. Its key order IS
+		// the dequeue ORDER BY, so Postgres never sorts the whole eligible
+		// backlog to find the top row.
+		name: "idx_runnerq_dequeue_order_v2",
+		ddl: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_dequeue_order_v2
+			ON runnerq_activities (
+				queue_name,
+				priority DESC,
+				retry_count DESC,
+				COALESCE(scheduled_at, created_at) ASC
+			)
+			WHERE status IN ('pending', 'scheduled', 'retrying', 'waiting')`,
+		dropAfter: "idx_runnerq_dequeue_order",
+	},
+}
+
+// ensureDequeueIndexes builds the versioned dequeue indexes concurrently and
+// retires their predecessors. Runs on the schema-advisory-locked connection
+// (so concurrent boots serialize), with each statement autocommitting —
+// required, since CONCURRENTLY cannot run inside a transaction. A concurrent
+// build that failed previously leaves an INVALID index; those are detected,
+// dropped, and rebuilt. The old index is dropped only after its replacement
+// is valid, so the claim path is never left unindexed.
+func (b *PostgresBackend) ensureDequeueIndexes(ctx context.Context, conn *pgxpool.Conn) error {
+	for _, idx := range dequeueIndexes {
+		var valid *bool
+		err := conn.QueryRow(ctx, `
+			SELECT i.indisvalid
+			FROM pg_index i
+			JOIN pg_class c ON c.oid = i.indexrelid
+			WHERE c.relname = $1`, idx.name).Scan(&valid)
+		switch {
+		case err == pgx.ErrNoRows:
+			// Doesn't exist yet — build below.
+		case err != nil:
+			return storage.NewInternalError(fmt.Sprintf("Failed to inspect index %s: %v", idx.name, err))
+		case valid != nil && !*valid:
+			// Leftover of an interrupted concurrent build — drop and rebuild.
+			if _, err := conn.Exec(ctx, "DROP INDEX IF EXISTS "+pgx.Identifier{idx.name}.Sanitize()); err != nil {
+				return storage.NewInternalError(fmt.Sprintf("Failed to drop invalid index %s: %v", idx.name, err))
+			}
+		default:
+			// Exists and valid: just make sure the predecessor is gone.
+			if _, err := conn.Exec(ctx, "DROP INDEX IF EXISTS "+pgx.Identifier{idx.dropAfter}.Sanitize()); err != nil {
+				return storage.NewInternalError(fmt.Sprintf("Failed to drop superseded index %s: %v", idx.dropAfter, err))
+			}
+			continue
+		}
+
+		if _, err := conn.Exec(ctx, idx.ddl); err != nil {
+			return storage.NewInternalError(fmt.Sprintf("Failed to build index %s: %v", idx.name, err))
+		}
+		if _, err := conn.Exec(ctx, "DROP INDEX IF EXISTS "+pgx.Identifier{idx.dropAfter}.Sanitize()); err != nil {
+			return storage.NewInternalError(fmt.Sprintf("Failed to drop superseded index %s: %v", idx.dropAfter, err))
+		}
+	}
 	return nil
 }
 
@@ -357,7 +447,7 @@ const (
 		WHERE id = (
 			SELECT id FROM runnerq_activities
 			WHERE queue_name = $3
-			  AND status IN ('pending', 'scheduled', 'retrying')
+			  AND status IN ('pending', 'scheduled', 'retrying', 'waiting')
 			  AND (status = 'pending' OR scheduled_at <= NOW())`
 	dequeueSQLTail = `
 			ORDER BY
@@ -479,6 +569,7 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 	defer tx.Rollback(ctx)
 
 	var actType *string
+	var parentID *uuid.UUID
 	err = tx.QueryRow(ctx, `
 		UPDATE runnerq_activities
 		SET status = 'completed',
@@ -489,8 +580,8 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 		WHERE id = $3 AND queue_name = $4
 		  AND status = 'processing'
 		  AND current_worker_id = $2
-		RETURNING activity_type`,
-		now, workerID, activityID, b.queueName).Scan(&actType)
+		RETURNING activity_type, parent_activity_id`,
+		now, workerID, activityID, b.queueName).Scan(&actType, &parentID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return storage.NewNotFoundError(fmt.Sprintf("Activity %s is not in a claimable state for ack_success", activityID))
@@ -518,13 +609,42 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 		return err
 	}
 
+	wokeParent, err := b.wakeWaitingParentTx(ctx, tx, parentID)
+	if err != nil {
+		return err
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return storage.NewInternalError(fmt.Sprintf("Failed to commit ack: %v", err))
 	}
 
 	b.signalEvent()
 	b.signalResult(activityID)
+	if wokeParent {
+		b.signalWork()
+	}
 	return nil
+}
+
+// wakeWaitingParentTx makes a parked parent runnable when one of its children
+// reaches a terminal state (its result is now available). Atomic with the
+// child's transition: a crash can't complete the child without queueing the
+// parent's wake. Waking on ANY child's completion — not just the one the
+// parent awaits — costs at most one cheap replay-and-repark per completion;
+// parents in other states are untouched.
+func (b *PostgresBackend) wakeWaitingParentTx(ctx context.Context, tx pgx.Tx, parentID *uuid.UUID) (bool, error) {
+	if parentID == nil {
+		return false, nil
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE runnerq_activities
+		SET status = 'pending', scheduled_at = NULL
+		WHERE id = $1 AND queue_name = $2 AND status = 'waiting'`,
+		*parentID, b.queueName)
+	if err != nil {
+		return false, storage.NewInternalError(fmt.Sprintf("Failed to wake waiting parent: %v", err))
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, failure storage.FailureKind, workerID string) (bool, error) {
@@ -538,13 +658,14 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 
 	// Lock the activity row
 	var ar activityRow
+	var parentID *uuid.UUID
 	err = tx.QueryRow(ctx, `
-		SELECT id, retry_count, max_retries, retry_delay_seconds, max_retry_delay_seconds
+		SELECT id, retry_count, max_retries, retry_delay_seconds, max_retry_delay_seconds, parent_activity_id
 		FROM runnerq_activities
 		WHERE id = $1 AND queue_name = $2 AND status = 'processing' AND current_worker_id = $3
 		FOR UPDATE`,
 		activityID, b.queueName, workerID).Scan(
-		&ar.id, &ar.retryCount, &ar.maxRetries, &ar.retryDelaySeconds, &ar.maxRetryDelaySeconds)
+		&ar.id, &ar.retryCount, &ar.maxRetries, &ar.retryDelaySeconds, &ar.maxRetryDelaySeconds, &parentID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return false, storage.NewNotFoundError(fmt.Sprintf("Activity %s not found or not claimed by this worker", activityID))
@@ -584,11 +705,19 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 			return false, err
 		}
 
+		wokeParent, err := b.wakeWaitingParentTx(ctx, tx, parentID)
+		if err != nil {
+			return false, err
+		}
+
 		if err := tx.Commit(ctx); err != nil {
 			return false, storage.NewInternalError(fmt.Sprintf("Failed to commit ack_failure: %v", err))
 		}
 		b.signalEvent()
 		b.signalResult(activityID)
+		if wokeParent {
+			b.signalWork()
+		}
 		return false, nil
 	}
 
@@ -693,12 +822,20 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		return false, err
 	}
 
+	wokeParent, err := b.wakeWaitingParentTx(ctx, tx, parentID)
+	if err != nil {
+		return false, err
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return false, storage.NewInternalError(fmt.Sprintf("Failed to commit ack_failure DLQ: %v", err))
 	}
 
 	b.signalEvent()
 	b.signalResult(activityID)
+	if wokeParent {
+		b.signalWork()
+	}
 	return true, nil
 }
 
@@ -751,7 +888,7 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 			LIMIT $2
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id, status, retry_count`,
+		RETURNING id, status, retry_count, parent_activity_id`,
 		b.queueName, batchSize, now, leaseExpiredError)
 	if err != nil {
 		return 0, storage.NewInternalError(fmt.Sprintf("Failed to requeue expired: %v", err))
@@ -761,12 +898,13 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 		id         uuid.UUID
 		deadLetter bool
 		retryCount int32
+		parentID   *uuid.UUID
 	}
 	var reaped []reapedRow
 	for rows.Next() {
 		var r reapedRow
 		var status string
-		if err := rows.Scan(&r.id, &status, &r.retryCount); err != nil {
+		if err := rows.Scan(&r.id, &status, &r.retryCount, &r.parentID); err != nil {
 			rows.Close()
 			return 0, storage.NewInternalError(fmt.Sprintf("Failed to scan requeued row: %v", err))
 		}
@@ -797,6 +935,11 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 			}
 			if err := b.recordEvent(ctx, tx, r.id, storage.EventDeadLetter, nil,
 				toDetail(map[string]any{"error": leaseExpiredError, "reason": "lease_expired"})); err != nil {
+				return 0, err
+			}
+			// Dead-letter is terminal with a result stored — wake a parked
+			// parent so it observes the failure instead of waiting forever.
+			if _, err := b.wakeWaitingParentTx(ctx, tx, r.parentID); err != nil {
 				return 0, err
 			}
 			continue
@@ -836,7 +979,7 @@ func (b *PostgresBackend) Yield(ctx context.Context, activityID uuid.UUID, wakeA
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE runnerq_activities
-		SET status = 'scheduled',
+		SET status = 'waiting',
 			scheduled_at = $1,
 			last_worker_id = $2,
 			current_worker_id = NULL,
@@ -905,12 +1048,13 @@ func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UU
 
 	// Wake a parked (yielded) waiter. Rows in other states are untouched:
 	// pending/processing activities will see the stored signal when their
-	// handler reaches (or replays past) WaitForSignal; retrying rows keep
-	// their backoff.
+	// handler reaches (or replays past) WaitForSignal; Delay-scheduled rows
+	// keep their schedule and retrying rows keep their backoff — only the
+	// dedicated 'waiting' park state is woken early.
 	tag, err := tx.Exec(ctx, `
 		UPDATE runnerq_activities
 		SET status = 'pending', scheduled_at = NULL
-		WHERE id = $1 AND queue_name = $2 AND status = 'scheduled'`,
+		WHERE id = $1 AND queue_name = $2 AND status = 'waiting'`,
 		activityID, b.queueName)
 	if err != nil {
 		return storage.NewInternalError(fmt.Sprintf("Failed to wake signaled activity: %v", err))
@@ -935,6 +1079,26 @@ func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UU
 		b.signalWork()
 	}
 	return nil
+}
+
+// WakeWaiting makes a yield-parked ('waiting') activity immediately runnable.
+// No-op (false) for activities in any other state. Used by the engine to
+// close the park race: a result that committed between a handler's last
+// check and its park landing would otherwise never produce a wake.
+func (b *PostgresBackend) WakeWaiting(ctx context.Context, activityID uuid.UUID) (bool, error) {
+	tag, err := b.pool.Exec(ctx, `
+		UPDATE runnerq_activities
+		SET status = 'pending', scheduled_at = NULL
+		WHERE id = $1 AND queue_name = $2 AND status = 'waiting'`,
+		activityID, b.queueName)
+	if err != nil {
+		return false, storage.NewInternalError(fmt.Sprintf("Failed to wake waiting activity: %v", err))
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil
+	}
+	b.signalWork()
+	return true, nil
 }
 
 // cleanupLockClass namespaces the per-queue advisory lock that elects a
@@ -1313,6 +1477,7 @@ func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error
 			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'processing')                                                             AS processing,
 			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'scheduled')                                                              AS scheduled,
 			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'retrying')                                                               AS retrying,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'waiting')                                                                AS waiting,
 			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'failed')                                                                 AS failed,
 			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'dead_letter')                                                            AS dead_letter,
 			(SELECT COUNT(DISTINCT current_worker_id) FROM runnerq_activities WHERE queue_name = $1 AND status = 'processing' AND current_worker_id IS NOT NULL) AS active_workers,
@@ -1320,6 +1485,7 @@ func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error
 			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'processing')  AS root_processing,
 			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'scheduled')   AS root_scheduled,
 			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'retrying')    AS root_retrying,
+			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'waiting')     AS root_waiting,
 			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'completed')   AS root_completed,
 			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'failed')      AS root_failed,
 			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'dead_letter') AS root_dead_letter`,
@@ -1328,6 +1494,7 @@ func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error
 		&stats.Processing,
 		&stats.Scheduled,
 		&stats.Retrying,
+		&stats.Waiting,
 		&stats.Failed,
 		&stats.DeadLetter,
 		&stats.ActiveWorkers,
@@ -1335,6 +1502,7 @@ func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error
 		&stats.Roots.Processing,
 		&stats.Roots.Scheduled,
 		&stats.Roots.Retrying,
+		&stats.Roots.Waiting,
 		&stats.Roots.Completed,
 		&stats.Roots.Failed,
 		&stats.Roots.DeadLetter,
@@ -1434,7 +1602,7 @@ func (b *PostgresBackend) ListScheduled(ctx context.Context, offset, limit int) 
 			idempotency_key, lease_deadline_ms,
 			parent_activity_id, root_activity_id, depth
 		FROM runnerq_activities
-		WHERE queue_name = $1 AND status IN ('scheduled', 'retrying')
+		WHERE queue_name = $1 AND status IN ('scheduled', 'retrying', 'waiting')
 		ORDER BY scheduled_at ASC, created_at ASC
 		LIMIT $2 OFFSET $3`,
 		b.queueName, limit, offset)
@@ -1837,6 +2005,8 @@ func (r *activityRow) toSnapshot() storage.ActivitySnapshot {
 		status = "Scheduled"
 	case "retrying":
 		status = "Retrying"
+	case "waiting":
+		status = "Waiting"
 	case "failed":
 		status = "Failed"
 	case "dead_letter":

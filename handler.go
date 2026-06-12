@@ -131,14 +131,21 @@ func (c ActivityContext) Run(name string, fn func() (json.RawMessage, error)) (j
 // spurious timeout-retry.
 const yieldMargin = 2 * time.Second
 
-// yieldPark is the sentinel error a yielding durable wait (Sleep or
-// WaitForSignal) returns. The engine intercepts it and reschedules the
-// activity row to wake at wakeAt — without counting a retry — instead of
-// treating it as a failure. A parked signal wait is additionally woken early
-// by signal delivery.
+// yieldPark is the sentinel error a yielding durable wait (Sleep,
+// WaitForSignal, or an in-handler GetResult) returns. The engine intercepts
+// it and parks the activity row as 'waiting' until wakeAt — without counting
+// a retry — instead of treating it as a failure. Parked waits are woken
+// early by what they wait for: signal delivery or child completion.
+//
+// recheck closes the park race: a checkpoint/result that commits between the
+// handler's final check and the park landing produces no wake of its own
+// (the row wasn't 'waiting' yet when the producer looked). When recheck is
+// set, the engine re-checks that result AFTER the park commits and self-
+// wakes the activity if it exists.
 type yieldPark struct {
-	wakeAt time.Time
-	step   string
+	wakeAt  time.Time
+	step    string
+	recheck uuid.UUID // result ID to re-check post-park; uuid.Nil = none
 }
 
 func (y *yieldPark) Error() string {
@@ -335,7 +342,7 @@ func (c ActivityContext) WaitForSignal(name string, timeout time.Duration) (json
 				margin = 0
 			}
 			if wake.After(ctxDeadline.Add(-margin)) {
-				return nil, &yieldPark{wakeAt: wake, step: name}
+				return nil, &yieldPark{wakeAt: wake, step: name, recheck: sigID}
 			}
 		}
 

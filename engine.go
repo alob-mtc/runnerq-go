@@ -556,6 +556,9 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	activityTimeout := time.Duration(act.TimeoutSeconds) * time.Second
 	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, activityTimeout)
 	defer timeoutCancel()
+	// Mark the context as handler-scoped so in-handler GetResult calls may
+	// yield-park this activity; awaits outside a handler block normally.
+	timeoutCtx = withHandlerScope(timeoutCtx)
 
 	scopedExecutor := newWorkerEngineWrapperWithDepth(e.queue, e.config.MaxActivityDepth).scopedForChild(act)
 
@@ -659,9 +662,31 @@ func (e *WorkerEngine) handleYield(ctx context.Context, act *activity, ys *yield
 		return
 	}
 	e.metrics.IncCounter("activity_yielded", 1)
-	slog.Debug("Activity yielded for durable sleep",
+	slog.Debug("Activity yielded for durable wait",
 		"worker_id", workerID, "activity_id", activityID, "activity_type", activityType,
 		"step", ys.step, "wake_at", ys.wakeAt)
+
+	// Close the park race: a result (signal, child completion) that committed
+	// between the handler's final check and the park above produced no wake —
+	// the row wasn't 'waiting' yet when the producer looked. Re-check now
+	// that the park is committed and self-wake if the awaited result exists.
+	// Failure here is degraded latency, not lost work: the park deadline (or
+	// for child awaits, a later sibling completion) still wakes the row.
+	if ys.recheck == uuid.Nil {
+		return
+	}
+	res, err := e.queue.GetResult(ctx, ys.recheck)
+	if err != nil || res == nil {
+		if err != nil {
+			slog.Warn("Post-park recheck failed; the park deadline will recover",
+				"activity_id", activityID, "error", err)
+		}
+		return
+	}
+	if _, err := e.backend.WakeWaiting(ctx, act.ID); err != nil {
+		slog.Warn("Post-park self-wake failed; the park deadline will recover",
+			"activity_id", activityID, "error", err)
+	}
 }
 
 func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity, handler ActivityHandler, actCtx ActivityContext, payloadForDL json.RawMessage, reason string, workerLabel string, workerID int, activityID any, activityType string) {

@@ -29,32 +29,15 @@ CREATE TABLE IF NOT EXISTS runnerq_activities (
 
 -- Indexes for efficient queries
 --
--- idx_runnerq_dequeue_effective serves the single-type dequeue form: with
--- activity_type pinned by equality, the remaining key columns match the
--- dequeue ORDER BY exactly, so the claim is an index walk that stops at the
--- first unlocked row.
-CREATE INDEX IF NOT EXISTS idx_runnerq_dequeue_effective
-    ON runnerq_activities (
-        queue_name,
-        activity_type,
-        priority DESC,
-        retry_count DESC,
-        COALESCE(scheduled_at, created_at) ASC
-    )
-    WHERE status IN ('pending', 'scheduled', 'retrying');
--- idx_runnerq_dequeue_order serves the untyped and multi-type dequeue forms.
--- Its key order IS the dequeue ORDER BY, so Postgres never has to sort the
--- whole eligible backlog to find the top row — without it, every claim is a
--- top-1 sort over every live row in the queue, i.e. O(backlog) per dequeue
--- per worker, which degrades superlinearly exactly when a backlog builds.
-CREATE INDEX IF NOT EXISTS idx_runnerq_dequeue_order
-    ON runnerq_activities (
-        queue_name,
-        priority DESC,
-        retry_count DESC,
-        COALESCE(scheduled_at, created_at) ASC
-    )
-    WHERE status IN ('pending', 'scheduled', 'retrying');
+-- NOTE: the two hot dequeue indexes (idx_runnerq_dequeue_effective_v2,
+-- idx_runnerq_dequeue_order_v2) are NOT created here. They are versioned
+-- (_v2: their partial predicates gained the 'waiting' status) and migrated
+-- by ensureDequeueIndexes in Go using CREATE INDEX CONCURRENTLY, because a
+-- plain CREATE INDEX takes a SHARE lock that blocks all writes on
+-- runnerq_activities for the duration of the build — at boot, on a hot
+-- queue, that stalls every enqueue/dequeue/ack in the cluster. The v1 names
+-- are dropped only after the v2 indexes are built and valid, so there is
+-- never a window with no dequeue index. See ensureDequeueIndexes.
 CREATE INDEX IF NOT EXISTS idx_runnerq_activities_processing
     ON runnerq_activities(queue_name, lease_deadline_ms)
     WHERE status = 'processing';
