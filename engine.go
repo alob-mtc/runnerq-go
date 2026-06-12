@@ -580,7 +580,7 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	// A yielding durable Sleep is not a failure: park the activity until its
 	// wake time without consuming a retry. Checked before the timeout so a
 	// yield that raced the deadline is still honored as a yield.
-	var ys *yieldSleep
+	var ys *yieldPark
 	if errors.As(handlerErr, &ys) {
 		e.handleYield(ctx, act, ys, workerLabel, workerID, activityID, activityType)
 		return
@@ -651,7 +651,7 @@ func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result 
 // On failure the row simply stays processing: its lease expires, the reaper
 // requeues it, and the handler replays to the same Sleep — degraded latency
 // and one consumed retry, not lost work.
-func (e *WorkerEngine) handleYield(ctx context.Context, act *activity, ys *yieldSleep, workerLabel string, workerID int, activityID any, activityType string) {
+func (e *WorkerEngine) handleYield(ctx context.Context, act *activity, ys *yieldPark, workerLabel string, workerID int, activityID any, activityType string) {
 	if err := e.queue.Yield(ctx, act, ys.wakeAt, workerLabel); err != nil {
 		slog.Error("Failed to park yielding activity; lease expiry will recover it",
 			"worker_id", workerID, "activity_id", activityID, "activity_type", activityType,

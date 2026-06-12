@@ -504,6 +504,28 @@ func (h *FulfillOrderHandler) Handle(ctx runnerq.ActivityContext, payload json.R
 }
 ```
 
+Workflows can also wait for **external signals** — human approvals, webhook callbacks —
+delivered from any process that shares the database:
+
+```go
+// Inside a handler: park (no worker held, no retry consumed) until delivery.
+approval, err := ctx.WaitForSignal("approval", 48*time.Hour)
+if runnerq.IsSignalTimeout(err) {
+	return escalate(ctx)
+}
+
+// From anywhere — an engine...
+engine.Signal(ctx, activityID, "approval", json.RawMessage(`{"by":"ops"}`))
+// ...or a process holding only a backend handle (e.g. a webhook receiver):
+runnerq.SignalActivity(ctx, backend, activityID, "approval", payload)
+```
+
+Signals are buffered: one delivered before the handler reaches the wait — or before the
+activity even starts — resolves instantly, including on replay. The wait deadline persists
+across parks (timeouts measure from the first wait, not per attempt). Per name, the last
+delivered payload wins. Note: delivering a signal wakes a scheduled activity early, including
+one scheduled via `Delay`.
+
 Semantics summary:
 
 | Primitive | On retry/replay | Notes |
@@ -511,6 +533,7 @@ Semantics summary:
 | `ctx.Run(name, fn)` | Stored success or permanent failure returned without re-running `fn` | Retryable errors re-run; crash between `fn` and checkpoint re-runs (at-least-once) |
 | `.Step(name)` spawn | Same child returned; memoized result resolves instantly | Incompatible with `AsRoot`/`IdempotencyKeyOption`; handler-context only |
 | `ctx.Sleep(name, d)` | Waits only the remainder; elapsed sleeps return immediately | Wakes that wouldn't land safely before the handler deadline yield: no retry consumed, worker released |
+| `ctx.WaitForSignal(name, timeout)` | Buffered signal resolves instantly; wait deadline persists | Long/unbounded waits park until delivery; timeout → non-retryable error (`IsSignalTimeout`) |
 
 ## Metrics and Monitoring
 
