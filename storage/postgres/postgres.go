@@ -128,9 +128,39 @@ func validateQueueName(name string) error {
 	return nil
 }
 
+// schemaAdvisoryLockKey serializes schema initialization across connections
+// and processes. The value is arbitrary but must stay stable forever — every
+// RunnerQ instance on the same database must agree on it.
+const schemaAdvisoryLockKey int64 = 0x52554E4E45525121 // "RUNNERQ!"
+
 func (b *PostgresBackend) initSchema(ctx context.Context) error {
-	_, err := b.pool.Exec(ctx, schemaSql)
+	// Schema init must be serialized: ALTER TABLE takes ACCESS EXCLUSIVE
+	// before evaluating IF NOT EXISTS, so two backends initializing
+	// concurrently (multiple engine processes booting, parallel tests) take
+	// conflicting locks in different orders and one is killed with
+	// "deadlock detected" (SQLSTATE 40P01). A session-level advisory lock on
+	// a dedicated connection makes inits run one at a time; the lock
+	// auto-releases if the session dies.
+	conn, err := b.pool.Acquire(ctx)
 	if err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to acquire connection for schema init: %v", err))
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, schemaAdvisoryLockKey); err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to acquire schema lock: %v", err))
+	}
+	defer func() {
+		// Unlock on a cancellation-proof context: the session-level lock
+		// must be released on the SAME connection that took it, and leaving
+		// it held would block every other process's startup until this
+		// connection closes.
+		if _, err := conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, schemaAdvisoryLockKey); err != nil {
+			slog.Warn("runnerq: failed to release schema advisory lock; it releases when the connection closes", "error", err)
+		}
+	}()
+
+	if _, err := conn.Exec(ctx, schemaSql); err != nil {
 		return storage.NewInternalError(fmt.Sprintf("Failed to initialize schema: %v", err))
 	}
 	return nil
