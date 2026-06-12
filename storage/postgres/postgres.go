@@ -18,8 +18,6 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-const notifyPayloadMax = 7900
-
 // statsCacheTTL bounds how often Stats() actually hits the database.
 // Stats() runs ~14 COUNT subqueries per call and is polled by every
 // connected SSE client; without this the dashboard amplifies into real
@@ -37,6 +35,12 @@ type PostgresBackend struct {
 	pool           *pgxpool.Pool
 	queueName      string
 	defaultLeaseMS int64
+
+	// sig batches post-commit wake-up signals; watch is the lazily-started
+	// shared listener that turns them into in-process wake-ups. See signals.go.
+	sig       *signaler
+	watcherMu sync.Mutex
+	watch     *watcher
 
 	statsMu     sync.Mutex
 	statsCache  *storage.QueueStats
@@ -79,11 +83,23 @@ func WithConfig(ctx context.Context, databaseURL, queueName string, defaultLease
 		return nil, err
 	}
 
+	backend.sig = newSignaler(backend)
+
 	return backend, nil
 }
 
-// Close closes the connection pool.
+// Close stops the signal machinery and closes the connection pool.
 func (b *PostgresBackend) Close() {
+	b.watcherMu.Lock()
+	w := b.watch
+	b.watch = nil
+	b.watcherMu.Unlock()
+	if w != nil {
+		w.stop()
+	}
+	if b.sig != nil {
+		b.sig.stop()
+	}
 	b.pool.Close()
 }
 
@@ -112,16 +128,42 @@ func validateQueueName(name string) error {
 	return nil
 }
 
+// schemaAdvisoryLockKey serializes schema initialization across connections
+// and processes. The value is arbitrary but must stay stable forever — every
+// RunnerQ instance on the same database must agree on it.
+const schemaAdvisoryLockKey int64 = 0x52554E4E45525121 // "RUNNERQ!"
+
 func (b *PostgresBackend) initSchema(ctx context.Context) error {
-	_, err := b.pool.Exec(ctx, schemaSql)
+	// Schema init must be serialized: ALTER TABLE takes ACCESS EXCLUSIVE
+	// before evaluating IF NOT EXISTS, so two backends initializing
+	// concurrently (multiple engine processes booting, parallel tests) take
+	// conflicting locks in different orders and one is killed with
+	// "deadlock detected" (SQLSTATE 40P01). A session-level advisory lock on
+	// a dedicated connection makes inits run one at a time; the lock
+	// auto-releases if the session dies.
+	conn, err := b.pool.Acquire(ctx)
 	if err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to acquire connection for schema init: %v", err))
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, schemaAdvisoryLockKey); err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to acquire schema lock: %v", err))
+	}
+	defer func() {
+		// Unlock on a cancellation-proof context: the session-level lock
+		// must be released on the SAME connection that took it, and leaving
+		// it held would block every other process's startup until this
+		// connection closes.
+		if _, err := conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, schemaAdvisoryLockKey); err != nil {
+			slog.Warn("runnerq: failed to release schema advisory lock; it releases when the connection closes", "error", err)
+		}
+	}()
+
+	if _, err := conn.Exec(ctx, schemaSql); err != nil {
 		return storage.NewInternalError(fmt.Sprintf("Failed to initialize schema: %v", err))
 	}
 	return nil
-}
-
-func (b *PostgresBackend) notificationChannel() string {
-	return fmt.Sprintf("runnerq_events_%s", b.queueName)
 }
 
 func priorityToInt(p storage.ActivityPriority) int32 {
@@ -138,53 +180,21 @@ func intToPriority(val int32) storage.ActivityPriority {
 	return storage.PriorityNormal
 }
 
+// recordEvent inserts the lifecycle event row — and ONLY the row. It must
+// never NOTIFY: this runs inside the hot-path transactions, and Postgres
+// serializes the commit of every NOTIFY-carrying transaction on one global
+// lock, capping cluster-wide throughput. Live consumers are fed by the
+// post-commit signaler + event tailer instead (signals.go); callers emit
+// b.signalEvent() after their transaction commits.
 func (b *PostgresBackend) recordEvent(ctx context.Context, tx pgx.Tx, activityID uuid.UUID, eventType string, workerID *string, detail json.RawMessage) error {
-	now := time.Now().UTC()
-	event := storage.ActivityEvent{
-		ActivityID: activityID,
-		Timestamp:  now,
-		EventType:  eventType,
-		WorkerID:   workerID,
-		Detail:     detail,
-	}
-
 	_, err := tx.Exec(ctx, `
 		INSERT INTO runnerq_events (activity_id, queue_name, event_type, worker_id, detail, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6)`,
-		activityID, b.queueName, eventType, workerID, detail, now)
+		activityID, b.queueName, eventType, workerID, detail, time.Now().UTC())
 	if err != nil {
 		return storage.NewInternalError(fmt.Sprintf("Failed to record event: %v", err))
 	}
-
-	payload := b.prepareNotifyPayload(&event)
-	channel := b.notificationChannel()
-	_, err = tx.Exec(ctx, "SELECT pg_notify($1::text, $2::text)", channel, payload)
-	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to notify: %v", err))
-	}
-
 	return nil
-}
-
-func (b *PostgresBackend) prepareNotifyPayload(event *storage.ActivityEvent) string {
-	data, err := json.Marshal(event)
-	if err != nil {
-		return "{}"
-	}
-	payload := string(data)
-	if len(payload) > notifyPayloadMax {
-		slog.Warn("NOTIFY payload truncated to avoid PostgreSQL limit",
-			"activity_id", event.ActivityID,
-			"len", len(payload))
-		truncated := map[string]any{
-			"activity_id": event.ActivityID,
-			"event_type":  event.EventType,
-			"truncated":   true,
-		}
-		data, _ = json.Marshal(truncated)
-		return string(data)
-	}
-	return payload
 }
 
 func (b *PostgresBackend) storeResultTx(ctx context.Context, tx pgx.Tx, activityID uuid.UUID, result *storage.ActivityResult, now time.Time) error {
@@ -230,7 +240,19 @@ func (b *PostgresBackend) Enqueue(ctx context.Context, a storage.QueuedActivity)
 		return storage.NewInternalError(fmt.Sprintf("Failed to commit enqueue: %v", err))
 	}
 
+	b.signalEnqueued(&a)
 	return nil
+}
+
+// signalEnqueued emits the post-commit signals for a newly enqueued activity:
+// the event edge always, and the work edge when the activity is immediately
+// runnable (future-scheduled rows are picked up by the blocked dequeuers'
+// periodic probes when they come due).
+func (b *PostgresBackend) signalEnqueued(a *storage.QueuedActivity) {
+	b.signalEvent()
+	if a.ScheduledAt == nil || !a.ScheduledAt.After(time.Now().UTC()) {
+		b.signalWork()
+	}
 }
 
 // enqueueInTx inserts the activity row and its lifecycle event inside the
@@ -292,29 +314,37 @@ func (b *PostgresBackend) enqueueInTx(ctx context.Context, tx pgx.Tx, a *storage
 	return b.recordEvent(ctx, tx, a.ID, eventType, nil, detail)
 }
 
-func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, _ time.Duration, activityTypes []string) (*storage.QueuedActivity, error) {
-	tx, err := b.pool.Begin(ctx)
-	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
-	}
-	defer tx.Rollback(ctx)
-
-	var types []string
-	if len(activityTypes) > 0 {
-		types = activityTypes
-	}
-
-	// Compute the lease deadline directly from the row's per-activity timeout
-	// (clamped to at least the engine default lease). Earlier code did this
-	// via a follow-up ExtendLease call for activities whose timeout exceeded
-	// the default lease — every dequeue paid for two SQL round trips on the
-	// hot worker loop. Folded into the single UPDATE here.
-	//
-	// All time arithmetic uses the DATABASE clock (NOW()), never the caller's:
-	// lease deadlines set here are compared against NOW() in RequeueExpired,
-	// so with app clocks a fast-clocked reaper node would systematically
-	// reclaim other nodes' live leases and double-execute their activities.
-	row := tx.QueryRow(ctx, `
+// Dequeue claim SQL comes in three static forms so the planner can pick the
+// right index for each instead of compromising on one plan for an
+// `($x IS NULL OR activity_type = ANY($x))` OR-pattern:
+//
+//   - no type filter  → idx_runnerq_dequeue_order (key order == ORDER BY)
+//   - one type        → idx_runnerq_dequeue_effective (type pinned by equality,
+//     remaining key order == ORDER BY)
+//   - multiple types  → idx_runnerq_dequeue_order with an in-scan type filter
+//
+// In all three cases the claim is an ordered index walk that stops at the
+// first unlocked qualifying row — never a sort over the whole backlog.
+//
+// Lease arithmetic uses the DATABASE clock (NOW()), never the caller's: the
+// deadline set here is compared against NOW() in RequeueExpired, so with app
+// clocks a fast-clocked reaper node would systematically reclaim other nodes'
+// live leases and double-execute their activities. The deadline derives from
+// the row's per-activity timeout, clamped to at least the engine default
+// lease, folded into the single claim UPDATE.
+const (
+	// The eligibility predicate is written as
+	//   status IN (...) AND (status = 'pending' OR scheduled_at <= NOW())
+	// rather than the equivalent
+	//   status = 'pending' OR (status IN ('scheduled','retrying') AND scheduled_at <= NOW())
+	// deliberately: the first conjunct textually matches the partial-index
+	// predicate, which Postgres's predicate prover needs in order to offer an
+	// ORDERED scan of the partial index. With the OR-only form the planner
+	// can still use the index for bitmap scans, but not for ordered scans —
+	// forcing a top-1 sort over the whole eligible backlog on every claim
+	// (verified with EXPLAIN ANALYZE on a 200k-row backlog: external merge
+	// sort vs a 0.2ms index walk).
+	dequeueSQLHead = `
 		UPDATE runnerq_activities
 		SET status = 'processing',
 			current_worker_id = $1,
@@ -323,11 +353,9 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, _ time.D
 		WHERE id = (
 			SELECT id FROM runnerq_activities
 			WHERE queue_name = $3
-			  AND (
-				status = 'pending'
-				OR (status IN ('scheduled', 'retrying') AND scheduled_at <= NOW())
-			  )
-			  AND ($4::text[] IS NULL OR activity_type = ANY($4))
+			  AND status IN ('pending', 'scheduled', 'retrying')
+			  AND (status = 'pending' OR scheduled_at <= NOW())`
+	dequeueSQLTail = `
 			ORDER BY
 				priority DESC,
 				retry_count DESC,
@@ -338,8 +366,66 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, _ time.D
 		RETURNING id, activity_type, payload, priority, retry_count, max_retries,
 			timeout_seconds, retry_delay_seconds, max_retry_delay_seconds,
 			scheduled_at, metadata, idempotency_key, created_at,
-			parent_activity_id, root_activity_id, depth, lease_deadline_ms`,
-		workerID, b.defaultLeaseMS, b.queueName, types)
+			parent_activity_id, root_activity_id, depth, lease_deadline_ms`
+
+	dequeueSQLAllTypes  = dequeueSQLHead + dequeueSQLTail
+	dequeueSQLOneType   = dequeueSQLHead + ` AND activity_type = $4` + dequeueSQLTail
+	dequeueSQLManyTypes = dequeueSQLHead + ` AND activity_type = ANY($4)` + dequeueSQLTail
+)
+
+// Dequeue claims the next runnable activity. When the queue is empty and
+// maxBlock > 0, it parks until new work is signalled (LISTEN/NOTIFY via the
+// shared watcher), re-probing every workWaitProbe as a fallback for lost
+// signals and for scheduled/retrying rows coming due, up to maxBlock. Returns
+// (nil, nil) when nothing became claimable in time.
+func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, maxBlock time.Duration, activityTypes []string) (*storage.QueuedActivity, error) {
+	deadline := time.Now().Add(maxBlock)
+
+	a, err := b.dequeueOnce(ctx, workerID, activityTypes)
+	if a != nil || err != nil || maxBlock <= 0 {
+		return a, err
+	}
+
+	w := b.getWatcher()
+	ch := w.registerWork()
+	defer w.unregisterWork(ch)
+
+	for {
+		// Re-probe after registering so a signal emitted between the previous
+		// probe and registration can't be missed.
+		a, err := b.dequeueOnce(ctx, workerID, activityTypes)
+		if a != nil || err != nil {
+			return a, err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ch:
+		case <-time.After(min(remaining, workWaitProbe)):
+		}
+	}
+}
+
+func (b *PostgresBackend) dequeueOnce(ctx context.Context, workerID string, activityTypes []string) (*storage.QueuedActivity, error) {
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+	}
+	defer tx.Rollback(ctx)
+
+	var row pgx.Row
+	switch len(activityTypes) {
+	case 0:
+		row = tx.QueryRow(ctx, dequeueSQLAllTypes, workerID, b.defaultLeaseMS, b.queueName)
+	case 1:
+		row = tx.QueryRow(ctx, dequeueSQLOneType, workerID, b.defaultLeaseMS, b.queueName, activityTypes[0])
+	default:
+		row = tx.QueryRow(ctx, dequeueSQLManyTypes, workerID, b.defaultLeaseMS, b.queueName, activityTypes)
+	}
 
 	var ar activityRow
 	var leaseDeadlineMS int64
@@ -368,6 +454,8 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, _ time.D
 	if err := tx.Commit(ctx); err != nil {
 		return nil, storage.NewInternalError(fmt.Sprintf("Failed to commit dequeue: %v", err))
 	}
+
+	b.signalEvent()
 
 	slog.Debug("Activity claimed",
 		"activity_id", a.ID,
@@ -430,6 +518,8 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 		return storage.NewInternalError(fmt.Sprintf("Failed to commit ack: %v", err))
 	}
 
+	b.signalEvent()
+	b.signalResult(activityID)
 	return nil
 }
 
@@ -493,6 +583,8 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		if err := tx.Commit(ctx); err != nil {
 			return false, storage.NewInternalError(fmt.Sprintf("Failed to commit ack_failure: %v", err))
 		}
+		b.signalEvent()
+		b.signalResult(activityID)
 		return false, nil
 	}
 
@@ -559,6 +651,12 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		if err := tx.Commit(ctx); err != nil {
 			return false, storage.NewInternalError(fmt.Sprintf("Failed to commit ack_failure retry: %v", err))
 		}
+		b.signalEvent()
+		if retryDelay == 0 {
+			// Immediate retry is runnable right now; delayed retries are
+			// picked up by blocked dequeuers' periodic probes when due.
+			b.signalWork()
+		}
 		return false, nil
 	}
 
@@ -595,6 +693,8 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		return false, storage.NewInternalError(fmt.Sprintf("Failed to commit ack_failure DLQ: %v", err))
 	}
 
+	b.signalEvent()
+	b.signalResult(activityID)
 	return true, nil
 }
 
@@ -706,6 +806,16 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 	if err := tx.Commit(ctx); err != nil {
 		return 0, storage.NewInternalError(fmt.Sprintf("Failed to commit requeue expired: %v", err))
 	}
+
+	b.signalEvent()
+	for _, r := range reaped {
+		if r.deadLetter {
+			b.signalResult(r.id)
+		}
+	}
+	if len(reaped) > 0 {
+		b.signalWork() // requeued rows are immediately runnable
+	}
 	return uint64(len(reaped)), nil
 }
 
@@ -742,6 +852,7 @@ func (b *PostgresBackend) ExtendLease(ctx context.Context, activityID uuid.UUID,
 	if err := tx.Commit(ctx); err != nil {
 		return false, storage.NewInternalError(fmt.Sprintf("Failed to commit extend_lease: %v", err))
 	}
+	b.signalEvent()
 	return true, nil
 }
 
@@ -760,6 +871,7 @@ func (b *PostgresBackend) RecordSpawnLinked(ctx context.Context, childID, parent
 	if err := tx.Commit(ctx); err != nil {
 		return storage.NewInternalError(fmt.Sprintf("Failed to commit spawn_linked: %v", err))
 	}
+	b.signalEvent()
 	return nil
 }
 
@@ -792,6 +904,9 @@ func (b *PostgresBackend) StoreResult(ctx context.Context, activityID uuid.UUID,
 	if err := tx.Commit(ctx); err != nil {
 		return storage.NewInternalError(fmt.Sprintf("Failed to commit store_result: %v", err))
 	}
+
+	b.signalEvent()
+	b.signalResult(activityID)
 
 	slog.Debug("Activity result stored", "activity_id", activityID)
 	return nil
@@ -868,6 +983,7 @@ func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.Q
 		if err := tx.Commit(ctx); err != nil {
 			return nil, false, storage.NewInternalError(fmt.Sprintf("Failed to commit idempotent enqueue: %v", err))
 		}
+		b.signalEnqueued(a)
 		return nil, true, nil
 	}
 
@@ -907,6 +1023,7 @@ func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.Q
 		if err := tx.Commit(ctx); err != nil {
 			return nil, false, storage.NewInternalError(fmt.Sprintf("Failed to commit idempotent enqueue: %v", err))
 		}
+		b.signalEnqueued(a)
 		return nil, true, nil
 	}
 
@@ -1389,52 +1506,16 @@ func (b *PostgresBackend) GetSubtree(ctx context.Context, rootID uuid.UUID) ([]s
 	return b.scanSnapshots(rows)
 }
 
+// EventStream yields lifecycle events committed after the subscription. It is
+// fed by the shared event tailer (signals.go): writers only insert rows, a
+// debounced post-commit notification kicks the tailer, and the tailer reads
+// full event rows from the table by id cursor. Consequences vs the old
+// per-event NOTIFY design: subscribers no longer pin a dedicated pool
+// connection each (one shared LISTEN connection serves everything), event
+// payloads are no longer truncated at the 8KB NOTIFY limit, and writers pay
+// zero notification cost inside their transactions.
 func (b *PostgresBackend) EventStream(ctx context.Context) (<-chan storage.ActivityEvent, error) {
-	conn, err := b.pool.Acquire(ctx)
-	if err != nil {
-		return nil, storage.NewUnavailableError(fmt.Sprintf("Failed to acquire connection: %v", err))
-	}
-
-	channel := b.notificationChannel()
-	_, err = conn.Exec(ctx, fmt.Sprintf("LISTEN %s", pgx.Identifier{channel}.Sanitize()))
-	if err != nil {
-		conn.Release()
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to listen on channel %s: %v", channel, err))
-	}
-
-	ch := make(chan storage.ActivityEvent, 100)
-
-	go func() {
-		defer conn.Release()
-		defer close(ch)
-
-		for {
-			notification, err := conn.Conn().WaitForNotification(ctx)
-			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				slog.Error("Listener error", "error", err)
-				return
-			}
-
-			var event storage.ActivityEvent
-			if err := json.Unmarshal([]byte(notification.Payload), &event); err != nil {
-				slog.Warn("Failed to parse event from notification",
-					"error", err,
-					"payload", notification.Payload)
-				continue
-			}
-
-			select {
-			case ch <- event:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return ch, nil
+	return b.getWatcher().subscribeEvents(ctx), nil
 }
 
 // ============================================================================

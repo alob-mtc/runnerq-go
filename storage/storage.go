@@ -216,11 +216,25 @@ type ResultStorage interface {
 	GetResult(ctx context.Context, activityID uuid.UUID) (*ActivityResult, error)
 }
 
+// ResultWaiter is an optional capability: backends that can block efficiently
+// until a result exists (e.g. via LISTEN/NOTIFY) implement it, and futures
+// use it instead of polling GetResult. The wait must work across processes —
+// the caller awaiting a result is routinely a different process from the
+// worker that produces it, connected only through the shared database.
+// Implementations must return once the result exists, or with the context's
+// error on cancellation.
+type ResultWaiter interface {
+	WaitForResult(ctx context.Context, activityID uuid.UUID) (*ActivityResult, error)
+}
+
 // QueueStorage defines core queue operations.
 type QueueStorage interface {
 	ResultStorage
 
 	Enqueue(ctx context.Context, activity QueuedActivity) error
+	// Dequeue claims the next runnable activity. timeout is the maximum time
+	// to block waiting for work when the queue is empty (0 = single
+	// non-blocking attempt); (nil, nil) means nothing became claimable.
 	Dequeue(ctx context.Context, workerID string, timeout time.Duration, activityTypes []string) (*QueuedActivity, error)
 	// AckSuccess marks an activity as completed and persists its result.
 	// Implementations MUST store the result atomically with the status change
