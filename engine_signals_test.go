@@ -116,10 +116,12 @@ func TestSignalWakesParkedWaiterAcrossProcesses(t *testing.T) {
 	}
 }
 
-// A short timeout waits in-process and surfaces a typed, non-retryable
-// timeout error the handler can act on.
+// A short timeout waits in-process — single invocation, no park — and
+// surfaces a typed, non-retryable timeout error the handler can act on.
 func TestSignalTimeoutInProcess(t *testing.T) {
+	var invocations atomic.Int32
 	h := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		invocations.Add(1)
 		_, err := ctx.WaitForSignal("never-arrives", time.Second)
 		if !IsSignalTimeout(err) {
 			return nil, NewNonRetryError("expected a signal timeout, got: " + errString(err))
@@ -136,6 +138,20 @@ func TestSignalTimeoutInProcess(t *testing.T) {
 	res := rig.await(t, fut.activityID, 20*time.Second)
 	if res.State != storage.ResultOk || !strings.Contains(string(res.Data), "timed_out") {
 		t.Fatalf("result = %v %s, want timeout handled", res.State, res.Data)
+	}
+	// The contract under test is that a 1s wait inside the default 300s
+	// budget stays in-process: exactly one invocation, no Yielded event.
+	if got := invocations.Load(); got != 1 {
+		t.Fatalf("handler invoked %d times, want 1 — a short wait must not park", got)
+	}
+	events, err := rig.backend.GetActivityEvents(context.Background(), fut.activityID, 100)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	for _, ev := range events {
+		if ev.EventType == storage.EventYielded {
+			t.Fatal("short in-budget signal wait recorded a Yielded event")
+		}
 	}
 }
 
@@ -182,12 +198,21 @@ func TestSignalTimeoutSurvivesPark(t *testing.T) {
 	}
 }
 
-// Signalling a nonexistent activity is an error, not a silent row leak.
+// Signalling a nonexistent activity is rejected with a not-found error
+// specifically — not just any backend failure.
 func TestSignalNonexistentActivity(t *testing.T) {
 	rig := newStepsRig(t, func(e *WorkerEngine) {})
 	err := rig.engine.Signal(context.Background(), uuid.New(), "ghost", nil)
 	if err == nil {
 		t.Fatal("signal to nonexistent activity succeeded; it must be rejected")
+	}
+	we, ok := IsWorkerError(err)
+	if !ok {
+		t.Fatalf("error type = %T (%v), want *WorkerError", err, err)
+	}
+	se, ok := storage.IsStorageError(we.Cause)
+	if !ok || se.Kind != storage.ErrNotFound {
+		t.Fatalf("error = %v (cause %v), want a storage not-found rejection", err, we.Cause)
 	}
 }
 

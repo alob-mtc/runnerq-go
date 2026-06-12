@@ -260,6 +260,12 @@ func (c ActivityContext) WaitForSignal(name string, timeout time.Duration) (json
 		// key, delivering the wrong signal on retry.
 		return nil, NewNonRetryError("WaitForSignal requires a non-empty signal name")
 	}
+	if timeout < 0 {
+		// A computed negative duration silently becoming "wait forever"
+		// would be a surprising and hard-to-debug outcome — fail fast
+		// before the wait checkpoint is written.
+		return nil, NewNonRetryError("WaitForSignal timeout must be >= 0 (0 = wait forever)")
+	}
 	if c.queue == nil {
 		return nil, NewNonRetryError("WaitForSignal requires engine checkpoint storage; it cannot run on a hand-constructed ActivityContext")
 	}
@@ -300,6 +306,15 @@ func (c ActivityContext) WaitForSignal(name string, timeout time.Duration) (json
 		}
 
 		if deadline != nil && !time.Now().Before(*deadline) {
+			// One final check before declaring a timeout: a signal that
+			// committed between the lookup above and this deadline check
+			// would otherwise be misreported as missing. Ties go to the
+			// signal.
+			if stored, err := c.queue.GetResult(c.Ctx, sigID); err != nil {
+				return nil, err
+			} else if stored != nil {
+				return stored.Data, nil
+			}
 			return nil, &WorkerError{
 				Kind:    ErrSignalTimeoutW,
 				Message: fmt.Sprintf("signal %q was not delivered within the wait deadline", name),
