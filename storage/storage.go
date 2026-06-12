@@ -128,9 +128,9 @@ type QueueStats struct {
 	Retrying   uint64
 	// Waiting counts yield-parked activities: durable sleeps, signal waits,
 	// and parents awaiting children.
-	Waiting    uint64
-	Failed     uint64
-	DeadLetter uint64
+	Waiting       uint64
+	Failed        uint64
+	DeadLetter    uint64
 	ByPriority    PriorityBreakdown
 	MaxWorkers    *int
 	ActiveWorkers uint64 // distinct current_worker_id across processing rows
