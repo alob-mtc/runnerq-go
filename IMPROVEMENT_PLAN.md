@@ -140,8 +140,9 @@ already exist (idempotency table, permanent results table, lineage columns):
    fixes the signals early-wake caveat (Delay-scheduled rows are no longer woken by delivery);
    a post-park recheck closes the park race for ALL durable waits (a result committing between
    the handler's final check and the park landing previously produced no wake — a latent
-   forever-park bug for unbounded signal waits); `SuspendOnAwait` is deprecated (the starvation
-   pattern it existed for self-resolves within the await grace); `FutureFor`/`ActivityID`/
+   forever-park bug for unbounded signal waits); `SuspendOnAwait` has been removed entirely (the starvation
+   pattern it existed for self-resolves within the await grace; the dispatcher, slotHolder
+   machinery, config fields, and stress example are deleted); `FutureFor`/`ActivityID`/
    `WaitAll` ship future rehydration. Item "auto-key every spawn" is closed as won't-do:
    sequence-derived keys are fail-wrong under non-deterministic replay and payload-hash keys
    silently degrade — explicit `Step` names are the model (same conclusion as Inngest).

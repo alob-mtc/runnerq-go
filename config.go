@@ -57,40 +57,13 @@ type WorkerConfig struct {
 	// When zero, defaults to 32.
 	MaxActivityDepth uint16 `json:"max_activity_depth,omitempty"`
 
-	// SuspendOnAwait, when true, switches the engine to a semaphore-based
-	// concurrency model where ActivityFuture.GetResult releases this
-	// activity's worker slot while it waits for the child future to resolve.
-	//
-	// Deprecated: in-handler GetResult now yield-parks the parent after a
-	// short in-process grace, which frees the whole worker (goroutine and
-	// all), not just a slot — the parent-blocking-on-children starvation
-	// pattern this mode existed for self-resolves within the grace window in
-	// the default fixed-pool model. SuspendOnAwait remains functional but
-	// buys little; it and SuspendLeafActivityTypes/SuspendLeavesReserved may
-	// be removed in a future release.
-	SuspendOnAwait bool `json:"suspend_on_await,omitempty"`
-
-	// SuspendLeafActivityTypes, when non-empty together with SuspendOnAwait,
-	// reserves SuspendLeavesReserved slots for these "leaf" types — i.e. when
-	// the free-slot count drops to the reservation, the dispatcher only
-	// dequeues leaf types. Prevents the wake-up deadlock where every freed
-	// slot is immediately taken by another awakening parent and no leaf can
-	// run. Mirrors the parent/leaf split from the WORKER_MODE example
-	// pattern, but in-process.
-	SuspendLeafActivityTypes []string `json:"suspend_leaf_activity_types,omitempty"`
-
-	// SuspendLeavesReserved is the number of slots set aside for leaf
-	// activity types when at-pressure. Only meaningful with SuspendOnAwait
-	// and SuspendLeafActivityTypes set. Default 0 (no reservation).
-	SuspendLeavesReserved int `json:"suspend_leaves_reserved,omitempty"`
-
 	// Retention enables deletion of old terminal workflow trees. Nil (the
 	// default) keeps everything forever.
 	Retention *RetentionConfig `json:"retention,omitempty"`
 
 	// ShutdownGraceSeconds bounds the entire shutdown drain — worker loops,
-	// dispatchers, in-flight activity goroutines, result-storage goroutines,
-	// and worker-pool deregistration all run in parallel under this single
+	// in-flight activity goroutines, and worker-pool deregistration all run
+	// in parallel under this single
 	// budget. When the budget expires, Start() returns even if some
 	// goroutines are still in flight (those are then orphaned for the
 	// remaining process lifetime, which is fine on a SIGTERM). Default 30s.
