@@ -197,17 +197,21 @@ func (b *PostgresBackend) recordEvent(ctx context.Context, tx pgx.Tx, activityID
 	return nil
 }
 
-func (b *PostgresBackend) storeResultTx(ctx context.Context, tx pgx.Tx, activityID uuid.UUID, result *storage.ActivityResult, now time.Time) error {
+// storeResultTx persists a result row. owner is the activity whose workflow
+// tree governs this row's lifetime (equals activityID for normal results;
+// the handler's activity for Run/Sleep checkpoints) — the retention sweeper
+// deletes result rows by owner alongside the tree.
+func (b *PostgresBackend) storeResultTx(ctx context.Context, tx pgx.Tx, activityID, owner uuid.UUID, result *storage.ActivityResult, now time.Time) error {
 	stateStr := "Ok"
 	if result.State == storage.ResultErr {
 		stateStr = "Err"
 	}
 	_, err := tx.Exec(ctx, `
-		INSERT INTO runnerq_results (activity_id, queue_name, state, data, created_at)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO runnerq_results (activity_id, queue_name, state, data, created_at, owner_activity_id)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (activity_id) DO UPDATE
-		SET state = $3, data = $4, created_at = $5`,
-		activityID, b.queueName, stateStr, result.Data, now)
+		SET state = $3, data = $4, created_at = $5, owner_activity_id = $6`,
+		activityID, b.queueName, stateStr, result.Data, now, owner)
 	if err != nil {
 		return storage.NewInternalError(fmt.Sprintf("Failed to store result: %v", err))
 	}
@@ -500,7 +504,7 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 	// transaction means completion and result are atomic — a crash can't leave
 	// a completed activity with no result.
 	ar := &storage.ActivityResult{Data: result, State: storage.ResultOk}
-	if err := b.storeResultTx(ctx, tx, activityID, ar, now); err != nil {
+	if err := b.storeResultTx(ctx, tx, activityID, activityID, ar, now); err != nil {
 		return err
 	}
 
@@ -572,7 +576,7 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 			"type":      "non_retryable",
 			"failed_at": now.Format(time.RFC3339),
 		}), State: storage.ResultErr}
-		if err := b.storeResultTx(ctx, tx, activityID, res, now); err != nil {
+		if err := b.storeResultTx(ctx, tx, activityID, activityID, res, now); err != nil {
 			return false, err
 		}
 		if err := b.recordEvent(ctx, tx, activityID, storage.EventFailed, &workerID,
@@ -681,7 +685,7 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		"type":      "dead_letter",
 		"failed_at": now.Format(time.RFC3339),
 	}), State: storage.ResultErr}
-	if err := b.storeResultTx(ctx, tx, activityID, res, now); err != nil {
+	if err := b.storeResultTx(ctx, tx, activityID, activityID, res, now); err != nil {
 		return false, err
 	}
 	if err := b.recordEvent(ctx, tx, activityID, storage.EventDeadLetter, &workerID,
@@ -788,7 +792,7 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 				"type":      "dead_letter",
 				"failed_at": now.Format(time.RFC3339),
 			}), State: storage.ResultErr}
-			if err := b.storeResultTx(ctx, tx, r.id, res, now); err != nil {
+			if err := b.storeResultTx(ctx, tx, r.id, r.id, res, now); err != nil {
 				return 0, err
 			}
 			if err := b.recordEvent(ctx, tx, r.id, storage.EventDeadLetter, nil,
@@ -868,6 +872,113 @@ func (b *PostgresBackend) Yield(ctx context.Context, activityID uuid.UUID, wakeA
 	return nil
 }
 
+// cleanupLockClass namespaces the per-queue advisory lock that elects a
+// single retention sweeper across all processes. Arbitrary but stable.
+const cleanupLockClass = int32(1381913428) // "RQCT"
+
+// CleanupExpired deletes terminal workflow trees older than the policy TTLs.
+//
+// The deletion unit is a whole tree: a root that has been terminal past its
+// TTL AND has no non-terminal descendants. Deleting per-row instead would
+// corrupt retries — a parent whose completed child was individually deleted
+// would re-run that child via idempotency orphan repair. Everything tied to
+// the tree goes together: activity rows, their events, result rows (matched
+// by activity_id AND by owner_activity_id, which is how Run/Sleep checkpoint
+// rows with synthetic IDs are collected), events recorded under those
+// checkpoint IDs, and idempotency keys.
+//
+// Leadership: a per-queue advisory transaction lock makes concurrent sweepers
+// from other processes no-op (return 0) instead of contending on the same
+// trees. All cutoffs use the database clock.
+func (b *PostgresBackend) CleanupExpired(ctx context.Context, policy storage.RetentionPolicy, batchSize int) (uint64, error) {
+	if policy.Completed <= 0 && policy.Failed <= 0 {
+		return 0, nil
+	}
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return 0, storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+	}
+	defer tx.Rollback(ctx)
+
+	var leader bool
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1::int4, hashtext($2))`,
+		cleanupLockClass, b.queueName).Scan(&leader); err != nil {
+		return 0, storage.NewInternalError(fmt.Sprintf("Failed to acquire cleanup lock: %v", err))
+	}
+	if !leader {
+		return 0, nil
+	}
+
+	var deletedRoots int64
+	err = tx.QueryRow(ctx, `
+		WITH roots AS (
+			SELECT r.id
+			FROM runnerq_activities r
+			WHERE r.queue_name = $1
+			  AND r.parent_activity_id IS NULL
+			  AND (
+				(r.status = 'completed' AND $2::bigint > 0
+					AND r.completed_at < NOW() - make_interval(secs => $2))
+				OR (r.status IN ('failed', 'dead_letter') AND $3::bigint > 0
+					AND r.completed_at < NOW() - make_interval(secs => $3))
+			  )
+			  AND NOT EXISTS (
+				SELECT 1 FROM runnerq_activities c
+				WHERE c.queue_name = $1
+				  AND c.root_activity_id = r.id
+				  AND c.status NOT IN ('completed', 'failed', 'dead_letter')
+			  )
+			ORDER BY r.completed_at ASC
+			LIMIT $4
+			FOR UPDATE SKIP LOCKED
+		),
+		tree AS (
+			SELECT a.id FROM runnerq_activities a
+			JOIN roots ON a.root_activity_id = roots.id
+			WHERE a.queue_name = $1
+		),
+		del_results AS (
+			DELETE FROM runnerq_results
+			WHERE queue_name = $1
+			  AND (activity_id IN (SELECT id FROM tree)
+				OR owner_activity_id IN (SELECT id FROM tree))
+			RETURNING activity_id
+		),
+		del_events AS (
+			DELETE FROM runnerq_events
+			WHERE queue_name = $1
+			  AND (activity_id IN (SELECT id FROM tree)
+				OR activity_id IN (SELECT activity_id FROM del_results))
+		),
+		del_idem AS (
+			DELETE FROM runnerq_idempotency
+			WHERE queue_name = $1
+			  AND activity_id IN (SELECT id FROM tree)
+		),
+		del_act AS (
+			DELETE FROM runnerq_activities
+			WHERE queue_name = $1
+			  AND id IN (SELECT id FROM tree)
+		)
+		SELECT count(*) FROM roots`,
+		b.queueName,
+		int64(policy.Completed/time.Second),
+		int64(policy.Failed/time.Second),
+		batchSize).Scan(&deletedRoots)
+	if err != nil {
+		return 0, storage.NewInternalError(fmt.Sprintf("Failed to clean up expired trees: %v", err))
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, storage.NewInternalError(fmt.Sprintf("Failed to commit cleanup: %v", err))
+	}
+	return uint64(deletedRoots), nil
+}
+
 func (b *PostgresBackend) ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error) {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
@@ -924,7 +1035,7 @@ func (b *PostgresBackend) RecordSpawnLinked(ctx context.Context, childID, parent
 	return nil
 }
 
-func (b *PostgresBackend) StoreResult(ctx context.Context, activityID uuid.UUID, result storage.ActivityResult) error {
+func (b *PostgresBackend) StoreResult(ctx context.Context, activityID uuid.UUID, ownerActivityID uuid.UUID, result storage.ActivityResult) error {
 	stateStr := "Ok"
 	if result.State == storage.ResultErr {
 		stateStr = "Err"
@@ -932,6 +1043,7 @@ func (b *PostgresBackend) StoreResult(ctx context.Context, activityID uuid.UUID,
 
 	slog.Debug("Storing activity result",
 		"activity_id", activityID,
+		"owner_activity_id", ownerActivityID,
 		"state", stateStr,
 		"has_data", result.Data != nil)
 
@@ -942,7 +1054,7 @@ func (b *PostgresBackend) StoreResult(ctx context.Context, activityID uuid.UUID,
 	}
 	defer tx.Rollback(ctx)
 
-	if err := b.storeResultTx(ctx, tx, activityID, &result, now); err != nil {
+	if err := b.storeResultTx(ctx, tx, activityID, ownerActivityID, &result, now); err != nil {
 		return err
 	}
 	if err := b.recordEvent(ctx, tx, activityID, storage.EventResultStored, nil,

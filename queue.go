@@ -51,7 +51,10 @@ type activityQueue interface {
 	// the key and nothing was enqueued.
 	EnqueueIdempotent(ctx context.Context, a *activity) (*storage.IdempotencyResult, error)
 	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
-	StoreResult(ctx context.Context, activityID uuid.UUID, result activityResult) error
+	// StoreResult persists a result row. owner is the activity whose workflow
+	// tree governs the row's lifetime (the activity itself for normal results;
+	// the handler's activity for Run/Sleep checkpoints).
+	StoreResult(ctx context.Context, activityID uuid.UUID, owner uuid.UUID, result activityResult) error
 	GetResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error)
 	// WaitForResult blocks until the activity's result exists or ctx is done.
 	WaitForResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error)
@@ -235,12 +238,12 @@ func (a *backendQueueAdapter) ExtendLease(ctx context.Context, activityID uuid.U
 	return a.backend.ExtendLease(ctx, activityID, extendBy)
 }
 
-func (a *backendQueueAdapter) StoreResult(ctx context.Context, activityID uuid.UUID, result activityResult) error {
+func (a *backendQueueAdapter) StoreResult(ctx context.Context, activityID uuid.UUID, owner uuid.UUID, result activityResult) error {
 	backendResult := storage.ActivityResult{
 		Data:  result.Data,
 		State: storage.ResultState(result.State),
 	}
-	return a.backend.StoreResult(ctx, activityID, backendResult)
+	return a.backend.StoreResult(ctx, activityID, owner, backendResult)
 }
 
 func (a *backendQueueAdapter) GetResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error) {

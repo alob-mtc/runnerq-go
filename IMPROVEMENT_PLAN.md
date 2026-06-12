@@ -178,11 +178,15 @@ already exist (idempotency table, permanent results table, lineage columns):
    handler does 100 sequential round-trips); dequeue claims one row per round-trip → O(workers²)
    skip-locked scanning; no batch ack. ~20 statements / 4 transactions per successful activity
    today. Add batch claim, batch enqueue, batch ack.
-5. **Unbounded table growth.** `runnerq_activities`, `runnerq_events`, `runnerq_results`,
-   `runnerq_idempotency` are all "permanent — no TTL" (schema.go:4, 81-88, 90-91, 104-105) with no
-   archival/cleanup anywhere. ~1B event rows/day at 10k/sec. Need a retention/archival job and
-   time- or status-based partitioning. UPDATE churn on indexed columns (status flips across 5
-   partial indexes, lease_deadline_ms) means no HOT updates → bloat; tune fillfactor/autovacuum.
+5. ◐ **PARTIALLY DONE — unbounded table growth.** Retention sweeper shipped: opt-in
+   `RetentionConfig{Completed, Failed TTLs}` on the engine; the backend's `CleanupExpired`
+   deletes whole terminal workflow trees (activities + events + results — including Run/Sleep
+   checkpoint rows via the new `owner_activity_id` column — + idempotency keys) in batched
+   transactions, with per-queue advisory-lock leadership so only one engine sweeps. Tree-level
+   deletion (terminal root, no non-terminal descendants) guarantees retries never find their
+   children's results missing. Still open: time-based partitioning for very high volumes, and
+   fillfactor/autovacuum tuning for UPDATE-churn bloat (status flips across 5 partial indexes
+   are never HOT).
 6. **Suspend-mode dispatcher is single-threaded** (engine.go:421-457): serial
    acquire→dequeue→spawn caps the engine at roughly 200-500 dispatches/sec regardless of
    `MaxConcurrentActivities`.

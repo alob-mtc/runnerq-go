@@ -103,14 +103,14 @@ func (c ActivityContext) Run(name string, fn func() (json.RawMessage, error)) (j
 			// Permanent failure: checkpoint it so retries of the PARENT (for
 			// unrelated reasons) don't re-run a step that failed for good.
 			failureJSON, _ := json.Marshal(map[string]string{"error": fnErr.Error()})
-			if err := c.queue.StoreResult(c.Ctx, checkID, activityResult{Data: failureJSON, State: ResultErr}); err != nil {
+			if err := c.queue.StoreResult(c.Ctx, checkID, c.ActivityID, activityResult{Data: failureJSON, State: ResultErr}); err != nil {
 				return nil, err
 			}
 		}
 		return nil, fnErr
 	}
 
-	if err := c.queue.StoreResult(c.Ctx, checkID, activityResult{Data: out, State: ResultOk}); err != nil {
+	if err := c.queue.StoreResult(c.Ctx, checkID, c.ActivityID, activityResult{Data: out, State: ResultOk}); err != nil {
 		// The side effect happened but the checkpoint didn't commit; surface
 		// a retryable error so the attempt retries — fn will run again, which
 		// is the documented at-least-once edge.
@@ -186,7 +186,7 @@ func (c ActivityContext) Sleep(name string, d time.Duration) error {
 		cpJSON, _ := json.Marshal(map[string]time.Time{"wake_at": wakeAt})
 		// Persist BEFORE waiting, so a crash mid-sleep resumes the remainder
 		// instead of restarting the full duration.
-		if err := c.queue.StoreResult(c.Ctx, checkID, activityResult{Data: cpJSON, State: ResultOk}); err != nil {
+		if err := c.queue.StoreResult(c.Ctx, checkID, c.ActivityID, activityResult{Data: cpJSON, State: ResultOk}); err != nil {
 			return err
 		}
 	}

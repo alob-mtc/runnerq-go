@@ -84,6 +84,20 @@ type ActivityResult struct {
 	State ResultState
 }
 
+// RetentionPolicy controls how long terminal workflow trees are kept before
+// the retention sweeper deletes them (activities, events, results including
+// Run/Sleep checkpoints, and idempotency keys). A zero duration means "keep
+// forever" for that class. The deletion unit is the whole tree rooted at a
+// terminal root with no non-terminal descendants — never individual rows, so
+// a retried parent can never find its children's results missing.
+type RetentionPolicy struct {
+	// Completed applies to trees whose root finished with status completed.
+	Completed time.Duration
+	// Failed applies to trees whose root is failed or dead_letter — kept on
+	// a separate clock so operators can hold failures longer for inspection.
+	Failed time.Duration
+}
+
 // FailureKind describes how an activity failed.
 type FailureKind struct {
 	Retryable bool
@@ -256,7 +270,20 @@ type QueueStorage interface {
 	// by that worker.
 	Yield(ctx context.Context, activityID uuid.UUID, wakeAt time.Time, workerID string) error
 	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
-	StoreResult(ctx context.Context, activityID uuid.UUID, result ActivityResult) error
+	// StoreResult persists a result row. ownerActivityID is the activity
+	// whose lifetime governs the row: pass the activity's own ID for normal
+	// results, or the handler's activity ID for Run/Sleep checkpoints whose
+	// activityID is synthetic. The retention sweeper deletes result rows
+	// together with their owner's workflow tree.
+	StoreResult(ctx context.Context, activityID uuid.UUID, ownerActivityID uuid.UUID, result ActivityResult) error
+	// CleanupExpired deletes terminal workflow trees older than the policy's
+	// TTLs, up to batchSize roots per call, and returns the number of root
+	// trees deleted. Implementations must (a) only delete trees whose root is
+	// terminal AND has no non-terminal descendants, (b) delete the tree's
+	// activities, events, results (by activity AND by owner), and idempotency
+	// keys together, and (c) coordinate so concurrent sweepers don't duplicate
+	// work (returning 0 when another sweeper holds the lease is correct).
+	CleanupExpired(ctx context.Context, policy RetentionPolicy, batchSize int) (uint64, error)
 	// EnqueueIdempotent claims the activity's idempotency key AND enqueues the
 	// activity in a single atomic operation. A nil result with a nil error
 	// means the activity was enqueued (the caller MUST NOT call Enqueue

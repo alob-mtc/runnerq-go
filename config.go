@@ -1,5 +1,28 @@
 package runnerq
 
+import "time"
+
+// RetentionConfig opts the engine into deleting old terminal workflow trees.
+// Without it, activities, events, results, and idempotency keys are kept
+// forever. The deletion unit is a whole tree (terminal root with no
+// non-terminal descendants), so retries can never find their children's
+// results missing. One engine per queue sweeps at a time (advisory-lock
+// leadership in the backend); running it on every engine is safe.
+type RetentionConfig struct {
+	// Completed is how long trees whose root completed successfully are kept.
+	// Zero keeps them forever.
+	Completed time.Duration `json:"completed,omitempty"`
+	// Failed is how long trees whose root is failed or dead_letter are kept —
+	// a separate clock so failures can be held longer for inspection.
+	// Zero keeps them forever.
+	Failed time.Duration `json:"failed,omitempty"`
+	// Interval is the sweep cadence. Defaults to 1 minute.
+	Interval time.Duration `json:"interval,omitempty"`
+	// BatchSize is the max root trees deleted per sweep transaction.
+	// Defaults to 100.
+	BatchSize int `json:"batch_size,omitempty"`
+}
+
 // WorkerConfig controls queue behavior and resource usage.
 type WorkerConfig struct {
 	// QueueName is used as a prefix to avoid conflicts between different applications.
@@ -55,6 +78,10 @@ type WorkerConfig struct {
 	// activity types when at-pressure. Only meaningful with SuspendOnAwait
 	// and SuspendLeafActivityTypes set. Default 0 (no reservation).
 	SuspendLeavesReserved int `json:"suspend_leaves_reserved,omitempty"`
+
+	// Retention enables deletion of old terminal workflow trees. Nil (the
+	// default) keeps everything forever.
+	Retention *RetentionConfig `json:"retention,omitempty"`
 
 	// ShutdownGraceSeconds bounds the entire shutdown drain — worker loops,
 	// dispatchers, in-flight activity goroutines, result-storage goroutines,
