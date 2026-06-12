@@ -235,7 +235,6 @@ func TestDelayScheduledNotWokenBySignal(t *testing.T) {
 	}}
 	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("delayed", h) })
 
-	enqueuedAt := time.Now()
 	fut, err := rig.engine.GetActivityExecutor().
 		Activity("delayed").
 		Delay(4 * time.Second).
@@ -244,13 +243,23 @@ func TestDelayScheduledNotWokenBySignal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
+	// Anchor against the row's persisted schedule, not a pre-enqueue wall
+	// clock — enqueue latency must not eat into the assertion.
+	snap, err := rig.backend.GetActivity(context.Background(), fut.activityID)
+	if err != nil || snap == nil || snap.ScheduledAt == nil {
+		t.Fatalf("get scheduled activity: snap=%+v err=%v", snap, err)
+	}
+	scheduledFor := *snap.ScheduledAt
+
 	if err := rig.engine.Signal(context.Background(), fut.activityID, "poke", nil); err != nil {
 		t.Fatalf("signal: %v", err)
 	}
 
 	rig.await(t, fut.activityID, 30*time.Second)
-	ranAfter := time.UnixMilli(startedAt.Load()).Sub(enqueuedAt)
-	if ranAfter < 3500*time.Millisecond {
-		t.Fatalf("delayed activity ran %v after enqueue — the signal woke it before its Delay elapsed", ranAfter)
+	started := time.UnixMilli(startedAt.Load())
+	// Small epsilon for clock granularity between the DB schedule and the
+	// handler's app-clock timestamp.
+	if started.Before(scheduledFor.Add(-250 * time.Millisecond)) {
+		t.Fatalf("delayed activity started %v before its schedule — the signal woke it early", scheduledFor.Sub(started))
 	}
 }

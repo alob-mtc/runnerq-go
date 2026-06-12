@@ -163,6 +163,96 @@ func (b *PostgresBackend) initSchema(ctx context.Context) error {
 	if _, err := conn.Exec(ctx, schemaSql); err != nil {
 		return storage.NewInternalError(fmt.Sprintf("Failed to initialize schema: %v", err))
 	}
+
+	if err := b.ensureDequeueIndexes(ctx, conn); err != nil {
+		return err
+	}
+	return nil
+}
+
+// dequeueIndexes are the hot claim-path indexes, built CONCURRENTLY (outside
+// schemaSql) so their creation never takes the SHARE lock that would block
+// every write on runnerq_activities during the build. dropAfter names the
+// previous version, removed only once the replacement is valid.
+var dequeueIndexes = []struct {
+	name      string
+	ddl       string
+	dropAfter string
+}{
+	{
+		// Serves the single-type dequeue form: with activity_type pinned by
+		// equality, the remaining key columns match the dequeue ORDER BY
+		// exactly, so the claim is an index walk that stops at the first
+		// unlocked row.
+		name: "idx_runnerq_dequeue_effective_v2",
+		ddl: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_dequeue_effective_v2
+			ON runnerq_activities (
+				queue_name,
+				activity_type,
+				priority DESC,
+				retry_count DESC,
+				COALESCE(scheduled_at, created_at) ASC
+			)
+			WHERE status IN ('pending', 'scheduled', 'retrying', 'waiting')`,
+		dropAfter: "idx_runnerq_dequeue_effective",
+	},
+	{
+		// Serves the untyped and multi-type dequeue forms. Its key order IS
+		// the dequeue ORDER BY, so Postgres never sorts the whole eligible
+		// backlog to find the top row.
+		name: "idx_runnerq_dequeue_order_v2",
+		ddl: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_dequeue_order_v2
+			ON runnerq_activities (
+				queue_name,
+				priority DESC,
+				retry_count DESC,
+				COALESCE(scheduled_at, created_at) ASC
+			)
+			WHERE status IN ('pending', 'scheduled', 'retrying', 'waiting')`,
+		dropAfter: "idx_runnerq_dequeue_order",
+	},
+}
+
+// ensureDequeueIndexes builds the versioned dequeue indexes concurrently and
+// retires their predecessors. Runs on the schema-advisory-locked connection
+// (so concurrent boots serialize), with each statement autocommitting —
+// required, since CONCURRENTLY cannot run inside a transaction. A concurrent
+// build that failed previously leaves an INVALID index; those are detected,
+// dropped, and rebuilt. The old index is dropped only after its replacement
+// is valid, so the claim path is never left unindexed.
+func (b *PostgresBackend) ensureDequeueIndexes(ctx context.Context, conn *pgxpool.Conn) error {
+	for _, idx := range dequeueIndexes {
+		var valid *bool
+		err := conn.QueryRow(ctx, `
+			SELECT i.indisvalid
+			FROM pg_index i
+			JOIN pg_class c ON c.oid = i.indexrelid
+			WHERE c.relname = $1`, idx.name).Scan(&valid)
+		switch {
+		case err == pgx.ErrNoRows:
+			// Doesn't exist yet — build below.
+		case err != nil:
+			return storage.NewInternalError(fmt.Sprintf("Failed to inspect index %s: %v", idx.name, err))
+		case valid != nil && !*valid:
+			// Leftover of an interrupted concurrent build — drop and rebuild.
+			if _, err := conn.Exec(ctx, "DROP INDEX IF EXISTS "+pgx.Identifier{idx.name}.Sanitize()); err != nil {
+				return storage.NewInternalError(fmt.Sprintf("Failed to drop invalid index %s: %v", idx.name, err))
+			}
+		default:
+			// Exists and valid: just make sure the predecessor is gone.
+			if _, err := conn.Exec(ctx, "DROP INDEX IF EXISTS "+pgx.Identifier{idx.dropAfter}.Sanitize()); err != nil {
+				return storage.NewInternalError(fmt.Sprintf("Failed to drop superseded index %s: %v", idx.dropAfter, err))
+			}
+			continue
+		}
+
+		if _, err := conn.Exec(ctx, idx.ddl); err != nil {
+			return storage.NewInternalError(fmt.Sprintf("Failed to build index %s: %v", idx.name, err))
+		}
+		if _, err := conn.Exec(ctx, "DROP INDEX IF EXISTS "+pgx.Identifier{idx.dropAfter}.Sanitize()); err != nil {
+			return storage.NewInternalError(fmt.Sprintf("Failed to drop superseded index %s: %v", idx.dropAfter, err))
+		}
+	}
 	return nil
 }
 

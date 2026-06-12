@@ -51,6 +51,9 @@ func FutureFor(backend storage.Storage, activityID uuid.UUID) *ActivityFuture {
 func WaitAll(ctx context.Context, futures ...*ActivityFuture) ([]json.RawMessage, error) {
 	results := make([]json.RawMessage, len(futures))
 	for i, f := range futures {
+		if f == nil {
+			return nil, &WorkerError{Kind: ErrQueue, Message: fmt.Sprintf("WaitAll: future at index %d is nil", i)}
+		}
 		r, err := f.GetResult(ctx)
 		if err != nil {
 			return nil, err

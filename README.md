@@ -523,8 +523,8 @@ runnerq.SignalActivity(ctx, backend, activityID, "approval", payload)
 Signals are buffered: one delivered before the handler reaches the wait — or before the
 activity even starts — resolves instantly, including on replay. The wait deadline persists
 across parks (timeouts measure from the first wait, not per attempt). Per name, the last
-delivered payload wins. Note: delivering a signal wakes a scheduled activity early, including
-one scheduled via `Delay`.
+delivered payload wins. Delivery wakes only parked (`waiting`) activities; rows scheduled via
+`Delay` keep their schedule and see the buffered signal when they run.
 
 Semantics summary:
 
