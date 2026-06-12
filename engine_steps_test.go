@@ -1,0 +1,359 @@
+package runnerq
+
+// Integration tests for durable steps: Step() memoized spawns, ctx.Run
+// checkpoints, and ctx.Sleep durable timers (in-process and yielding).
+// Skipped unless RUNNERQ_TEST_DSN is set — see engine_shutdown_test.go.
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/alob-mtc/runnerq-go/storage"
+	"github.com/alob-mtc/runnerq-go/storage/postgres"
+)
+
+type stepsTestRig struct {
+	backend *postgres.PostgresBackend
+	engine  *WorkerEngine
+}
+
+func newStepsRig(t *testing.T, register func(e *WorkerEngine)) *stepsTestRig {
+	t.Helper()
+	dsn := os.Getenv("RUNNERQ_TEST_DSN")
+	if dsn == "" {
+		t.Skip("RUNNERQ_TEST_DSN not set; skipping integration test")
+	}
+	queueName := "t_" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+	backend, err := postgres.New(context.Background(), dsn, queueName)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	t.Cleanup(backend.Close)
+
+	engine, err := Builder().Backend(backend).QueueName(queueName).MaxWorkers(4).Build()
+	if err != nil {
+		t.Fatalf("build engine: %v", err)
+	}
+	register(engine)
+
+	startDone := make(chan error, 1)
+	go func() { startDone <- engine.Start(context.Background()) }()
+	t.Cleanup(func() {
+		engine.Stop()
+		select {
+		case err := <-startDone:
+			if err != nil {
+				t.Errorf("engine.Start: %v", err)
+			}
+		case <-time.After(35 * time.Second):
+			t.Error("engine did not stop")
+		}
+	})
+	return &stepsTestRig{backend: backend, engine: engine}
+}
+
+// await resolves an activity's result via the backend with a test deadline.
+func (r *stepsTestRig) await(t *testing.T, id uuid.UUID, within time.Duration) *storage.ActivityResult {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), within)
+	defer cancel()
+	res, err := r.backend.WaitForResult(ctx, id)
+	if err != nil {
+		t.Fatalf("await result of %s: %v", id, err)
+	}
+	return res
+}
+
+type funcHandler struct {
+	DefaultDeadLetterHandler
+	fn func(ctx ActivityContext, payload json.RawMessage) (json.RawMessage, error)
+}
+
+func (h *funcHandler) ActivityType() string { return "func" }
+func (h *funcHandler) Handle(ctx ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
+	return h.fn(ctx, payload)
+}
+
+// Step(): a retried parent must reattach to the child it already spawned and
+// get its memoized result — the child runs exactly once.
+func TestStepSpawnMemoizedAcrossParentRetry(t *testing.T) {
+	var childRuns, parentRuns atomic.Int32
+
+	child := &funcHandler{fn: func(_ ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		childRuns.Add(1)
+		return json.RawMessage(`{"reserved":true}`), nil
+	}}
+	parent := &funcHandler{fn: func(ctx ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
+		parentRuns.Add(1)
+		fut, err := ctx.ActivityExecutor.
+			Activity("reserve").
+			Step("reserve").
+			Payload(json.RawMessage(`{}`)).
+			Execute(ctx.Ctx)
+		if err != nil {
+			return nil, err
+		}
+		res, err := fut.GetResult(ctx.Ctx)
+		if err != nil {
+			return nil, err
+		}
+		if ctx.RetryCount == 0 {
+			return nil, NewRetryError("forced crash after child completed")
+		}
+		return res, nil
+	}}
+
+	rig := newStepsRig(t, func(e *WorkerEngine) {
+		e.RegisterActivity("orchestrate", parent)
+		e.RegisterActivity("reserve", child)
+	})
+
+	fut, err := rig.engine.GetActivityExecutor().
+		Activity("orchestrate").
+		Payload(json.RawMessage(`{}`)).
+		Execute(context.Background())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	res := rig.await(t, fut.activityID, 30*time.Second)
+	if res.State != storage.ResultOk {
+		t.Fatalf("parent result = %v %s, want Ok", res.State, res.Data)
+	}
+	if got := parentRuns.Load(); got != 2 {
+		t.Fatalf("parent ran %d times, want 2 (original + retry)", got)
+	}
+	if got := childRuns.Load(); got != 1 {
+		t.Fatalf("child ran %d times, want exactly 1 — the retried parent must reattach, not respawn", got)
+	}
+}
+
+// ctx.Run: the checkpointed function runs once; the retried handler gets the
+// stored result without re-executing the side effect.
+func TestRunCheckpointSurvivesRetry(t *testing.T) {
+	var fnRuns atomic.Int32
+
+	h := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		out, err := ctx.Run("charge-payment", func() (json.RawMessage, error) {
+			fnRuns.Add(1)
+			return json.RawMessage(`{"charge_id":"ch_1"}`), nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if ctx.RetryCount == 0 {
+			return nil, NewRetryError("forced crash after charge")
+		}
+		return out, nil
+	}}
+
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("pay", h) })
+
+	fut, err := rig.engine.GetActivityExecutor().
+		Activity("pay").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	res := rig.await(t, fut.activityID, 30*time.Second)
+	if res.State != storage.ResultOk || !strings.Contains(string(res.Data), "ch_1") {
+		t.Fatalf("result = %v %s, want Ok with ch_1", res.State, res.Data)
+	}
+	if got := fnRuns.Load(); got != 1 {
+		t.Fatalf("checkpointed fn ran %d times, want exactly 1 — the customer was charged %d times", got, got)
+	}
+}
+
+// ctx.Run: a NonRetryError is itself checkpointed — a handler retried for an
+// unrelated reason must NOT re-run a step that failed permanently.
+func TestRunCheckpointsPermanentFailure(t *testing.T) {
+	var fnRuns atomic.Int32
+
+	h := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		_, runErr := ctx.Run("doomed-step", func() (json.RawMessage, error) {
+			fnRuns.Add(1)
+			return nil, NewNonRetryError("card declined")
+		})
+		if ctx.RetryCount == 0 {
+			return nil, NewRetryError("forced crash; unrelated to the step")
+		}
+		// Second attempt: the stored failure must come back without fn
+		// re-running, and it must still be non-retryable.
+		if runErr == nil {
+			return nil, NewNonRetryError("expected stored step failure, got success")
+		}
+		if re, ok := runErr.(RetryableError); !ok || re.IsRetryable() {
+			return nil, NewNonRetryError("stored step failure lost its non-retryable kind")
+		}
+		return json.RawMessage(`{"observed":"stored failure"}`), nil
+	}}
+
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("doomed", h) })
+
+	fut, err := rig.engine.GetActivityExecutor().
+		Activity("doomed").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	res := rig.await(t, fut.activityID, 30*time.Second)
+	if res.State != storage.ResultOk {
+		t.Fatalf("result = %v %s, want Ok", res.State, res.Data)
+	}
+	if got := fnRuns.Load(); got != 1 {
+		t.Fatalf("failed step ran %d times, want exactly 1", got)
+	}
+}
+
+// ctx.Sleep, short form: waits in-process; a retried handler replaying past
+// an already-elapsed sleep continues immediately instead of re-waiting.
+func TestSleepResumesRemainderOnRetry(t *testing.T) {
+	var sleepDurations [2]atomic.Int64 // per-attempt time spent in Sleep
+
+	h := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		start := time.Now()
+		if err := ctx.Sleep("nap", 700*time.Millisecond); err != nil {
+			return nil, err
+		}
+		if int(ctx.RetryCount) < len(sleepDurations) {
+			sleepDurations[ctx.RetryCount].Store(int64(time.Since(start)))
+		}
+		if ctx.RetryCount == 0 {
+			return nil, NewRetryError("forced crash after sleep elapsed")
+		}
+		return json.RawMessage(`{"woke":true}`), nil
+	}}
+
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("napper", h) })
+
+	fut, err := rig.engine.GetActivityExecutor().
+		Activity("napper").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	res := rig.await(t, fut.activityID, 30*time.Second)
+	if res.State != storage.ResultOk {
+		t.Fatalf("result = %v %s, want Ok", res.State, res.Data)
+	}
+	first := time.Duration(sleepDurations[0].Load())
+	second := time.Duration(sleepDurations[1].Load())
+	if first < 600*time.Millisecond {
+		t.Fatalf("first attempt slept %v, want ~700ms", first)
+	}
+	if second > 300*time.Millisecond {
+		t.Fatalf("second attempt slept %v, want near-instant replay of an elapsed sleep", second)
+	}
+}
+
+// ctx.Sleep, margin regression: a short sleep inside a short-timeout handler
+// must wait in-process, not yield — the yield margin is capped at half the
+// remaining budget so small timeouts don't force a reschedule for every wait.
+func TestShortSleepInShortTimeoutStaysInProcess(t *testing.T) {
+	var invocations atomic.Int32
+
+	h := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		invocations.Add(1)
+		// 300ms sleep, 2s timeout: wake lands well before deadline/2.
+		if err := ctx.Sleep("blink", 300*time.Millisecond); err != nil {
+			return nil, err
+		}
+		return json.RawMessage(`{"ok":true}`), nil
+	}}
+
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("blinker", h) })
+
+	fut, err := rig.engine.GetActivityExecutor().
+		Activity("blinker").
+		Timeout(2 * time.Second).
+		Payload(json.RawMessage(`{}`)).
+		Execute(context.Background())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	res := rig.await(t, fut.activityID, 15*time.Second)
+	if res.State != storage.ResultOk {
+		t.Fatalf("result = %v %s, want Ok", res.State, res.Data)
+	}
+	if got := invocations.Load(); got != 1 {
+		t.Fatalf("handler invoked %d times, want 1 — a 300ms sleep in a 2s budget must not yield", got)
+	}
+	events, err := rig.backend.GetActivityEvents(context.Background(), fut.activityID, 100)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	for _, ev := range events {
+		if ev.EventType == storage.EventYielded {
+			t.Fatal("short in-budget sleep recorded a Yielded event")
+		}
+	}
+}
+
+// ctx.Sleep, long form: a sleep that exceeds the handler's timeout budget
+// yields — the activity parks as scheduled until the wake time, consumes NO
+// retry, and the handler resumes afterwards.
+func TestSleepYieldsBeyondTimeoutBudget(t *testing.T) {
+	var invocations atomic.Int32
+
+	h := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		invocations.Add(1)
+		// 5s sleep inside a 2s timeout: must yield, not burn the attempt.
+		if err := ctx.Sleep("cooling-off", 5*time.Second); err != nil {
+			return nil, err
+		}
+		return json.RawMessage(`{"cooled":true}`), nil
+	}}
+
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("cooler", h) })
+
+	start := time.Now()
+	fut, err := rig.engine.GetActivityExecutor().
+		Activity("cooler").
+		Timeout(2 * time.Second).
+		Payload(json.RawMessage(`{}`)).
+		Execute(context.Background())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	res := rig.await(t, fut.activityID, 30*time.Second)
+	elapsed := time.Since(start)
+	if res.State != storage.ResultOk {
+		t.Fatalf("result = %v %s, want Ok", res.State, res.Data)
+	}
+	if elapsed < 5*time.Second {
+		t.Fatalf("completed in %v — the 5s durable sleep was not honored", elapsed)
+	}
+	if got := invocations.Load(); got != 2 {
+		t.Fatalf("handler invoked %d times, want 2 (yield + resume)", got)
+	}
+
+	snap, err := rig.backend.GetActivity(context.Background(), fut.activityID)
+	if err != nil || snap == nil {
+		t.Fatalf("get activity: snap=%v err=%v", snap, err)
+	}
+	if snap.RetryCount != 0 {
+		t.Fatalf("retry_count = %d after yield, want 0 — a durable sleep must not consume retries", snap.RetryCount)
+	}
+	events, err := rig.backend.GetActivityEvents(context.Background(), fut.activityID, 100)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	sawYield := false
+	for _, ev := range events {
+		if ev.EventType == storage.EventYielded {
+			sawYield = true
+		}
+	}
+	if !sawYield {
+		t.Fatal("no Yielded event recorded")
+	}
+}

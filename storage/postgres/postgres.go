@@ -819,6 +819,55 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 	return uint64(len(reaped)), nil
 }
 
+// Yield parks a processing activity as 'scheduled' until wakeAt — a durable
+// Sleep continuation, not a failure: retry_count is untouched and started_at
+// is cleared for the next attempt. Fenced on workerID like the acks so a
+// stale worker can't park a row another worker has since reclaimed.
+func (b *PostgresBackend) Yield(ctx context.Context, activityID uuid.UUID, wakeAt time.Time, workerID string) error {
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE runnerq_activities
+		SET status = 'scheduled',
+			scheduled_at = $1,
+			last_worker_id = $2,
+			current_worker_id = NULL,
+			lease_deadline_ms = NULL,
+			started_at = NULL
+		WHERE id = $3 AND queue_name = $4
+		  AND status = 'processing'
+		  AND current_worker_id = $2`,
+		wakeAt, workerID, activityID, b.queueName)
+	if err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to yield activity: %v", err))
+	}
+	if tag.RowsAffected() == 0 {
+		return storage.NewNotFoundError(fmt.Sprintf("Activity %s is not in a claimable state for yield", activityID))
+	}
+
+	if err := b.recordEvent(ctx, tx, activityID, storage.EventYielded, &workerID,
+		toDetail(map[string]any{"wake_at": wakeAt.Format(time.RFC3339)})); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to commit yield: %v", err))
+	}
+
+	b.signalEvent()
+	// A wake time that is already due makes the row immediately runnable —
+	// wake blocked dequeuers now instead of leaving it to their next probe
+	// (mirrors signalEnqueued's fast-path for due scheduled inserts).
+	if !wakeAt.After(time.Now().UTC()) {
+		b.signalWork()
+	}
+	return nil
+}
+
 func (b *PostgresBackend) ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error) {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {

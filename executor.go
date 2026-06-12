@@ -73,6 +73,7 @@ type ActivityBuilder struct {
 	idempotencyKey *IdempotencyConfig
 	metadata       map[string]string
 	asRoot         bool
+	step           string
 }
 
 // Payload sets the JSON payload for the activity.
@@ -122,6 +123,23 @@ func (b *ActivityBuilder) IdempotencyKeyOption(key string, behavior OnDuplicate)
 	return b
 }
 
+// Step makes this spawn a named, memoized step of the calling handler. The
+// idempotency key is derived automatically from (root activity, parent
+// activity, name) with ReturnExisting behavior, so when a retried parent
+// re-issues the same spawn it gets the SAME child back instead of creating a
+// duplicate — and GetResult returns the child's stored result instantly if it
+// already completed. This is what lets a retried orchestrator fast-forward
+// through work it finished on a previous attempt.
+//
+// Contract: step names must be stable across retries and unique among this
+// parent's spawns (two spawns sharing a name resolve to one child). Only
+// valid when called from inside an activity handler; incompatible with
+// AsRoot and IdempotencyKeyOption.
+func (b *ActivityBuilder) Step(name string) *ActivityBuilder {
+	b.step = name
+	return b
+}
+
 // Metadata sets a single metadata key/value pair on the activity.
 func (b *ActivityBuilder) Metadata(key, value string) *ActivityBuilder {
 	if b.metadata == nil {
@@ -157,6 +175,14 @@ func (b *ActivityBuilder) MetadataMap(metadata map[string]string) *ActivityBuild
 func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) {
 	if b.payload == nil {
 		return nil, &WorkerError{Kind: ErrQueue, Message: "Activity payload is required"}
+	}
+	if b.step != "" {
+		if b.idempotencyKey != nil {
+			return nil, &WorkerError{Kind: ErrQueue, Message: "Step and IdempotencyKeyOption are mutually exclusive — Step derives its own key"}
+		}
+		if b.asRoot {
+			return nil, &WorkerError{Kind: ErrQueue, Message: "Step requires parent lineage and cannot be combined with AsRoot"}
+		}
 	}
 
 	hasOption := b.priority != nil || b.maxRetries != nil || b.timeout != nil || b.maxRetryDelay != nil || b.delay != nil || b.idempotencyKey != nil || len(b.metadata) > 0
@@ -202,7 +228,7 @@ func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) 
 		}
 	}
 
-	return b.wrapper.executeActivity(ctx, b.activityType, b.payload, option, b.asRoot)
+	return b.wrapper.executeActivity(ctx, b.activityType, b.payload, option, b.asRoot, b.step)
 }
 
 // WorkerEngineWrapper provides activity execution capabilities.
@@ -259,7 +285,7 @@ func (w *WorkerEngineWrapper) Activity(activityType string) *ActivityBuilder {
 	}
 }
 
-func (w *WorkerEngineWrapper) executeActivity(ctx context.Context, activityType string, payload json.RawMessage, option *ActivityOption, asRoot bool) (*ActivityFuture, error) {
+func (w *WorkerEngineWrapper) executeActivity(ctx context.Context, activityType string, payload json.RawMessage, option *ActivityOption, asRoot bool, step string) (*ActivityFuture, error) {
 	a := newActivity(activityType, payload, option)
 
 	if w.lineage != nil && !asRoot {
@@ -273,6 +299,21 @@ func (w *WorkerEngineWrapper) executeActivity(ctx context.Context, activityType 
 		a.ParentActivityID = &p
 		a.RootActivityID = w.lineage.rootID
 		a.Depth = w.lineage.childDepth
+	}
+
+	if step != "" {
+		if w.lineage == nil || asRoot {
+			return nil, &WorkerError{Kind: ErrQueue, Message: "Step is only valid when spawning from inside an activity handler"}
+		}
+		// Positional identity: a retried parent re-issuing this exact spawn
+		// derives the same key and reattaches to the existing child instead
+		// of duplicating it. The "rq:step:" prefix keeps the derived keyspace
+		// disjoint from user-supplied idempotency keys (which are suffixed
+		// with the activity type, never prefixed like this).
+		a.IdempotencyKey = &IdempotencyConfig{
+			Key:      fmt.Sprintf("rq:step:%s:%s:%s", a.RootActivityID, w.lineage.parentID, step),
+			Behavior: ReturnExisting,
+		}
 	}
 
 	activityID := a.ID

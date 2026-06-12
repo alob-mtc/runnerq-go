@@ -187,7 +187,10 @@ const (
 	EventDeadLetter ActivityEventType = "DeadLetter"
 	// EventRequeued records the reaper returning an expired-lease activity to
 	// the pending state for another attempt.
-	EventRequeued      ActivityEventType = "Requeued"
+	EventRequeued ActivityEventType = "Requeued"
+	// EventYielded records a durable Sleep parking the activity until its
+	// wake time without consuming a retry.
+	EventYielded       ActivityEventType = "Yielded"
 	EventLeaseExtended ActivityEventType = "LeaseExtended"
 	EventResultStored  ActivityEventType = "ResultStored"
 	// EventSpawnLinked records a secondary parent's link to an existing activity
@@ -245,6 +248,13 @@ type QueueStorage interface {
 	AckFailure(ctx context.Context, activityID uuid.UUID, failure FailureKind, workerID string) (bool, error)
 	ProcessScheduled(ctx context.Context) (uint64, error)
 	RequeueExpired(ctx context.Context, batchSize int) (uint64, error)
+	// Yield reschedules a processing activity to wake at wakeAt WITHOUT
+	// counting a retry — the engine uses it when a durable Sleep's wake time
+	// doesn't fit the current attempt's timeout budget. Must be fenced on
+	// workerID like AckSuccess/AckFailure (only the claiming worker may
+	// yield) and return a not-found error when the row is no longer claimed
+	// by that worker.
+	Yield(ctx context.Context, activityID uuid.UUID, wakeAt time.Time, workerID string) error
 	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
 	StoreResult(ctx context.Context, activityID uuid.UUID, result ActivityResult) error
 	// EnqueueIdempotent claims the activity's idempotency key AND enqueues the
