@@ -73,6 +73,11 @@ func (c ActivityContext) checkpointID(kind, name string) uuid.UUID {
 //
 // Step names must be stable across retries and unique within the handler.
 func (c ActivityContext) Run(name string, fn func() (json.RawMessage, error)) (json.RawMessage, error) {
+	if name == "" {
+		// An empty name would alias every unnamed Run onto one checkpoint
+		// key, replaying the wrong stored result on retry.
+		return nil, NewNonRetryError("Run requires a non-empty step name")
+	}
 	if c.queue == nil {
 		// Hand-constructed context (unit tests): no checkpoint storage.
 		return fn()
@@ -149,6 +154,11 @@ func (y *yieldSleep) Error() string {
 //
 // Step names must be stable across retries and unique within the handler.
 func (c ActivityContext) Sleep(name string, d time.Duration) error {
+	if name == "" {
+		// An empty name would alias every unnamed Sleep onto one checkpoint
+		// key, replaying the wrong wake deadline on retry.
+		return NewNonRetryError("Sleep requires a non-empty step name")
+	}
 	if c.queue == nil {
 		// Hand-constructed context (unit tests): plain in-process wait.
 		select {
@@ -188,9 +198,18 @@ func (c ActivityContext) Sleep(name string, d time.Duration) error {
 
 	// Yield when the wake wouldn't comfortably precede the handler deadline:
 	// burning the rest of this attempt on a wait that ends in a timeout-retry
-	// would consume retry budget and hold a goroutine for nothing.
-	if deadline, ok := c.Ctx.Deadline(); ok && wakeAt.After(deadline.Add(-yieldMargin)) {
-		return &yieldSleep{wakeAt: wakeAt, step: name}
+	// would consume retry budget and hold a goroutine for nothing. The margin
+	// is capped at half the remaining budget so short-timeout handlers (≤ 2×
+	// yieldMargin) can still take short sleeps in-process instead of paying a
+	// reschedule round-trip for every wait.
+	if deadline, ok := c.Ctx.Deadline(); ok {
+		margin := min(yieldMargin, time.Until(deadline)/2)
+		if margin < 0 {
+			margin = 0
+		}
+		if wakeAt.After(deadline.Add(-margin)) {
+			return &yieldSleep{wakeAt: wakeAt, step: name}
+		}
 	}
 
 	if h := suspendFromContext(c.Ctx); h != nil {

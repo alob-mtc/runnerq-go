@@ -48,7 +48,10 @@ func newStepsRig(t *testing.T, register func(e *WorkerEngine)) *stepsTestRig {
 	t.Cleanup(func() {
 		engine.Stop()
 		select {
-		case <-startDone:
+		case err := <-startDone:
+			if err != nil {
+				t.Errorf("engine.Start: %v", err)
+			}
 		case <-time.After(35 * time.Second):
 			t.Error("engine did not stop")
 		}
@@ -247,6 +250,50 @@ func TestSleepResumesRemainderOnRetry(t *testing.T) {
 	}
 	if second > 300*time.Millisecond {
 		t.Fatalf("second attempt slept %v, want near-instant replay of an elapsed sleep", second)
+	}
+}
+
+// ctx.Sleep, margin regression: a short sleep inside a short-timeout handler
+// must wait in-process, not yield — the yield margin is capped at half the
+// remaining budget so small timeouts don't force a reschedule for every wait.
+func TestShortSleepInShortTimeoutStaysInProcess(t *testing.T) {
+	var invocations atomic.Int32
+
+	h := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		invocations.Add(1)
+		// 300ms sleep, 2s timeout: wake lands well before deadline/2.
+		if err := ctx.Sleep("blink", 300*time.Millisecond); err != nil {
+			return nil, err
+		}
+		return json.RawMessage(`{"ok":true}`), nil
+	}}
+
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("blinker", h) })
+
+	fut, err := rig.engine.GetActivityExecutor().
+		Activity("blinker").
+		Timeout(2 * time.Second).
+		Payload(json.RawMessage(`{}`)).
+		Execute(context.Background())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	res := rig.await(t, fut.activityID, 15*time.Second)
+	if res.State != storage.ResultOk {
+		t.Fatalf("result = %v %s, want Ok", res.State, res.Data)
+	}
+	if got := invocations.Load(); got != 1 {
+		t.Fatalf("handler invoked %d times, want 1 — a 300ms sleep in a 2s budget must not yield", got)
+	}
+	events, err := rig.backend.GetActivityEvents(context.Background(), fut.activityID, 100)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	for _, ev := range events {
+		if ev.EventType == storage.EventYielded {
+			t.Fatal("short in-budget sleep recorded a Yielded event")
+		}
 	}
 }
 

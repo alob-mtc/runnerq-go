@@ -859,6 +859,12 @@ func (b *PostgresBackend) Yield(ctx context.Context, activityID uuid.UUID, wakeA
 	}
 
 	b.signalEvent()
+	// A wake time that is already due makes the row immediately runnable —
+	// wake blocked dequeuers now instead of leaving it to their next probe
+	// (mirrors signalEnqueued's fast-path for due scheduled inserts).
+	if !wakeAt.After(time.Now().UTC()) {
+		b.signalWork()
+	}
 	return nil
 }
 

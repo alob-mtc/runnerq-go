@@ -463,9 +463,11 @@ across retries and unique within the handler.
 
 ```go
 func (h *FulfillOrderHandler) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
-	// Checkpointed side effect: runs AT MOST ONCE per recorded success.
-	// A retried handler gets the stored receipt back instantly — the
-	// customer is never charged twice.
+	// Checkpointed side effect: once a success is recorded, retried
+	// handlers get the stored receipt back instantly instead of charging
+	// again. (One documented edge: a crash between the charge and the
+	// checkpoint commit re-runs fn — pass a provider idempotency key for
+	// true exactly-once.)
 	receipt, err := ctx.Run("charge-payment", func() (json.RawMessage, error) {
 		return chargeCustomer(payload) // your non-idempotent call
 	})
@@ -490,10 +492,10 @@ func (h *FulfillOrderHandler) Handle(ctx runnerq.ActivityContext, payload json.R
 	}
 
 	// Durable timer: the wake deadline persists, so a crash or redeploy
-	// mid-sleep resumes with only the remainder. Sleeps longer than the
-	// handler's timeout budget YIELD — the activity parks as scheduled
-	// (releasing the worker) without consuming a retry, then resumes.
-	// Always propagate Sleep's error unchanged.
+	// mid-sleep resumes with only the remainder. A sleep whose wake time
+	// wouldn't land safely before the handler's deadline YIELDS — the
+	// activity parks as scheduled (releasing the worker) without consuming
+	// a retry, then resumes. Always propagate Sleep's error unchanged.
 	if err := ctx.Sleep("cooling-off", 24*time.Hour); err != nil {
 		return nil, err
 	}
@@ -508,7 +510,7 @@ Semantics summary:
 |---|---|---|
 | `ctx.Run(name, fn)` | Stored success or permanent failure returned without re-running `fn` | Retryable errors re-run; crash between `fn` and checkpoint re-runs (at-least-once) |
 | `.Step(name)` spawn | Same child returned; memoized result resolves instantly | Incompatible with `AsRoot`/`IdempotencyKeyOption`; handler-context only |
-| `ctx.Sleep(name, d)` | Waits only the remainder; elapsed sleeps return immediately | Long sleeps yield: no retry consumed, worker released |
+| `ctx.Sleep(name, d)` | Waits only the remainder; elapsed sleeps return immediately | Wakes that wouldn't land safely before the handler deadline yield: no retry consumed, worker released |
 
 ## Metrics and Monitoring
 
