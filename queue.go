@@ -41,6 +41,9 @@ type activityQueue interface {
 	MarkFailed(ctx context.Context, a *activity, errorMessage string, retryable bool, workerID string) (bool, error)
 	ScheduleActivity(ctx context.Context, a *activity) error
 	ProcessScheduledActivities(ctx context.Context) ([]*activity, error)
+	// Yield parks a processing activity as scheduled until wakeAt without
+	// consuming a retry. Used by durable Sleep.
+	Yield(ctx context.Context, a *activity, wakeAt time.Time, workerID string) error
 	RequeueExpired(ctx context.Context, maxToProcess int) (uint64, error)
 	// EnqueueIdempotent atomically claims the activity's idempotency key and
 	// enqueues it. A nil result means the activity was enqueued; callers must
@@ -217,6 +220,10 @@ func (a *backendQueueAdapter) ProcessScheduledActivities(ctx context.Context) ([
 
 func (a *backendQueueAdapter) RequeueExpired(ctx context.Context, maxToProcess int) (uint64, error) {
 	return a.backend.RequeueExpired(ctx, maxToProcess)
+}
+
+func (a *backendQueueAdapter) Yield(ctx context.Context, act *activity, wakeAt time.Time, workerID string) error {
+	return a.backend.Yield(ctx, act.ID, wakeAt, workerID)
 }
 
 func (a *backendQueueAdapter) EnqueueIdempotent(ctx context.Context, act *activity) (*storage.IdempotencyResult, error) {

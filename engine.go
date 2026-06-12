@@ -3,6 +3,7 @@ package runnerq
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -548,12 +549,22 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 		ParentActivityID: act.ParentActivityID,
 		RootActivityID:   act.RootActivityID,
 		Depth:            act.Depth,
+		queue:            e.queue,
 	}
 
 	payloadForDL := make(json.RawMessage, len(act.Payload))
 	copy(payloadForDL, act.Payload)
 
 	result, handlerErr := e.safeHandle(handler, actCtx, act.Payload)
+
+	// A yielding durable Sleep is not a failure: park the activity until its
+	// wake time without consuming a retry. Checked before the timeout so a
+	// yield that raced the deadline is still honored as a yield.
+	var ys *yieldSleep
+	if errors.As(handlerErr, &ys) {
+		e.handleYield(ctx, act, ys, workerLabel, workerID, activityID, activityType)
+		return
+	}
 
 	// Check if we timed out
 	if timeoutCtx.Err() == context.DeadlineExceeded {
@@ -614,6 +625,23 @@ func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result 
 	}
 	e.metrics.IncCounter("activity_completed", 1)
 	slog.Info("Activity completed successfully", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType)
+}
+
+// handleYield parks a sleeping activity as scheduled until its wake time.
+// On failure the row simply stays processing: its lease expires, the reaper
+// requeues it, and the handler replays to the same Sleep — degraded latency
+// and one consumed retry, not lost work.
+func (e *WorkerEngine) handleYield(ctx context.Context, act *activity, ys *yieldSleep, workerLabel string, workerID int, activityID any, activityType string) {
+	if err := e.queue.Yield(ctx, act, ys.wakeAt, workerLabel); err != nil {
+		slog.Error("Failed to park yielding activity; lease expiry will recover it",
+			"worker_id", workerID, "activity_id", activityID, "activity_type", activityType,
+			"wake_at", ys.wakeAt, "error", err)
+		return
+	}
+	e.metrics.IncCounter("activity_yielded", 1)
+	slog.Debug("Activity yielded for durable sleep",
+		"worker_id", workerID, "activity_id", activityID, "activity_type", activityType,
+		"step", ys.step, "wake_at", ys.wakeAt)
 }
 
 func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity, handler ActivityHandler, actCtx ActivityContext, payloadForDL json.RawMessage, reason string, workerLabel string, workerID int, activityID any, activityType string) {

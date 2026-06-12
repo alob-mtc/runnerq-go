@@ -107,29 +107,39 @@ Not Temporal-style full event-sourced replay — that replaces the current core 
 Step memoization delivers ~90% of user-visible durability semantics on top of building blocks that
 already exist (idempotency table, permanent results table, lineage columns):
 
-1. **Auto-key every child spawn** as `(root_activity_id, parent_activity_id, step_seq_or_name)`
-   with `ReturnExisting` behavior. On parent retry the handler re-runs, re-issues identical
-   spawns, each dedupes against the existing child, and `GetResult` returns the memoized result
-   instantly — the parent fast-forwards through completed steps. Determinism requirement becomes
-   the mild Inngest-style one (same step names/order across retries), not full replay determinism.
-2. **`ctx.Run(name, fn)`** — checkpoint arbitrary local side effects into the results table the
-   same way (covers non-activity work between spawns).
-3. **`ctx.Sleep(d)`** — durable timer as a memoized scheduled child. Today the only timer is
-   spawn-time `Delay` (executor.go:120-123).
+1. ✅ **DONE — memoized step spawns.** `ActivityBuilder.Step(name)` derives the idempotency key
+   `(root_activity_id, parent_activity_id, name)` with `ReturnExisting`: a retried parent
+   re-issues identical spawns, each reattaches to the existing child, and `GetResult` returns
+   the memoized result instantly — the parent fast-forwards through completed steps.
+   Determinism contract is the mild Inngest-style one (stable step names across retries, unique
+   per parent), not full replay determinism. (Step is opt-in per spawn; making lineage-keyed
+   dedup the default for ALL spawns remains open.)
+2. ✅ **DONE — `ctx.Run(name, fn)`.** Checkpoints local side effects into the results table
+   under a UUIDv5 of (activity ID, step name): success and permanent failure are both stored
+   and replayed; retryable failures re-run. At-least-once with at-most-once-per-recorded-success
+   (a crash between fn and the checkpoint commit re-runs fn — documented).
+3. ✅ **DONE — `ctx.Sleep(name, d)`.** Durable timer: the wake deadline persists as a checkpoint,
+   so a crashed/redeployed handler resumes with only the remainder. Sleeps that fit the handler's
+   timeout budget wait in-process (releasing the suspend slot); longer sleeps YIELD — a new
+   fenced `Yield` storage op parks the row as scheduled until the wake time WITHOUT consuming
+   retry_count, and the handler resumes after the wake (records an `EventYielded`).
 4. **Signals** — awaitable external-event rows; no API exists today to deliver data into a running
    workflow.
 5. **Decouple parent lifetime from a single lease (the largest piece).** Park the parent as a
    `waiting` status row when all awaited children are pending; re-dispatch it on child completion
    instead of holding a goroutine + lease for the whole await. This replaces the suspend.go
    slot-juggling machinery and simultaneously fixes the unbounded-goroutine growth and waker/
-   dispatcher slot races (suspend.go:55-68 vs engine.go:424).
+   dispatcher slot races (suspend.go:55-68 vs engine.go:424). The Yield mechanism from item 3 is
+   a template: parking-and-resuming already works for timers; this extends it to child awaits.
 
 ### Also required for the category
 - **Cancellation API** — none exists at any layer (storage, inspector, engine). Add cancel with
   best-effort propagation to descendants via `root_activity_id`.
-- **`ctx.Heartbeat()`** — `ExtendLease` is fully plumbed (queue.go:218-220, postgres.go:618-651)
-  but never called and not exposed to handlers; long activities are silently reaped and
-  double-executed. Add a worker/fencing guard to its WHERE clause when exposing it.
+- **`ctx.Heartbeat()` — deliberately deferred.** Dequeue already sets the lease to
+  `max(default, timeout+10s)`, so the lease never expires before the activity timeout and a
+  heartbeat that only extends the lease buys nothing today. It becomes meaningful only with a
+  rethought long-activity timeout model (heartbeat-refreshed deadlines instead of one fixed
+  timeout); do it then, with a worker-fence guard added to ExtendLease's WHERE clause.
 - **Engine-native cron/schedules** — the console Schedules tab only lists rows the user tagged
   `metadata.source='cron'` (postgres.go:1255-1274); nothing in core creates them.
 - **Future rehydration** — `ActivityFuture` fields are package-private (executor.go:21-24); a

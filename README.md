@@ -454,6 +454,62 @@ func (h *OrderProcessingHandler) Handle(ctx runnerq.ActivityContext, payload jso
 - **Scheduling**: Schedule activities for future execution
 - **Fluent API**: Clean, readable activity execution with method chaining
 
+## Durable Steps
+
+Orchestrator handlers re-run **from the top** whenever they are retried (crash, timeout, deploy).
+Durable steps make retries cheap and safe: completed work is checkpointed, and a retried handler
+fast-forwards through it instead of redoing it. The only contract is that step names are stable
+across retries and unique within the handler.
+
+```go
+func (h *FulfillOrderHandler) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
+	// Checkpointed side effect: runs AT MOST ONCE per recorded success.
+	// A retried handler gets the stored receipt back instantly — the
+	// customer is never charged twice.
+	receipt, err := ctx.Run("charge-payment", func() (json.RawMessage, error) {
+		return chargeCustomer(payload) // your non-idempotent call
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Memoized child spawn: Step() derives an idempotency key from
+	// (root, parent, "reserve"), so a retried parent reattaches to the SAME
+	// child instead of spawning a duplicate, and GetResult returns the
+	// child's stored result immediately if it already completed.
+	fut, err := ctx.ActivityExecutor.
+		Activity("reserve_inventory").
+		Step("reserve").
+		Payload(payload).
+		Execute(ctx.Ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := fut.GetResult(ctx.Ctx); err != nil {
+		return nil, err
+	}
+
+	// Durable timer: the wake deadline persists, so a crash or redeploy
+	// mid-sleep resumes with only the remainder. Sleeps longer than the
+	// handler's timeout budget YIELD — the activity parks as scheduled
+	// (releasing the worker) without consuming a retry, then resumes.
+	// Always propagate Sleep's error unchanged.
+	if err := ctx.Sleep("cooling-off", 24*time.Hour); err != nil {
+		return nil, err
+	}
+
+	return json.Marshal(map[string]string{"status": "fulfilled"})
+}
+```
+
+Semantics summary:
+
+| Primitive | On retry/replay | Notes |
+|---|---|---|
+| `ctx.Run(name, fn)` | Stored success or permanent failure returned without re-running `fn` | Retryable errors re-run; crash between `fn` and checkpoint re-runs (at-least-once) |
+| `.Step(name)` spawn | Same child returned; memoized result resolves instantly | Incompatible with `AsRoot`/`IdempotencyKeyOption`; handler-context only |
+| `ctx.Sleep(name, d)` | Waits only the remainder; elapsed sleeps return immediately | Long sleeps yield: no retry consumed, worker released |
+
 ## Metrics and Monitoring
 
 RunnerQ provides comprehensive metrics collection through the `MetricsSink` interface, allowing you to integrate with your preferred monitoring system.
