@@ -33,13 +33,20 @@ type activityResult struct {
 type activityQueue interface {
 	Enqueue(ctx context.Context, a *activity) error
 	Dequeue(ctx context.Context, timeout time.Duration, workerID string) (*activity, error)
-	MarkCompleted(ctx context.Context, a *activity, workerID string) error
+	// MarkCompleted marks an activity as completed and persists its result
+	// atomically with the status flip. result may be nil (handler returned no
+	// data) — a result row is still written so awaiting parents resolve.
+	MarkCompleted(ctx context.Context, a *activity, result json.RawMessage, workerID string) error
 	// MarkFailed marks an activity as failed. Returns true if moved to dead letter queue.
 	MarkFailed(ctx context.Context, a *activity, errorMessage string, retryable bool, workerID string) (bool, error)
 	ScheduleActivity(ctx context.Context, a *activity) error
 	ProcessScheduledActivities(ctx context.Context) ([]*activity, error)
 	RequeueExpired(ctx context.Context, maxToProcess int) (uint64, error)
-	EvaluateIdempotencyRule(ctx context.Context, a *activity) (*storage.IdempotencyResult, error)
+	// EnqueueIdempotent atomically claims the activity's idempotency key and
+	// enqueues it. A nil result means the activity was enqueued; callers must
+	// not Enqueue separately. A non-nil result means an existing activity owns
+	// the key and nothing was enqueued.
+	EnqueueIdempotent(ctx context.Context, a *activity) (*storage.IdempotencyResult, error)
 	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
 	StoreResult(ctx context.Context, activityID uuid.UUID, result activityResult) error
 	GetResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error)
@@ -175,8 +182,8 @@ func (a *backendQueueAdapter) Dequeue(ctx context.Context, timeout time.Duration
 	return queuedToActivity(q), nil
 }
 
-func (a *backendQueueAdapter) MarkCompleted(ctx context.Context, act *activity, workerID string) error {
-	return a.backend.AckSuccess(ctx, act.ID, nil, workerID)
+func (a *backendQueueAdapter) MarkCompleted(ctx context.Context, act *activity, result json.RawMessage, workerID string) error {
+	return a.backend.AckSuccess(ctx, act.ID, result, workerID)
 }
 
 func (a *backendQueueAdapter) MarkFailed(ctx context.Context, act *activity, errorMessage string, retryable bool, workerID string) (bool, error) {
@@ -210,9 +217,9 @@ func (a *backendQueueAdapter) RequeueExpired(ctx context.Context, maxToProcess i
 	return a.backend.RequeueExpired(ctx, maxToProcess)
 }
 
-func (a *backendQueueAdapter) EvaluateIdempotencyRule(ctx context.Context, act *activity) (*storage.IdempotencyResult, error) {
+func (a *backendQueueAdapter) EnqueueIdempotent(ctx context.Context, act *activity) (*storage.IdempotencyResult, error) {
 	queued := activityToQueued(act)
-	return a.backend.CheckIdempotency(ctx, &queued)
+	return a.backend.EnqueueIdempotent(ctx, &queued)
 }
 
 func (a *backendQueueAdapter) ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error) {

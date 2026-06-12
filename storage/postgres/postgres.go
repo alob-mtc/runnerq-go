@@ -216,6 +216,27 @@ func strPtr(s string) *string { return &s }
 // ============================================================================
 
 func (b *PostgresBackend) Enqueue(ctx context.Context, a storage.QueuedActivity) error {
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+	}
+	defer tx.Rollback(ctx)
+
+	if err := b.enqueueInTx(ctx, tx, &a); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return storage.NewInternalError(fmt.Sprintf("Failed to commit enqueue: %v", err))
+	}
+
+	return nil
+}
+
+// enqueueInTx inserts the activity row and its lifecycle event inside the
+// caller's transaction, so callers can make the enqueue atomic with other
+// writes (e.g. the idempotency-key claim in EnqueueIdempotent).
+func (b *PostgresBackend) enqueueInTx(ctx context.Context, tx pgx.Tx, a *storage.QueuedActivity) error {
 	status := "pending"
 	if a.ScheduledAt != nil {
 		status = "scheduled"
@@ -230,12 +251,6 @@ func (b *PostgresBackend) Enqueue(ctx context.Context, a storage.QueuedActivity)
 	if a.IdempotencyKey != nil {
 		idempotencyKey = &a.IdempotencyKey.Key
 	}
-
-	tx, err := b.pool.Begin(ctx)
-	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
-	}
-	defer tx.Rollback(ctx)
 
 	rootID := a.RootActivityID
 	if rootID == (uuid.UUID{}) {
@@ -274,21 +289,10 @@ func (b *PostgresBackend) Enqueue(ctx context.Context, a storage.QueuedActivity)
 		})
 	}
 
-	if err := b.recordEvent(ctx, tx, a.ID, eventType, nil, detail); err != nil {
-		return err
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to commit enqueue: %v", err))
-	}
-
-	return nil
+	return b.recordEvent(ctx, tx, a.ID, eventType, nil, detail)
 }
 
 func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, _ time.Duration, activityTypes []string) (*storage.QueuedActivity, error) {
-	now := time.Now().UTC()
-	nowMS := now.UnixMilli()
-
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
 		return nil, storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
@@ -305,20 +309,25 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, _ time.D
 	// via a follow-up ExtendLease call for activities whose timeout exceeded
 	// the default lease — every dequeue paid for two SQL round trips on the
 	// hot worker loop. Folded into the single UPDATE here.
+	//
+	// All time arithmetic uses the DATABASE clock (NOW()), never the caller's:
+	// lease deadlines set here are compared against NOW() in RequeueExpired,
+	// so with app clocks a fast-clocked reaper node would systematically
+	// reclaim other nodes' live leases and double-execute their activities.
 	row := tx.QueryRow(ctx, `
 		UPDATE runnerq_activities
 		SET status = 'processing',
 			current_worker_id = $1,
-			started_at = $2,
-			lease_deadline_ms = $3 + GREATEST($4::bigint, (timeout_seconds + 10) * 1000)
+			started_at = NOW(),
+			lease_deadline_ms = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint + GREATEST($2::bigint, (timeout_seconds + 10) * 1000)
 		WHERE id = (
 			SELECT id FROM runnerq_activities
-			WHERE queue_name = $5
+			WHERE queue_name = $3
 			  AND (
 				status = 'pending'
-				OR (status IN ('scheduled', 'retrying') AND scheduled_at <= $6)
+				OR (status IN ('scheduled', 'retrying') AND scheduled_at <= NOW())
 			  )
-			  AND ($7::text[] IS NULL OR activity_type = ANY($7))
+			  AND ($4::text[] IS NULL OR activity_type = ANY($4))
 			ORDER BY
 				priority DESC,
 				retry_count DESC,
@@ -330,7 +339,7 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, _ time.D
 			timeout_seconds, retry_delay_seconds, max_retry_delay_seconds,
 			scheduled_at, metadata, idempotency_key, created_at,
 			parent_activity_id, root_activity_id, depth, lease_deadline_ms`,
-		workerID, now, nowMS, b.defaultLeaseMS, b.queueName, now, types)
+		workerID, b.defaultLeaseMS, b.queueName, types)
 
 	var ar activityRow
 	var leaseDeadlineMS int64
@@ -397,21 +406,21 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 		return storage.NewInternalError(fmt.Sprintf("Failed to ack success: %v", err))
 	}
 
-	if result != nil {
-		ar := &storage.ActivityResult{Data: result, State: storage.ResultOk}
-		if err := b.storeResultTx(ctx, tx, activityID, ar, now); err != nil {
-			return err
-		}
+	// Always persist a result row, even when result is nil: awaiting parents
+	// poll runnerq_results for the row's existence, so a completed activity
+	// without one would hang them until their own timeout. Storing it in this
+	// transaction means completion and result are atomic — a crash can't leave
+	// a completed activity with no result.
+	ar := &storage.ActivityResult{Data: result, State: storage.ResultOk}
+	if err := b.storeResultTx(ctx, tx, activityID, ar, now); err != nil {
+		return err
 	}
 
 	actTypeStr := ""
 	if actType != nil {
 		actTypeStr = *actType
 	}
-	detailMap := map[string]any{"activity_type": actTypeStr}
-	if result != nil {
-		detailMap["result_stored"] = true
-	}
+	detailMap := map[string]any{"activity_type": actTypeStr, "result_stored": true}
 
 	if err := b.recordEvent(ctx, tx, activityID, storage.EventCompleted, &workerID, toDetail(detailMap)); err != nil {
 		return err
@@ -468,7 +477,11 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 			return false, storage.NewInternalError(fmt.Sprintf("Failed to mark as failed: %v", err))
 		}
 
-		res := &storage.ActivityResult{Data: toDetail(map[string]any{"error": errorMessage}), State: storage.ResultErr}
+		res := &storage.ActivityResult{Data: toDetail(map[string]any{
+			"error":     errorMessage,
+			"type":      "non_retryable",
+			"failed_at": now.Format(time.RFC3339),
+		}), State: storage.ResultErr}
 		if err := b.storeResultTx(ctx, tx, activityID, res, now); err != nil {
 			return false, err
 		}
@@ -505,6 +518,9 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		if retryDelay > maxCap {
 			retryDelay = maxCap
 		}
+		// Estimate for the event detail only — the authoritative scheduled_at
+		// is computed from the database clock in the UPDATE below, so retry
+		// timing is immune to app-clock skew (dequeue compares it to NOW()).
 		scheduledAt := now.Add(time.Duration(retryDelay) * time.Second)
 		newRetryCount := ar.retryCount + 1
 
@@ -518,7 +534,7 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 			UPDATE runnerq_activities
 			SET status = 'retrying',
 				retry_count = retry_count + 1,
-				scheduled_at = $1,
+				scheduled_at = NOW() + make_interval(secs => $1),
 				last_error = $2,
 				last_error_at = $3,
 				last_worker_id = $4,
@@ -526,7 +542,7 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 				lease_deadline_ms = NULL,
 				started_at = NULL
 			WHERE id = $5 AND queue_name = $6 AND status = 'processing' AND current_worker_id = $4`,
-			scheduledAt, errorMessage, now, workerID, activityID, b.queueName)
+			retryDelay, errorMessage, now, workerID, activityID, b.queueName)
 		if err != nil {
 			return false, storage.NewInternalError(fmt.Sprintf("Failed to schedule retry: %v", err))
 		}
@@ -562,7 +578,11 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		return false, storage.NewInternalError(fmt.Sprintf("Failed to move to DLQ: %v", err))
 	}
 
-	res := &storage.ActivityResult{Data: toDetail(map[string]any{"error": errorMessage}), State: storage.ResultErr}
+	res := &storage.ActivityResult{Data: toDetail(map[string]any{
+		"error":     errorMessage,
+		"type":      "dead_letter",
+		"failed_at": now.Format(time.RFC3339),
+	}), State: storage.ResultErr}
 	if err := b.storeResultTx(ctx, tx, activityID, res, now); err != nil {
 		return false, err
 	}
@@ -587,17 +607,35 @@ func (b *PostgresBackend) SchedulesNatively() bool {
 }
 
 func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (uint64, error) {
-	nowMS := time.Now().UTC().UnixMilli()
+	now := time.Now().UTC()
+	const leaseExpiredError = "lease expired before completion; worker presumed crashed or wedged"
 
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return 0, storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+	}
+	defer tx.Rollback(ctx)
+
+	// A lease expiry counts as a failed attempt: retry_count is incremented
+	// and, when retries are exhausted (same rule as AckFailure's canRetry),
+	// the row goes to dead_letter instead of pending. Without this, an
+	// activity whose handler crashes the whole process is reclaimed and
+	// re-crashes workers forever without ever reaching the DLQ.
+	//
 	// started_at is reset to NULL alongside the status flip back to pending
 	// because it carries "when did the current/last attempt start". Leaving
 	// the previous attempt's value in place makes pending rows look like
-	// they're already running (GetActivity / console snapshot misleads
-	// readers, even though no sort uses started_at on pending rows). The
-	// next Dequeue will populate started_at fresh for the new attempt.
-	tag, err := b.pool.Exec(ctx, `
+	// they're already running. The next Dequeue will populate started_at
+	// fresh for the new attempt.
+	rows, err := tx.Query(ctx, `
 		UPDATE runnerq_activities
-		SET status = 'pending',
+		SET retry_count = retry_count + 1,
+			status = CASE WHEN max_retries > 0 AND retry_count + 1 >= max_retries
+				THEN 'dead_letter' ELSE 'pending' END,
+			completed_at = CASE WHEN max_retries > 0 AND retry_count + 1 >= max_retries
+				THEN $3::timestamptz ELSE completed_at END,
+			last_error = $4,
+			last_error_at = $3,
 			current_worker_id = NULL,
 			lease_deadline_ms = NULL,
 			started_at = NULL
@@ -605,49 +643,106 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 			SELECT id FROM runnerq_activities
 			WHERE queue_name = $1
 			  AND status = 'processing'
-			  AND lease_deadline_ms < $2
-			LIMIT $3
+			  AND lease_deadline_ms < (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
+			LIMIT $2
 			FOR UPDATE SKIP LOCKED
-		)`, b.queueName, nowMS, batchSize)
+		)
+		RETURNING id, status, retry_count`,
+		b.queueName, batchSize, now, leaseExpiredError)
 	if err != nil {
 		return 0, storage.NewInternalError(fmt.Sprintf("Failed to requeue expired: %v", err))
 	}
-	return uint64(tag.RowsAffected()), nil
+
+	type reapedRow struct {
+		id         uuid.UUID
+		deadLetter bool
+		retryCount int32
+	}
+	var reaped []reapedRow
+	for rows.Next() {
+		var r reapedRow
+		var status string
+		if err := rows.Scan(&r.id, &status, &r.retryCount); err != nil {
+			rows.Close()
+			return 0, storage.NewInternalError(fmt.Sprintf("Failed to scan requeued row: %v", err))
+		}
+		r.deadLetter = status == "dead_letter"
+		reaped = append(reaped, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, storage.NewInternalError(fmt.Sprintf("Failed to read requeued rows: %v", err))
+	}
+	if len(reaped) == 0 {
+		return 0, nil
+	}
+
+	for _, r := range reaped {
+		if r.deadLetter {
+			// Store an error result so any parent awaiting this activity
+			// resolves instead of polling until its own timeout. Note the
+			// engine-side OnDeadLetter hook does not fire for reaper
+			// dead-letters — there is no live handler to call it on.
+			res := &storage.ActivityResult{Data: toDetail(map[string]any{
+				"error":     leaseExpiredError,
+				"type":      "dead_letter",
+				"failed_at": now.Format(time.RFC3339),
+			}), State: storage.ResultErr}
+			if err := b.storeResultTx(ctx, tx, r.id, res, now); err != nil {
+				return 0, err
+			}
+			if err := b.recordEvent(ctx, tx, r.id, storage.EventDeadLetter, nil,
+				toDetail(map[string]any{"error": leaseExpiredError, "reason": "lease_expired"})); err != nil {
+				return 0, err
+			}
+			continue
+		}
+		if err := b.recordEvent(ctx, tx, r.id, storage.EventRequeued, nil,
+			toDetail(map[string]any{"retry_count": r.retryCount, "reason": "lease_expired"})); err != nil {
+			return 0, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, storage.NewInternalError(fmt.Sprintf("Failed to commit requeue expired: %v", err))
+	}
+	return uint64(len(reaped)), nil
 }
 
 func (b *PostgresBackend) ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error) {
-	newDeadline := time.Now().UTC().Add(extendBy)
-
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
 		return false, storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
 	}
 	defer tx.Rollback(ctx)
 
-	tag, err := tx.Exec(ctx, `
+	// Deadline computed from the database clock — see Dequeue for why lease
+	// arithmetic must never use the caller's clock.
+	var newDeadlineMS int64
+	err = tx.QueryRow(ctx, `
 		UPDATE runnerq_activities
-		SET lease_deadline_ms = $1
-		WHERE id = $2 AND queue_name = $3 AND status = 'processing'`,
-		newDeadline.UnixMilli(), activityID, b.queueName)
+		SET lease_deadline_ms = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint + $1
+		WHERE id = $2 AND queue_name = $3 AND status = 'processing'
+		RETURNING lease_deadline_ms`,
+		extendBy.Milliseconds(), activityID, b.queueName).Scan(&newDeadlineMS)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			return false, nil
+		}
 		return false, storage.NewInternalError(fmt.Sprintf("Failed to extend lease: %v", err))
 	}
 
-	if tag.RowsAffected() > 0 {
-		if err := b.recordEvent(ctx, tx, activityID, storage.EventLeaseExtended, nil,
-			toDetail(map[string]any{
-				"new_deadline_ms": newDeadline.UnixMilli(),
-				"extend_by_ms":    extendBy.Milliseconds(),
-			})); err != nil {
-			return false, err
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return false, storage.NewInternalError(fmt.Sprintf("Failed to commit extend_lease: %v", err))
-		}
-		return true, nil
+	if err := b.recordEvent(ctx, tx, activityID, storage.EventLeaseExtended, nil,
+		toDetail(map[string]any{
+			"new_deadline_ms": newDeadlineMS,
+			"extend_by_ms":    extendBy.Milliseconds(),
+		})); err != nil {
+		return false, err
 	}
-
-	return false, nil
+	if err := tx.Commit(ctx); err != nil {
+		return false, storage.NewInternalError(fmt.Sprintf("Failed to commit extend_lease: %v", err))
+	}
+	return true, nil
 }
 
 func (b *PostgresBackend) RecordSpawnLinked(ctx context.Context, childID, parentID uuid.UUID) error {
@@ -722,125 +817,126 @@ func (b *PostgresBackend) GetResult(ctx context.Context, activityID uuid.UUID) (
 	return &storage.ActivityResult{Data: data, State: state}, nil
 }
 
-func (b *PostgresBackend) CheckIdempotency(ctx context.Context, a *storage.QueuedActivity) (*storage.IdempotencyResult, error) {
+func (b *PostgresBackend) EnqueueIdempotent(ctx context.Context, a *storage.QueuedActivity) (*storage.IdempotencyResult, error) {
 	if a.IdempotencyKey == nil {
-		return nil, nil
+		return nil, b.Enqueue(ctx, *a)
 	}
 	key := a.IdempotencyKey.Key
 	behavior := a.IdempotencyKey.Behavior
 
-	const maxRetries = 3
-	for range maxRetries {
-		result, err := b.tryClaimIdempotencyKey(ctx, a, key)
+	const maxAttempts = 3
+	for range maxAttempts {
+		result, done, err := b.tryEnqueueIdempotent(ctx, a, key, behavior)
 		if err != nil {
 			return nil, err
 		}
-		if result.claimed || result.existingID != nil || result.status != nil {
-			return b.resolveIdempotencyBehavior(ctx, a, key, behavior, result)
+		if done {
+			return result, nil
 		}
-		// Row disappeared between INSERT and SELECT — retry
+		// Key row vanished between our INSERT conflict and the locking
+		// SELECT — retry from the top.
 	}
-	return nil, storage.NewInternalError(fmt.Sprintf("Failed to resolve idempotency key '%s' after %d attempts", key, maxRetries))
+	return nil, storage.NewInternalError(fmt.Sprintf("Failed to resolve idempotency key '%s' after %d attempts", key, maxAttempts))
 }
 
-type idempotencyResult struct {
-	claimed          bool
-	existingID       *uuid.UUID
-	existingParentID *uuid.UUID
-	status           *string
-}
+// tryEnqueueIdempotent runs one claim-and-enqueue attempt in a single
+// transaction. The key claim, behavior resolution, and activity insert all
+// commit (or roll back) together — there is no state where the key points at
+// an activity that was never enqueued. Returns done=false when the key row
+// disappeared mid-attempt and the caller should retry.
+func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.QueuedActivity, key string, behavior storage.IdempotencyBehavior) (*storage.IdempotencyResult, bool, error) {
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+	}
+	defer tx.Rollback(ctx)
 
-func (b *PostgresBackend) tryClaimIdempotencyKey(ctx context.Context, a *storage.QueuedActivity, key string) (idempotencyResult, error) {
-	// Try to atomically claim the key
-	tag, err := b.pool.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO runnerq_idempotency (queue_name, idempotency_key, activity_id, created_at, updated_at)
 		VALUES ($1, $2, $3, NOW(), NOW())
 		ON CONFLICT (queue_name, idempotency_key) DO NOTHING`,
 		b.queueName, key, a.ID)
 	if err != nil {
-		return idempotencyResult{}, storage.NewInternalError(fmt.Sprintf("Failed to claim idempotency key: %v", err))
+		return nil, false, storage.NewInternalError(fmt.Sprintf("Failed to claim idempotency key: %v", err))
 	}
 
 	if tag.RowsAffected() > 0 {
-		return idempotencyResult{claimed: true}, nil
+		// Fresh claim — enqueue in the same transaction.
+		if err := b.enqueueInTx(ctx, tx, a); err != nil {
+			return nil, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, false, storage.NewInternalError(fmt.Sprintf("Failed to commit idempotent enqueue: %v", err))
+		}
+		return nil, true, nil
 	}
 
-	// Key exists - look up the existing activity, including its parent so the
-	// caller can decide whether a SpawnLinked attribution event is needed.
+	// Key exists. Lock the key row so behavior resolution can't race a
+	// concurrent claimer, then look up the activity it points at. FOR UPDATE
+	// OF i is valid here because i is the non-nullable side of the join.
 	var existingID uuid.UUID
 	var existingParentID *uuid.UUID
 	var status *string
-	err = b.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT i.activity_id, a.status, a.parent_activity_id
 		FROM runnerq_idempotency i
 		LEFT JOIN runnerq_activities a ON i.activity_id = a.id
-		WHERE i.queue_name = $1 AND i.idempotency_key = $2`,
+		WHERE i.queue_name = $1 AND i.idempotency_key = $2
+		FOR UPDATE OF i`,
 		b.queueName, key).Scan(&existingID, &status, &existingParentID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			// Row disappeared between INSERT and SELECT
-			return idempotencyResult{}, nil
+			return nil, false, nil
 		}
-		return idempotencyResult{}, storage.NewInternalError(fmt.Sprintf("Failed to get existing key: %v", err))
+		return nil, false, storage.NewInternalError(fmt.Sprintf("Failed to get existing key: %v", err))
 	}
 
-	return idempotencyResult{existingID: &existingID, existingParentID: existingParentID, status: status}, nil
-}
-
-func (b *PostgresBackend) resolveIdempotencyBehavior(ctx context.Context, a *storage.QueuedActivity, key string, behavior storage.IdempotencyBehavior, result idempotencyResult) (*storage.IdempotencyResult, error) {
-	if result.claimed {
-		return nil, nil
-	}
-
-	existingID := *result.existingID
-	status := result.status
-	existingResult := &storage.IdempotencyResult{ExistingID: existingID, ExistingParentID: result.existingParentID}
-
-	switch behavior {
-	case storage.BehaviorReturnExisting:
-		return existingResult, nil
-
-	case storage.BehaviorAllowReuse:
-		_, err := b.pool.Exec(ctx, `
+	// Repoint the key at our new activity and enqueue it, atomically. Used by
+	// the reuse behaviors and for orphan repair.
+	reclaim := func() (*storage.IdempotencyResult, bool, error) {
+		if _, err := tx.Exec(ctx, `
 			UPDATE runnerq_idempotency
 			SET activity_id = $1, updated_at = NOW()
 			WHERE queue_name = $2 AND idempotency_key = $3`,
-			a.ID, b.queueName, key)
-		if err != nil {
-			return nil, storage.NewInternalError(fmt.Sprintf("Failed to update key: %v", err))
+			a.ID, b.queueName, key); err != nil {
+			return nil, false, storage.NewInternalError(fmt.Sprintf("Failed to update key: %v", err))
 		}
-		return nil, nil
+		if err := b.enqueueInTx(ctx, tx, a); err != nil {
+			return nil, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, false, storage.NewInternalError(fmt.Sprintf("Failed to commit idempotent enqueue: %v", err))
+		}
+		return nil, true, nil
+	}
+
+	// status == nil means the key points at an activity row that doesn't
+	// exist — an orphan left by an older version that claimed the key and
+	// enqueued in separate transactions and crashed in between. The key is
+	// reclaimable regardless of behavior; leaving it would brick the key
+	// forever (ReturnExisting would hand out a future that never resolves).
+	if status == nil {
+		return reclaim()
+	}
+
+	switch behavior {
+	case storage.BehaviorReturnExisting:
+		return &storage.IdempotencyResult{ExistingID: existingID, ExistingParentID: existingParentID}, true, nil
+
+	case storage.BehaviorAllowReuse:
+		return reclaim()
 
 	case storage.BehaviorAllowReuseOnFailure:
-		statusStr := ""
-		if status != nil {
-			statusStr = *status
+		if *status == "dead_letter" || *status == "failed" {
+			return reclaim()
 		}
-		if statusStr == "dead_letter" || statusStr == "failed" {
-			tag, err := b.pool.Exec(ctx, `
-				UPDATE runnerq_idempotency i
-				SET activity_id = $1, updated_at = NOW()
-				FROM runnerq_activities a
-				WHERE i.queue_name = $2
-				  AND i.idempotency_key = $3
-				  AND i.activity_id = a.id
-				  AND a.status IN ('dead_letter', 'failed')`,
-				a.ID, b.queueName, key)
-			if err != nil {
-				return nil, storage.NewInternalError(fmt.Sprintf("Failed to update key: %v", err))
-			}
-			if tag.RowsAffected() > 0 {
-				return nil, nil
-			}
-			return nil, storage.NewIdempotencyConflictError(fmt.Sprintf("Idempotency key '%s' was claimed by another request", key))
-		}
-		return nil, storage.NewIdempotencyConflictError(fmt.Sprintf("Idempotency key '%s' exists with status '%s'", key, statusStr))
+		return nil, false, storage.NewIdempotencyConflictError(fmt.Sprintf("Idempotency key '%s' exists with status '%s'", key, *status))
 
 	case storage.BehaviorNoReuse:
-		return nil, storage.NewDuplicateActivityError(fmt.Sprintf("Activity with idempotency key '%s' already exists: %s", key, existingID))
+		return nil, false, storage.NewDuplicateActivityError(fmt.Sprintf("Activity with idempotency key '%s' already exists: %s", key, existingID))
 
 	default:
-		return nil, nil
+		return reclaim()
 	}
 }
 

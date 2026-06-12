@@ -12,6 +12,19 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: runnerq_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -39,7 +52,11 @@ jobs:
             exit 1
           fi
 
-      # No test files in the repo today — keep this step around so we
-      # don't have to revisit CI when the first test lands.
+      # Integration tests run against the postgres service container and are
+      # skipped automatically when RUNNERQ_TEST_DSN is unset (e.g. locally
+      # without a database). -race is non-negotiable for an engine this
+      # concurrency-heavy.
       - name: Test
-        run: go test ./... -count=1 -timeout=2m
+        env:
+          RUNNERQ_TEST_DSN: postgres://postgres:test@localhost:5432/runnerq_test
+        run: go test ./... -race -count=1 -timeout=5m
