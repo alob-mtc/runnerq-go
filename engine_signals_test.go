@@ -21,32 +21,60 @@ import (
 )
 
 // A signal delivered before the handler reaches WaitForSignal — here, before
-// the activity even runs — is buffered and returned instantly. Delivery also
-// wakes the scheduled activity early.
+// the engine even starts — is buffered and returned instantly on first pass.
 func TestSignalBufferedBeforeWait(t *testing.T) {
+	dsn := os.Getenv("RUNNERQ_TEST_DSN")
+	if dsn == "" {
+		t.Skip("RUNNERQ_TEST_DSN not set; skipping integration test")
+	}
+	ctx := context.Background()
+	queueName := "t_" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+	backend, err := postgres.New(ctx, dsn, queueName)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	defer backend.Close()
+
+	engine, err := Builder().Backend(backend).QueueName(queueName).MaxWorkers(2).Build()
+	if err != nil {
+		t.Fatalf("build engine: %v", err)
+	}
 	var invocations atomic.Int32
-	h := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+	engine.RegisterActivity("approve_me", &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 		invocations.Add(1)
 		return ctx.WaitForSignal("approval", 0)
-	}}
-	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("approve_me", h) })
+	}})
 
-	// Delay parks the activity as scheduled, guaranteeing the signal lands
-	// before the handler runs.
-	fut, err := rig.engine.GetActivityExecutor().
-		Activity("approve_me").
-		Delay(time.Minute).
-		Payload(json.RawMessage(`{}`)).
-		Execute(context.Background())
+	// Enqueue and signal BEFORE the engine starts: the signal is buffered.
+	fut, err := engine.GetActivityExecutor().
+		Activity("approve_me").Payload(json.RawMessage(`{}`)).Execute(ctx)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-
-	if err := rig.engine.Signal(context.Background(), fut.activityID, "approval", json.RawMessage(`{"approved":true}`)); err != nil {
+	if err := engine.Signal(ctx, fut.activityID, "approval", json.RawMessage(`{"approved":true}`)); err != nil {
 		t.Fatalf("signal: %v", err)
 	}
 
-	res := rig.await(t, fut.activityID, 20*time.Second)
+	startDone := make(chan error, 1)
+	go func() { startDone <- engine.Start(ctx) }()
+	t.Cleanup(func() {
+		engine.Stop()
+		select {
+		case err := <-startDone:
+			if err != nil {
+				t.Errorf("engine.Start: %v", err)
+			}
+		case <-time.After(35 * time.Second):
+			t.Error("engine did not stop")
+		}
+	})
+
+	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	res, err := backend.WaitForResult(waitCtx, fut.activityID)
+	if err != nil {
+		t.Fatalf("await: %v", err)
+	}
 	if res.State != storage.ResultOk || !strings.Contains(string(res.Data), "approved") {
 		t.Fatalf("result = %v %s, want buffered signal payload", res.State, res.Data)
 	}
@@ -75,11 +103,11 @@ func TestSignalWakesParkedWaiterAcrossProcesses(t *testing.T) {
 		t.Fatalf("execute: %v", err)
 	}
 
-	// Wait until the activity has actually yielded (parked as Scheduled).
+	// Wait until the activity has actually yielded (parked as Waiting).
 	deadline := time.After(15 * time.Second)
 	for {
 		snap, err := rig.backend.GetActivity(context.Background(), fut.activityID)
-		if err == nil && snap != nil && snap.Status == "Scheduled" {
+		if err == nil && snap != nil && snap.Status == "Waiting" {
 			break
 		}
 		select {

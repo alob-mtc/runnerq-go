@@ -29,11 +29,18 @@ CREATE TABLE IF NOT EXISTS runnerq_activities (
 
 -- Indexes for efficient queries
 --
--- idx_runnerq_dequeue_effective serves the single-type dequeue form: with
+-- The dequeue indexes are versioned (_v2) because their partial predicates
+-- gained the 'waiting' status (yield-parked activities: durable sleeps,
+-- signal waits, parents awaiting children). CREATE INDEX IF NOT EXISTS
+-- cannot update an existing index's predicate, so the v1 names are dropped;
+-- both statements are no-ops once applied.
+DROP INDEX IF EXISTS idx_runnerq_dequeue_effective;
+DROP INDEX IF EXISTS idx_runnerq_dequeue_order;
+-- idx_runnerq_dequeue_effective_v2 serves the single-type dequeue form: with
 -- activity_type pinned by equality, the remaining key columns match the
 -- dequeue ORDER BY exactly, so the claim is an index walk that stops at the
 -- first unlocked row.
-CREATE INDEX IF NOT EXISTS idx_runnerq_dequeue_effective
+CREATE INDEX IF NOT EXISTS idx_runnerq_dequeue_effective_v2
     ON runnerq_activities (
         queue_name,
         activity_type,
@@ -41,20 +48,21 @@ CREATE INDEX IF NOT EXISTS idx_runnerq_dequeue_effective
         retry_count DESC,
         COALESCE(scheduled_at, created_at) ASC
     )
-    WHERE status IN ('pending', 'scheduled', 'retrying');
--- idx_runnerq_dequeue_order serves the untyped and multi-type dequeue forms.
--- Its key order IS the dequeue ORDER BY, so Postgres never has to sort the
--- whole eligible backlog to find the top row — without it, every claim is a
--- top-1 sort over every live row in the queue, i.e. O(backlog) per dequeue
--- per worker, which degrades superlinearly exactly when a backlog builds.
-CREATE INDEX IF NOT EXISTS idx_runnerq_dequeue_order
+    WHERE status IN ('pending', 'scheduled', 'retrying', 'waiting');
+-- idx_runnerq_dequeue_order_v2 serves the untyped and multi-type dequeue
+-- forms. Its key order IS the dequeue ORDER BY, so Postgres never has to
+-- sort the whole eligible backlog to find the top row — without it, every
+-- claim is a top-1 sort over every live row in the queue, i.e. O(backlog)
+-- per dequeue per worker, which degrades superlinearly exactly when a
+-- backlog builds.
+CREATE INDEX IF NOT EXISTS idx_runnerq_dequeue_order_v2
     ON runnerq_activities (
         queue_name,
         priority DESC,
         retry_count DESC,
         COALESCE(scheduled_at, created_at) ASC
     )
-    WHERE status IN ('pending', 'scheduled', 'retrying');
+    WHERE status IN ('pending', 'scheduled', 'retrying', 'waiting');
 CREATE INDEX IF NOT EXISTS idx_runnerq_activities_processing
     ON runnerq_activities(queue_name, lease_deadline_ms)
     WHERE status = 'processing';

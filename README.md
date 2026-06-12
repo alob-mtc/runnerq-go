@@ -534,6 +534,27 @@ Semantics summary:
 | `.Step(name)` spawn | Same child returned; memoized result resolves instantly | Incompatible with `AsRoot`/`IdempotencyKeyOption`; handler-context only |
 | `ctx.Sleep(name, d)` | Waits only the remainder; elapsed sleeps return immediately | Wakes that wouldn't land safely before the handler deadline yield: no retry consumed, worker released |
 | `ctx.WaitForSignal(name, timeout)` | Buffered signal resolves instantly; wait deadline persists | Long/unbounded waits park until delivery; timeout → non-retryable error (`IsSignalTimeout`) |
+| `fut.GetResult(ctx)` (in handler) | Completed child's result returns instantly | Waits ~2s in-process, then parks until the child's completion wakes it — no worker held, no retry consumed |
+
+Because awaiting parks instead of blocking, **a workflow can outlive any number of handler
+invocations, process restarts, and deploys** — a parent awaiting a child for hours holds no
+goroutine, no lease, and burns no retry budget. Futures are also rehydratable across
+processes: share `fut.ActivityID()` and reconstruct with `runnerq.FutureFor(backend, id)`;
+`runnerq.WaitAll(ctx, futs...)` awaits a fan-out in order.
+
+### Versioning workflows across deploys
+
+Step keys are **name-based, not sequence-based**, which makes deploys far more forgiving than
+replay-deterministic engines: reordering steps is safe, adding steps is safe, and removing a
+step leaves only a harmless orphaned checkpoint. The one dangerous operation is **renaming a
+step while workflows that used the old name are still in flight** — the new name derives a new
+key, so the side effect runs again. Rules of thumb:
+
+- Never rename `Step`/`Run`/`Sleep`/`WaitForSignal` names that in-flight workflows may replay.
+- Gate behavioral changes on a version field in the payload rather than editing live step
+  sequences.
+- Code between steps re-executes on every replay — keep it free of side effects or move it
+  into a `Run`.
 
 ## Metrics and Monitoring
 

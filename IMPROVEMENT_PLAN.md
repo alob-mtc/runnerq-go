@@ -132,12 +132,19 @@ already exist (idempotency table, permanent results table, lineage columns):
    retention-collected with their tree. Caveat (documented): delivery wakes ANY scheduled row
    early, including Delay-scheduled ones. Per-name semantics are last-write-wins (DBOS
    setEvent-style), not a message queue.
-5. **Decouple parent lifetime from a single lease (the largest piece).** Park the parent as a
-   `waiting` status row when all awaited children are pending; re-dispatch it on child completion
-   instead of holding a goroutine + lease for the whole await. This replaces the suspend.go
-   slot-juggling machinery and simultaneously fixes the unbounded-goroutine growth and waker/
-   dispatcher slot races (suspend.go:55-68 vs engine.go:424). The Yield mechanism from item 3 is
-   a template: parking-and-resuming already works for timers; this extends it to child awaits.
+5. ✅ **DONE — parent re-dispatch.** In-handler `GetResult` waits in-process for a 2s grace,
+   then yield-parks the parent as a dedicated `waiting` status row — no goroutine, no lease, no
+   retry consumed; the child's terminal ack (success, failure, dead-letter — including reaper
+   dead-letters) atomically wakes the parked parent, which replays and fast-forwards. Workflows
+   now outlive handler invocations and deploys. Also landed with this: the `waiting` status
+   fixes the signals early-wake caveat (Delay-scheduled rows are no longer woken by delivery);
+   a post-park recheck closes the park race for ALL durable waits (a result committing between
+   the handler's final check and the park landing previously produced no wake — a latent
+   forever-park bug for unbounded signal waits); `SuspendOnAwait` is deprecated (the starvation
+   pattern it existed for self-resolves within the await grace); `FutureFor`/`ActivityID`/
+   `WaitAll` ship future rehydration. Item "auto-key every spawn" is closed as won't-do:
+   sequence-derived keys are fail-wrong under non-deterministic replay and payload-hash keys
+   silently degrade — explicit `Step` names are the model (same conclusion as Inngest).
 
 ### Also required for the category
 - **Cancellation API** — none exists at any layer (storage, inspector, engine). Add cancel with
@@ -149,9 +156,9 @@ already exist (idempotency table, permanent results table, lineage columns):
   timeout); do it then, with a worker-fence guard added to ExtendLease's WHERE clause.
 - **Engine-native cron/schedules** — the console Schedules tab only lists rows the user tagged
   `metadata.source='cron'` (postgres.go:1255-1274); nothing in core creates them.
-- **Future rehydration** — `ActivityFuture` fields are package-private (executor.go:21-24); a
-  future cannot be reconstructed after restart. Add a public get-result-by-ID API and a `WaitAll`.
-- **Workflow versioning** story once memoization lands (step-name compatibility across deploys).
+- ✅ **DONE — future rehydration**: `FutureFor(backend, id)`, `fut.ActivityID()`, and `WaitAll`.
+- ✅ **DONE — workflow versioning guidance**: README "Versioning workflows across deploys" —
+  name-based step keys make reorder/add safe; renaming live step names is the one hazard.
 
 ---
 

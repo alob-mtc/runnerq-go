@@ -3,6 +3,7 @@ package runnerq
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/alob-mtc/runnerq-go/storage"
 )
 
 // ActivityExecutor allows executing activities, enabling orchestration.
@@ -23,18 +26,63 @@ type ActivityFuture struct {
 	activityID uuid.UUID
 }
 
+// ActivityID returns the awaited activity's ID — the externally-shareable
+// handle for a future. Hand it to another process and reconstruct the future
+// there with FutureFor.
+func (f *ActivityFuture) ActivityID() uuid.UUID {
+	return f.activityID
+}
+
+// FutureFor reconstructs an awaitable future from an activity ID — futures
+// are rehydratable across processes and restarts: any process holding a
+// backend for the same queue can await any activity's result.
+func FutureFor(backend storage.Storage, activityID uuid.UUID) *ActivityFuture {
+	return &ActivityFuture{
+		queue:      newBackendQueueAdapter(backend, nil),
+		activityID: activityID,
+	}
+}
+
+// WaitAll awaits every future and returns their results in order. Inside a
+// handler, sequential awaiting is already efficient under replay semantics:
+// the first pending child parks the parent, and on each wake every completed
+// child fast-forwards — so no parallel-wait machinery is needed. Propagate
+// the error unchanged, as with GetResult.
+func WaitAll(ctx context.Context, futures ...*ActivityFuture) ([]json.RawMessage, error) {
+	results := make([]json.RawMessage, len(futures))
+	for i, f := range futures {
+		r, err := f.GetResult(ctx)
+		if err != nil {
+			return nil, err
+		}
+		results[i] = r
+	}
+	return results, nil
+}
+
+// awaitParkGrace is how long an in-handler GetResult waits in-process before
+// yield-parking the parent. Fast children resolve on this fast path with no
+// park round-trip; slower ones cost one replay when they complete. The grace
+// also bounds worst-case fan-out starvation: even if every worker is a
+// parent awaiting children, all of them park within the grace window and
+// free their workers for the children.
+const awaitParkGrace = 2 * time.Second
+
 // GetResult waits for and returns the completed activity result. The wait is
 // notification-driven when the backend supports it (the Postgres backend
 // does), with a slow table re-check as fallback — including when the caller
-// is a different process from the worker producing the result. The caller
-// should use context for timeout control.
+// is a different process from the worker producing the result.
 //
-// When called from inside an activity handler with SuspendOnAwait enabled,
-// the host activity's worker slot is released for the duration of the wait
-// and reacquired before returning. This prevents the parent-blocking-on-
-// children starvation that pins worker slots on recursive fan-out
-// workloads — see WorkerConfig.SuspendOnAwait. Outside that context the
-// release/reacquire is a no-op and behaviour is identical to before.
+// Called from inside an activity handler, GetResult waits in-process for a
+// short grace and then YIELDS, parking the parent activity — no goroutine
+// held, no lease, no retry consumed — until the child's completion wakes it.
+// The handler replays, earlier Step/Run checkpoints fast-forward, and this
+// call returns the now-available result. The sentinel error MUST be
+// propagated unchanged, same as Sleep and WaitForSignal. A parent workflow
+// can therefore outlive any number of handler invocations and deploys.
+//
+// Called from outside a handler (a server process holding a future), it
+// blocks until the result exists or ctx is done.
 func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error) {
 	if h := suspendFromContext(ctx); h != nil {
 		h.release()
@@ -47,10 +95,50 @@ func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error)
 		}()
 	}
 
-	result, err := f.queue.WaitForResult(ctx, f.activityID)
-	if err != nil {
-		return nil, err
+	if !inHandlerScope(ctx) {
+		result, err := f.queue.WaitForResult(ctx, f.activityID)
+		if err != nil {
+			return nil, err
+		}
+		return translateResult(result)
 	}
+
+	// In-handler: wait in-process up to the grace (clamped to the handler's
+	// remaining budget, same margin policy as Sleep), then park.
+	bound := time.Now().Add(awaitParkGrace)
+	if deadline, ok := ctx.Deadline(); ok {
+		margin := min(yieldMargin, time.Until(deadline)/2)
+		if margin < 0 {
+			margin = 0
+		}
+		if budgetBound := deadline.Add(-margin); budgetBound.Before(bound) {
+			bound = budgetBound
+		}
+	}
+	if bound.After(time.Now()) {
+		wctx, cancel := context.WithDeadline(ctx, bound)
+		result, err := f.queue.WaitForResult(wctx, f.activityID)
+		cancel()
+		if err == nil {
+			return translateResult(result)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return nil, err
+		}
+		// Grace elapsed without a result — park.
+	}
+
+	// Wake comes from the child's terminal ack (completion, failure, or
+	// dead-letter — all store a result), so the horizon is nominal. recheck
+	// closes the race with a child that completed while we were parking.
+	return nil, &yieldPark{
+		wakeAt:  time.Now().UTC().Add(signalParkHorizon),
+		step:    "await:" + f.activityID.String(),
+		recheck: f.activityID,
+	}
+}
+
+func translateResult(result *activityResult) (json.RawMessage, error) {
 	switch result.State {
 	case ResultOk:
 		return result.Data, nil

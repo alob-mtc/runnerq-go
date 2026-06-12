@@ -60,9 +60,14 @@ type WorkerConfig struct {
 	// SuspendOnAwait, when true, switches the engine to a semaphore-based
 	// concurrency model where ActivityFuture.GetResult releases this
 	// activity's worker slot while it waits for the child future to resolve.
-	// Eliminates the parent-blocking-on-children starvation pattern that
-	// pins worker slots on recursive fan-out workloads. Default false to
-	// preserve the existing fixed-goroutine behaviour.
+	//
+	// Deprecated: in-handler GetResult now yield-parks the parent after a
+	// short in-process grace, which frees the whole worker (goroutine and
+	// all), not just a slot — the parent-blocking-on-children starvation
+	// pattern this mode existed for self-resolves within the grace window in
+	// the default fixed-pool model. SuspendOnAwait remains functional but
+	// buys little; it and SuspendLeafActivityTypes/SuspendLeavesReserved may
+	// be removed in a future release.
 	SuspendOnAwait bool `json:"suspend_on_await,omitempty"`
 
 	// SuspendLeafActivityTypes, when non-empty together with SuspendOnAwait,

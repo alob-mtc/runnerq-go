@@ -27,6 +27,7 @@ const (
 	StatusCompleted  ActivityStatus = "Completed"
 	StatusFailed     ActivityStatus = "Failed"
 	StatusRetrying   ActivityStatus = "Retrying"
+	StatusWaiting    ActivityStatus = "Waiting"
 	StatusDeadLetter ActivityStatus = "DeadLetter"
 )
 
@@ -91,6 +92,7 @@ type QueueStats struct {
 	LowPriority          uint64              `json:"low_priority"`
 	ScheduledActivities  uint64              `json:"scheduled_activities"`
 	RetryingActivities   uint64              `json:"retrying_activities"`
+	WaitingActivities    uint64              `json:"waiting_activities"`
 	FailedActivities     uint64              `json:"failed_activities"`
 	DeadLetterActivities uint64              `json:"dead_letter_activities"`
 	MaxWorkers           *int                `json:"max_workers,omitempty"`
@@ -104,6 +106,7 @@ type RootStatusBreakdown struct {
 	Processing uint64 `json:"processing"`
 	Scheduled  uint64 `json:"scheduled"`
 	Retrying   uint64 `json:"retrying"`
+	Waiting    uint64 `json:"waiting"`
 	Completed  uint64 `json:"completed"`
 	Failed     uint64 `json:"failed"`
 	DeadLetter uint64 `json:"dead_letter"`

@@ -122,12 +122,15 @@ func NewTimeoutFailure() FailureKind {
 
 // QueueStats holds queue-level statistics.
 type QueueStats struct {
-	Pending       uint64
-	Processing    uint64
-	Scheduled     uint64
-	Retrying      uint64
-	Failed        uint64
-	DeadLetter    uint64
+	Pending    uint64
+	Processing uint64
+	Scheduled  uint64
+	Retrying   uint64
+	// Waiting counts yield-parked activities: durable sleeps, signal waits,
+	// and parents awaiting children.
+	Waiting    uint64
+	Failed     uint64
+	DeadLetter uint64
 	ByPriority    PriorityBreakdown
 	MaxWorkers    *int
 	ActiveWorkers uint64 // distinct current_worker_id across processing rows
@@ -142,6 +145,7 @@ type RootStatusBreakdown struct {
 	Processing uint64
 	Scheduled  uint64
 	Retrying   uint64
+	Waiting    uint64
 	Completed  uint64
 	Failed     uint64
 	DeadLetter uint64
@@ -278,6 +282,12 @@ type QueueStorage interface {
 	// activityID is synthetic. The retention sweeper deletes result rows
 	// together with their owner's workflow tree.
 	StoreResult(ctx context.Context, activityID uuid.UUID, ownerActivityID uuid.UUID, result ActivityResult) error
+	// WakeWaiting makes a yield-parked ('waiting') activity immediately
+	// runnable; false when the activity is in any other state. The engine
+	// uses it to close the park race (a result committing between a
+	// handler's final check and its park landing produces no wake of its
+	// own).
+	WakeWaiting(ctx context.Context, activityID uuid.UUID) (bool, error)
 	// SignalActivity delivers an external signal to an activity: it stores
 	// payload as a result row under signalID (owned by activityID, so the
 	// retention sweeper collects it with the tree) and, if the target is
