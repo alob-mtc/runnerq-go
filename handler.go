@@ -159,8 +159,7 @@ func (y *yieldPark) Error() string {
 // replay.
 //
 // When the remaining wait fits inside the activity's timeout budget, Sleep
-// waits in-process (releasing the worker slot under SuspendOnAwait, like
-// awaiting a child). When it doesn't, Sleep YIELDS: it returns a sentinel
+// waits in-process. When it doesn't, Sleep YIELDS: it returns a sentinel
 // error that the caller MUST propagate unchanged (`if err != nil { return
 // nil, err }`); the engine intercepts it, parks the activity as scheduled
 // until the wake time without consuming a retry, and re-invokes the handler
@@ -227,10 +226,6 @@ func (c ActivityContext) Sleep(name string, d time.Duration) error {
 		}
 	}
 
-	if h := suspendFromContext(c.Ctx); h != nil {
-		h.release()
-		defer func() { _ = h.reacquire(c.Ctx) }()
-	}
 	select {
 	case <-time.After(remaining):
 		return nil
@@ -361,14 +356,10 @@ func (c ActivityContext) WaitForSignal(name string, timeout time.Duration) (json
 }
 
 // waitForCheckpoint blocks on a checkpoint row until it exists or wake
-// passes, releasing the suspend slot (if any) for the duration.
+// passes.
 func (c ActivityContext) waitForCheckpoint(id uuid.UUID, wake time.Time) (*activityResult, error) {
 	waitCtx, cancel := context.WithDeadline(c.Ctx, wake)
 	defer cancel()
-	if h := suspendFromContext(c.Ctx); h != nil {
-		h.release()
-		defer func() { _ = h.reacquire(c.Ctx) }()
-	}
 	return c.queue.WaitForResult(waitCtx, id)
 }
 

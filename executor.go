@@ -87,17 +87,6 @@ const awaitParkGrace = 2 * time.Second
 // Called from outside a handler (a server process holding a future), it
 // blocks until the result exists or ctx is done.
 func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error) {
-	if h := suspendFromContext(ctx); h != nil {
-		h.release()
-		defer func() {
-			// Reacquire on the original ctx so a cancelled handler doesn't
-			// block forever waiting for a slot it'll never use. The error
-			// from reacquire is swallowed deliberately — if ctx is done the
-			// caller sees the ctx error from the wait itself.
-			_ = h.reacquire(ctx)
-		}()
-	}
-
 	if !inHandlerScope(ctx) {
 		result, err := f.queue.WaitForResult(ctx, f.activityID)
 		if err != nil {
