@@ -19,7 +19,7 @@ go run .
 
 ## Expected output
 
-```
+```text
 delivering webhooks: first event ×3, second event ×1
   ▶ processing evt-...-2 (handler run #1 for this event)
   ▶ processing evt-...-1 (handler run #1 for this event)

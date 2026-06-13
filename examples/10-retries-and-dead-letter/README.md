@@ -21,7 +21,7 @@ go run .
 
 ## Expected output
 
-```
+```text
   ▶ attempt #1 (RetryCount=0) — calling gateway...
   ▶ attempt #2 (RetryCount=1) — calling gateway...        ← after backoff
   ☠ dead-lettered <id> after exhausting retries: Retryable error: payment gateway 503

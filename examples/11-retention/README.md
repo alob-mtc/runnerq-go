@@ -19,7 +19,7 @@ go run .
 
 ## Expected output
 
-```
+```text
 workflow <id> completed; waiting for retention to sweep it...
 ✓ swept — the completed workflow tree was deleted by retention.
 ```

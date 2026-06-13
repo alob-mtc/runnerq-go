@@ -43,7 +43,9 @@ func (h *ProcessEvent) Handle(ctx runnerq.ActivityContext, payload json.RawMessa
 	var in struct {
 		EventID string `json:"event_id"`
 	}
-	_ = json.Unmarshal(payload, &in)
+	if err := json.Unmarshal(payload, &in); err != nil {
+		return nil, runnerq.NewNonRetryError("bad payload: " + err.Error())
+	}
 	mu.Lock()
 	processed[in.EventID]++
 	n := processed[in.EventID]
@@ -97,7 +99,11 @@ func main() {
 		fmt.Fprintln(w, "accepted")
 	})
 	srv := &http.Server{Addr: ":8080", Handler: mux}
-	go srv.ListenAndServe()
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("webhook server failed (port in use?): %v", err)
+		}
+	}()
 	defer srv.Close()
 	time.Sleep(200 * time.Millisecond) // let the listener bind
 

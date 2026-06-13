@@ -106,7 +106,11 @@ func main() {
 	})
 
 	srv := &http.Server{Addr: ":8080", Handler: mux}
-	go srv.ListenAndServe()
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("API server failed (port in use?): %v", err)
+		}
+	}()
 	defer srv.Close()
 	time.Sleep(200 * time.Millisecond)
 

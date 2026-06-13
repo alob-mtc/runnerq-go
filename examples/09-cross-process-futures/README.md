@@ -22,7 +22,7 @@ go run .
 
 ## Expected output
 
-```
+```text
 enqueued job a6ac3c8a-...
   poll right away: {"status":"running"}
   poll after work: {"status":"done","result":{"width":800,"height":600}}

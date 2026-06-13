@@ -21,7 +21,7 @@ go run .
 
 ## Expected output
 
-```
+```text
 enqueuing a mix of 12 activities across 4 types...
 ✓ handled — notifications fleet: 6, reports fleet: 3, finance fleet: 3
   each fleet only ran the activity types it was assigned.

@@ -39,7 +39,9 @@ func (h *FulfillOrder) Handle(ctx runnerq.ActivityContext, payload json.RawMessa
 	var in struct {
 		Order int `json:"order"`
 	}
-	_ = json.Unmarshal(payload, &in)
+	if err := json.Unmarshal(payload, &in); err != nil {
+		return nil, runnerq.NewNonRetryError("bad payload: " + err.Error())
+	}
 
 	if _, err := ctx.Run("reserve", func() (json.RawMessage, error) {
 		return json.RawMessage(`{"reserved":true}`), nil
