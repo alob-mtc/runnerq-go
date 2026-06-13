@@ -75,6 +75,12 @@ const (
 	// wait deadline and times out again immediately — the handler must
 	// decide what a missing signal means.
 	ErrSignalTimeoutW
+	// ErrActivityNotFoundW means a signal was addressed to an activity (by ID
+	// or by idempotency key) that does not exist in the queue — never
+	// enqueued, or already completed and retention-swept. Callers delivering
+	// an external event typically treat this as "already settled / nothing to
+	// wake" rather than a failure.
+	ErrActivityNotFoundW
 )
 
 // WorkerError represents an error from the worker engine.
@@ -121,6 +127,8 @@ func (e *WorkerError) Error() string {
 		prefix = "Unknown error"
 	case ErrSignalTimeoutW:
 		prefix = "Signal wait timed out"
+	case ErrActivityNotFoundW:
+		prefix = "Signal target activity not found"
 	}
 	return fmt.Sprintf("%s: %s", prefix, e.Message)
 }
@@ -173,6 +181,15 @@ func WorkerErrorFromStorage(err error) *WorkerError {
 func IsSignalTimeout(err error) bool {
 	we, ok := IsWorkerError(err)
 	return ok && we.Kind == ErrSignalTimeoutW
+}
+
+// IsActivityNotFound reports whether err is a signal-to-a-missing-activity
+// error (the target was never enqueued, or has completed and been swept).
+// External deliverers (webhooks, reconciliation) usually treat this as
+// "already settled" rather than a failure.
+func IsActivityNotFound(err error) bool {
+	we, ok := IsWorkerError(err)
+	return ok && we.Kind == ErrActivityNotFoundW
 }
 
 // IsWorkerError extracts a *WorkerError from err (if any).

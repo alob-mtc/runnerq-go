@@ -250,3 +250,49 @@ func errString(err error) string {
 	}
 	return err.Error()
 }
+
+// SignalByKey wakes the workflow that owns an idempotency key, without the
+// caller knowing the internal activity ID — the library resolves
+// key -> activity. This is what lets a webhook signal by business reference.
+func TestSignalByKeyWakesWorkflowOwningKey(t *testing.T) {
+	const key = "transfer-ref-9001"
+	var invocations atomic.Int32
+	h := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		invocations.Add(1)
+		return ctx.WaitForSignal("settled", 0) // park until signalled
+	}}
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("xfer", h) })
+
+	fut, err := rig.engine.GetActivityExecutor().
+		Activity("xfer").
+		IdempotencyKeyOption(key, ReturnExisting).
+		Payload(json.RawMessage(`{}`)).
+		Execute(context.Background())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	// Deliver by KEY — we never reference fut.ActivityID() to signal. The
+	// activity type plus the business key resolve the instance.
+	if err := rig.engine.SignalByKey(context.Background(), "xfer", key, "settled", json.RawMessage(`{"status":"completed"}`)); err != nil {
+		t.Fatalf("signal by key: %v", err)
+	}
+
+	res := rig.await(t, fut.activityID, 20*time.Second)
+	if res.State != storage.ResultOk || !strings.Contains(string(res.Data), "completed") {
+		t.Fatalf("result = %v %s, want the signalled payload", res.State, res.Data)
+	}
+}
+
+// SignalByKey to an unclaimed key returns a typed not-found a caller can
+// treat as "already settled / nothing to wake".
+func TestSignalByKeyUnknownKeyIsNotFound(t *testing.T) {
+	rig := newStepsRig(t, func(e *WorkerEngine) {})
+	err := rig.engine.SignalByKey(context.Background(), "xfer", "no-such-key", "settled", nil)
+	if err == nil {
+		t.Fatal("signal to unclaimed key succeeded; want not-found")
+	}
+	if !IsActivityNotFound(err) {
+		t.Fatalf("error = %v, want IsActivityNotFound", err)
+	}
+}

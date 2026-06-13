@@ -194,6 +194,16 @@ func (b *ActivityBuilder) Delay(d time.Duration) *ActivityBuilder {
 	return b
 }
 
+// idempotencyStorageKey is the actual key stored in the idempotency table for
+// a user-supplied key on an activity of activityType. User keys are namespaced
+// by activity type so the same business key can be reused across distinct
+// activity types without colliding. SignalActivityByKey reconstructs the same
+// composite to address a workflow by its business key — keep the two in lockstep
+// by routing both through this single function.
+func idempotencyStorageKey(userKey, activityType string) string {
+	return fmt.Sprintf("%s-%s", userKey, activityType)
+}
+
 // IdempotencyKeyOption sets the idempotency key and behavior for duplicate detection.
 func (b *ActivityBuilder) IdempotencyKeyOption(key string, behavior OnDuplicate) *ActivityBuilder {
 	b.idempotencyKey = &IdempotencyConfig{Key: key, Behavior: behavior}
@@ -289,8 +299,7 @@ func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) 
 		}
 		var idempKey *IdempotencyConfig
 		if b.idempotencyKey != nil {
-			prefixedKey := fmt.Sprintf("%s-%s", b.idempotencyKey.Key, b.activityType)
-			idempKey = &IdempotencyConfig{Key: prefixedKey, Behavior: b.idempotencyKey.Behavior}
+			idempKey = &IdempotencyConfig{Key: idempotencyStorageKey(b.idempotencyKey.Key, b.activityType), Behavior: b.idempotencyKey.Behavior}
 		}
 		metadata := make(map[string]string)
 		maps.Copy(metadata, b.metadata)

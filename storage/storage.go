@@ -298,6 +298,13 @@ type QueueStorage interface {
 	// together. Repeated signals with the same signalID overwrite the
 	// payload (last write wins).
 	SignalActivity(ctx context.Context, activityID uuid.UUID, signalID uuid.UUID, payload json.RawMessage) error
+	// LookupIdempotencyActivityID returns the activity ID that currently owns
+	// idempotencyKey in this queue, so a caller can address a signal by
+	// business idempotency key instead of by internal activity ID (see
+	// runnerq.SignalActivityByKey). The idempotency table's PRIMARY KEY makes
+	// this at most one activity. Returns a not-found error when no activity
+	// holds the key (never claimed, or completed and retention-swept).
+	LookupIdempotencyActivityID(ctx context.Context, idempotencyKey string) (uuid.UUID, error)
 	// CleanupExpired deletes terminal workflow trees older than the policy's
 	// TTLs, up to batchSize roots per call, and returns the number of root
 	// trees deleted. Implementations must (a) only delete trees whose root is
