@@ -245,7 +245,7 @@ func TestCleanupExpiredBatches(t *testing.T) {
 	b := testBackend(t)
 	ctx := context.Background()
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		plantTree(t, b, "completed", "completed", 2*time.Hour)
 	}
 

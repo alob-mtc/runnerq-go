@@ -99,10 +99,7 @@ func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error)
 	// remaining budget, same margin policy as Sleep), then park.
 	bound := time.Now().Add(awaitParkGrace)
 	if deadline, ok := ctx.Deadline(); ok {
-		margin := min(yieldMargin, time.Until(deadline)/2)
-		if margin < 0 {
-			margin = 0
-		}
+		margin := max(min(yieldMargin, time.Until(deadline)/2), 0)
 		if budgetBound := deadline.Add(-margin); budgetBound.Before(bound) {
 			bound = budgetBound
 		}

@@ -217,10 +217,7 @@ func (c ActivityContext) Sleep(name string, d time.Duration) error {
 	// yieldMargin) can still take short sleeps in-process instead of paying a
 	// reschedule round-trip for every wait.
 	if deadline, ok := c.Ctx.Deadline(); ok {
-		margin := min(yieldMargin, time.Until(deadline)/2)
-		if margin < 0 {
-			margin = 0
-		}
+		margin := max(min(yieldMargin, time.Until(deadline)/2), 0)
 		if wakeAt.After(deadline.Add(-margin)) {
 			return &yieldPark{wakeAt: wakeAt, step: name}
 		}
@@ -332,10 +329,7 @@ func (c ActivityContext) WaitForSignal(name string, timeout time.Duration) (json
 		// would end in a timeout-retry. Parked waits are woken early by
 		// delivery (SignalActivity flips the scheduled row to pending).
 		if ctxDeadline, ok := c.Ctx.Deadline(); ok {
-			margin := min(yieldMargin, time.Until(ctxDeadline)/2)
-			if margin < 0 {
-				margin = 0
-			}
+			margin := max(min(yieldMargin, time.Until(ctxDeadline)/2), 0)
 			if wake.After(ctxDeadline.Add(-margin)) {
 				return nil, &yieldPark{wakeAt: wake, step: name, recheck: sigID}
 			}

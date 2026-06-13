@@ -161,8 +161,7 @@ func TestEventStreamTailsCommittedEvents(t *testing.T) {
 	consumer := testBackendNamed(t, queueName)
 	producer := testBackendNamed(t, queueName)
 
-	streamCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	streamCtx := t.Context()
 	events, err := consumer.EventStream(streamCtx)
 	if err != nil {
 		t.Fatalf("event stream: %v", err)
