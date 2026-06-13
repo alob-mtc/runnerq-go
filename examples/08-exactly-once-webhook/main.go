@@ -84,8 +84,12 @@ func main() {
 	// The webhook receiver: enqueue keyed by the delivery's event ID. A
 	// duplicate delivery returns the existing activity instead of a new one.
 	mux := http.NewServeMux()
-	mux.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /webhook", func(w http.ResponseWriter, r *http.Request) {
 		eventID := r.URL.Query().Get("id")
+		if eventID == "" {
+			http.Error(w, "missing event id", http.StatusBadRequest)
+			return
+		}
 		payload, _ := json.Marshal(map[string]string{"event_id": eventID})
 		_, err := engine.GetActivityExecutor().
 			Activity("process_event").

@@ -15,12 +15,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -70,7 +70,7 @@ func main() {
 	mux := http.NewServeMux()
 
 	// POST /jobs — enqueue and return the activity ID. The caller polls with it.
-	mux.HandleFunc("/jobs", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /jobs", func(w http.ResponseWriter, r *http.Request) {
 		fut, err := engine.GetActivityExecutor().
 			Activity("resize_image").
 			Payload(json.RawMessage(`{"src":"photo.jpg"}`)).
@@ -86,8 +86,8 @@ func main() {
 	// GET /jobs/{id} — reconstruct the future from the ID ALONE and check it.
 	// This handler never saw the original *ActivityFuture; in a real system it
 	// could be a different process entirely.
-	mux.HandleFunc("/jobs/", func(w http.ResponseWriter, r *http.Request) {
-		id, err := uuid.Parse(strings.TrimPrefix(r.URL.Path, "/jobs/"))
+	mux.HandleFunc("GET /jobs/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := uuid.Parse(r.PathValue("id"))
 		if err != nil {
 			http.Error(w, "bad id", http.StatusBadRequest)
 			return
@@ -96,13 +96,16 @@ func main() {
 		waitCtx, cancel := context.WithTimeout(r.Context(), 200*time.Millisecond)
 		defer cancel()
 		result, err := runnerq.FutureFor(backend, id).GetResult(waitCtx)
-		if err != nil {
-			w.WriteHeader(http.StatusOK)
+		switch {
+		case err == nil:
+			w.Write(append([]byte(`{"status":"done","result":`), append(result, '}')...))
+		case errors.Is(err, context.DeadlineExceeded):
+			// Not finished within the poll window — still running.
 			json.NewEncoder(w).Encode(map[string]string{"status": "running"})
-			return
+		default:
+			// A real failure: the activity errored, or the backend is down.
+			json.NewEncoder(w).Encode(map[string]string{"status": "failed", "error": err.Error()})
 		}
-		w.WriteHeader(http.StatusOK)
-		w.Write(append([]byte(`{"status":"done","result":`), append(result, '}')...))
 	})
 
 	srv := &http.Server{Addr: ":8080", Handler: mux}

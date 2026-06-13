@@ -74,7 +74,12 @@ func main() {
 	for _, e := range engines {
 		done := make(chan struct{})
 		dones = append(dones, done)
-		go func(e *runnerq.WorkerEngine) { defer close(done); e.Start(ctx) }(e)
+		go func(e *runnerq.WorkerEngine) {
+			defer close(done)
+			if err := e.Start(ctx); err != nil {
+				log.Printf("fleet engine stopped: %v", err)
+			}
+		}(e)
 	}
 	defer func() {
 		for i, e := range engines {

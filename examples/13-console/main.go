@@ -99,7 +99,11 @@ func main() {
 	}
 	engine.RegisterActivity("fulfill_order", &FulfillOrder{})
 	engine.RegisterActivity("ship_order", &ShipOrder{})
-	go engine.Start(ctx)
+	go func() {
+		if err := engine.Start(ctx); err != nil {
+			log.Fatalf("engine stopped: %v", err)
+		}
+	}()
 
 	// Keep a steady stream of orders flowing so the dashboard always has
 	// something to show.
@@ -108,7 +112,9 @@ func main() {
 		for {
 			n := seq.Add(1)
 			payload, _ := json.Marshal(map[string]int{"order": int(n)})
-			engine.GetActivityExecutor().Activity("fulfill_order").Payload(payload).Execute(ctx)
+			if _, err := engine.GetActivityExecutor().Activity("fulfill_order").Payload(payload).Execute(ctx); err != nil {
+				log.Printf("enqueue order %d failed: %v", n, err)
+			}
 			time.Sleep(2 * time.Second)
 		}
 	}()
