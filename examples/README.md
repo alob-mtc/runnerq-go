@@ -1,59 +1,39 @@
-# RunnerQ Go Examples
+# RunnerQ Examples
 
-All examples require a running PostgreSQL instance:
+Each example is a standalone, runnable program with its own README. They build
+on each other — start at `01` and walk up.
 
-```bash
-docker run -d --name runnerq-postgres \
-    -e POSTGRES_PASSWORD=runnerq \
-    -e POSTGRES_DB=runnerq \
-    -p 5432:5432 \
-    postgres:16
-```
+## Setup (once)
 
-Set the connection string (or use the default `postgres://postgres:runnerq@localhost:5432/runnerq`):
+Every example talks to Postgres. Start one here:
 
 ```bash
-export DATABASE_URL="postgres://postgres:runnerq@localhost:5432/runnerq"
+docker compose up -d      # Postgres on localhost:5432
 ```
 
-## basic/
+Each example reads `DATABASE_URL` and falls back to
+`postgres://postgres:runnerq@localhost:5432/runnerq`, so once Postgres is up
+you can just `cd` into any example and `go run .`.
 
-Getting started with RunnerQ and the PostgreSQL backend. Creates a worker engine, registers a test activity handler that retries on the first 2 attempts, enqueues activities periodically, and serves the console UI.
+When you're done: `docker compose down -v`.
 
-```bash
-go run ./examples/basic
-```
+## The walkthrough
 
-## observability/
+| # | Example | What it teaches |
+|---|---------|-----------------|
+| 01 | [hello-workflow](01-hello-workflow/) | A durable two-step workflow — the smallest useful program |
+| 02 | [crash-and-resume](02-crash-and-resume/) | **The headline.** Kill it mid-flight; it resumes without redoing work |
+| 03 | [steps-and-retries](03-steps-and-retries/) | `.Step()` — child activities that survive a retry without re-running |
+| 04 | [checkpoint-side-effects](04-checkpoint-side-effects/) | `ctx.Run` — charge once, even when the handler retries |
+| 05 | [durable-sleep](05-durable-sleep/) | `ctx.Sleep` — timers that survive restarts (a 24h wait holds no worker) |
+| 06 | [human-approval](06-human-approval/) | `ctx.WaitForSignal` — pause for an approval/webhook, delivered over HTTP |
+| 07 | [fan-out](07-fan-out/) | `WaitAll` — spawn many children, run them in parallel, collect results |
 
-### console_ui/
+If you only run one, run **02** — it's the demo that shows what "durable" means.
 
-The simplest way to add the RunnerQ Console UI with real-time SSE updates. No extra configuration required.
+## More examples
 
-```bash
-go run ./examples/observability/console_ui
-```
+These predate the walkthrough above and are being reworked, but still run:
 
-### sse_events/
-
-Tests SSE event emission end-to-end. Enqueues activities that retry, so you can observe the full lifecycle (enqueued, dequeued, started, failed, retried, completed) in the browser DevTools console.
-
-```bash
-go run ./examples/observability/sse_events
-```
-
-## advanced/
-
-### activity_filtering/
-
-Runs multiple worker engines on the **same queue**, each filtering for different activity types. Demonstrates workload isolation without separate queues or binaries:
-
-| Node          | Activity Types               |
-|---------------|------------------------------|
-| `email-node`  | `send_email`, `send_sms`     |
-| `trade-node`  | `execute_trade`              |
-| `catch-all`   | everything                   |
-
-```bash
-go run ./examples/advanced/activity_filtering
-```
+- [observability/](observability/) — the built-in web console (live activity view over SSE).
+- [advanced/activity_filtering/](advanced/activity_filtering/) — multiple worker fleets sharing one queue, each handling different activity types.
