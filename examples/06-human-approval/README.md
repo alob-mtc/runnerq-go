@@ -27,7 +27,7 @@ curl -X POST localhost:8080/approve     # or /reject
 
 ## Expected output
 
-```
+```text
 workflow <id> is waiting.
   ⏸ awaiting a decision (POST /approve or /reject) — parked, holding no worker
   ✓ decision received: {"approved":true}

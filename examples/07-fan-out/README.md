@@ -23,7 +23,7 @@ go run .
 
 ## Expected output
 
-```
+```text
   spawned 3 page workers; parking until all finish
   ✓ page "intro": 100 words
   ✓ page "body": 200 words

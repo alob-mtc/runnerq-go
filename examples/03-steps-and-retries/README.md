@@ -22,7 +22,7 @@ go run .
 
 ## Expected output
 
-```
+```text
 process_order attempt #0
     ▶ reserve_inventory EXECUTING (run #1)
   ✓ reserved: {"qty":1,"sku":"WIDGET-1"}

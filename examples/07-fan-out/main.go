@@ -64,7 +64,9 @@ func (h *ProcessDocument) Handle(ctx runnerq.ActivityContext, payload json.RawMe
 		var out struct {
 			Words int `json:"words"`
 		}
-		_ = json.Unmarshal(r, &out)
+		if err := json.Unmarshal(r, &out); err != nil {
+			return nil, runnerq.NewNonRetryError("bad page result: " + err.Error())
+		}
 		fmt.Printf("  ✓ page %q: %d words\n", pages[i], out.Words)
 		total += out.Words
 	}
@@ -82,7 +84,9 @@ func (h *ProcessPage) Handle(ctx runnerq.ActivityContext, payload json.RawMessag
 		Page  string `json:"page"`
 		Index int    `json:"index"`
 	}
-	_ = json.Unmarshal(payload, &in)
+	if err := json.Unmarshal(payload, &in); err != nil {
+		return nil, runnerq.NewNonRetryError("bad page payload: " + err.Error())
+	}
 	time.Sleep(2 * time.Second) // simulate real work
 	words := 100 * (in.Index + 1)
 	return json.Marshal(map[string]any{"words": words})

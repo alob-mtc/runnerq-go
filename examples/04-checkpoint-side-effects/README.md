@@ -20,7 +20,7 @@ go run .
 
 ## Expected output
 
-```
+```text
 billing_run attempt #0
   ▶ charge-credits EXECUTING (run #1) — real money moves here
   ▶ send-batch EXECUTING (run #1)

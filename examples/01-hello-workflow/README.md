@@ -18,7 +18,7 @@ go run .
 
 ## Expected output
 
-```
+```text
 starting signup workflow...
   ▶ creating account for ada@example.com
   ▶ sending welcome email to ada@example.com

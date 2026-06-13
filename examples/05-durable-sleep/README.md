@@ -24,7 +24,7 @@ go run .
 
 ## Expected output
 
-```
+```text
   ▶ 10:58:58  welcome email sent
   ⏳ waiting 5s before the follow-up (this is a durable timer)
   ▶ 10:59:03  tips email sent          ← ~5s later

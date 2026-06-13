@@ -113,7 +113,11 @@ func main() {
 	mux.HandleFunc("/approve", decide(true))
 	mux.HandleFunc("/reject", decide(false))
 	srv := &http.Server{Addr: ":8080", Handler: mux}
-	go srv.ListenAndServe()
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("approval server failed (port in use?): %v", err)
+		}
+	}()
 	defer srv.Close()
 
 	fmt.Printf("\nworkflow %s is waiting.\n", activityID)

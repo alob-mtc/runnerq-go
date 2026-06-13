@@ -21,7 +21,7 @@ go run .
 
 You'll see it reserve, charge, then pause at:
 
-```
+```text
   ✓ reserve-inventory
   ✓ charge-card
 
@@ -36,7 +36,7 @@ go run .
 
 ## Expected output (the second run)
 
-```
+```text
   ✓ reserve-inventory          ← no "EXECUTING" line: replayed from checkpoint
   ✓ charge-card                ← no "EXECUTING" line: NOT re-charged
   ▶ EXECUTING ship-order          (real side effect)
