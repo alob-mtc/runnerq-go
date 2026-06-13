@@ -83,12 +83,16 @@ emailEngine, _ := runnerq.Builder().Backend(backend).
 reportEngine, _ := runnerq.Builder().Backend(backend).
     ActivityTypes([]string{"generate_report"}).MaxWorkers(8).Build()
 
-catchAll, _ := runnerq.Builder().Backend(backend).MaxWorkers(2).Build()  // no filter
+// A no-filter engine is a catch-all: it dequeues EVERY type, so it must
+// register a handler for each — otherwise it claims work it can't run and
+// fails it as handler_not_found. Register all handlers here, or give every
+// type a dedicated filtered fleet.
+catchAll, _ := runnerq.Builder().Backend(backend).MaxWorkers(2).Build()
 ```
 
 An engine whose `Dequeue` filter lists a type with no registered handler
 panics at `Start()` with a clear message. See
-[examples/advanced/activity_filtering](../examples/advanced/activity_filtering/).
+[example 12](../examples/12-workload-isolation/).
 
 ## Retention
 
