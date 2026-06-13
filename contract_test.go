@@ -98,7 +98,7 @@ func TestContract_NoLostNoDuplicateWork_ConcurrentFleets(t *testing.T) {
 	// Build the fleets (separate backends → distinct connection pools, like
 	// separate processes), all on the same queue.
 	var engines []*WorkerEngine
-	for f := 0; f < fleets; f++ {
+	for f := range fleets {
 		b := contractBackend(t, dsn, queue)
 		e, err := Builder().Backend(b).QueueName(queue).MaxWorkers(workers).Build()
 		if err != nil {
@@ -111,7 +111,7 @@ func TestContract_NoLostNoDuplicateWork_ConcurrentFleets(t *testing.T) {
 	// Enqueue everything BEFORE starting any worker, so all 200 are pending
 	// and the fleets race to claim them.
 	exec := engines[0].GetActivityExecutor()
-	for i := 0; i < activities; i++ {
+	for i := range activities {
 		p, _ := json.Marshal(map[string]int{"id": i})
 		if _, err := exec.Activity("unit").Payload(p).Execute(context.Background()); err != nil {
 			t.Fatalf("enqueue %d: %v", i, err)
@@ -177,7 +177,7 @@ func TestContract_ConcurrentIdempotentEnqueue(t *testing.T) {
 	exec := e.GetActivityExecutor()
 	ids := make([]uuid.UUID, callers)
 	var wg sync.WaitGroup
-	for i := 0; i < callers; i++ {
+	for i := range callers {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()

@@ -272,7 +272,6 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 
 	done := make(chan string, len(tasks))
 	for _, t := range tasks {
-		t := t
 		go func() {
 			t.fn()
 			done <- t.name

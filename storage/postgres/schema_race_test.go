@@ -19,17 +19,15 @@ func TestConcurrentSchemaInitDoesNotDeadlock(t *testing.T) {
 	const n = 10
 	var wg sync.WaitGroup
 	errs := make(chan error, n)
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range n {
+		wg.Go(func() {
 			b, err := WithConfig(context.Background(), dsn, "t_schema_race", 30_000, 2)
 			if err != nil {
 				errs <- err
 				return
 			}
 			b.Close()
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)

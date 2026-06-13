@@ -359,7 +359,7 @@ func (w *watcher) wakeResultWaiters(payload string) {
 	if len(w.resultWaiters) == 0 {
 		return
 	}
-	for _, part := range strings.Split(payload, ",") {
+	for part := range strings.SplitSeq(payload, ",") {
 		id, err := uuid.Parse(part)
 		if err != nil {
 			continue
