@@ -231,6 +231,12 @@ own README. `docker compose up -d` once, then `go run .` in any of them.
 | 05 | [durable-sleep](examples/05-durable-sleep/) | timers that survive restarts |
 | 06 | [human-approval](examples/06-human-approval/) | pause for an approval, delivered over HTTP |
 | 07 | [fan-out](examples/07-fan-out/) | spawn many children, run them in parallel |
+| 08 | [exactly-once-webhook](examples/08-exactly-once-webhook/) | idempotency keys collapse duplicate deliveries |
+| 09 | [cross-process-futures](examples/09-cross-process-futures/) | enqueue in a web tier, await by ID anywhere |
+| 10 | [retries-and-dead-letter](examples/10-retries-and-dead-letter/) | backoff, the dead-letter queue, `OnDeadLetter` |
+| 11 | [retention](examples/11-retention/) | TTL cleanup of completed workflows |
+| 12 | [workload-isolation](examples/12-workload-isolation/) | many worker fleets sharing one queue |
+| 13 | [console](examples/13-console/) | the built-in observability dashboard |
 
 ## Documentation
 

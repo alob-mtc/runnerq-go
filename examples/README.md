@@ -19,6 +19,8 @@ When you're done: `docker compose down -v`.
 
 ## The walkthrough
 
+Durable execution — start here:
+
 | # | Example | What it teaches |
 |---|---------|-----------------|
 | 01 | [hello-workflow](01-hello-workflow/) | A durable two-step workflow — the smallest useful program |
@@ -29,11 +31,15 @@ When you're done: `docker compose down -v`.
 | 06 | [human-approval](06-human-approval/) | `ctx.WaitForSignal` — pause for an approval/webhook, delivered over HTTP |
 | 07 | [fan-out](07-fan-out/) | `WaitAll` — spawn many children, run them in parallel, collect results |
 
+Patterns & operations:
+
+| # | Example | What it teaches |
+|---|---------|-----------------|
+| 08 | [exactly-once-webhook](08-exactly-once-webhook/) | Idempotency keys — duplicate webhook deliveries collapse to one |
+| 09 | [cross-process-futures](09-cross-process-futures/) | `FutureFor` — enqueue in a web tier, await the result anywhere by ID |
+| 10 | [retries-and-dead-letter](10-retries-and-dead-letter/) | Backoff, the dead-letter queue, and the `OnDeadLetter` callback |
+| 11 | [retention](11-retention/) | TTL cleanup of completed workflow trees |
+| 12 | [workload-isolation](12-workload-isolation/) | Many worker fleets on one queue, each handling its own types |
+| 13 | [console](13-console/) | The built-in observability dashboard, on a live workflow stream |
+
 If you only run one, run **02** — it's the demo that shows what "durable" means.
-
-## More examples
-
-These predate the walkthrough above and are being reworked, but still run:
-
-- [observability/](observability/) — the built-in web console (live activity view over SSE).
-- [advanced/activity_filtering/](advanced/activity_filtering/) — multiple worker fleets sharing one queue, each handling different activity types.
