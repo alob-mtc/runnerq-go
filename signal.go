@@ -47,7 +47,7 @@ func (e *WorkerEngine) Signal(ctx context.Context, activityID uuid.UUID, name st
 // instance, the name selects which of its waits to satisfy. A key owns at most
 // one activity (idempotency primary key), so there is no fan-out ambiguity.
 // When the key is unclaimed (never enqueued, or completed and retention-swept)
-// it returns an ErrActivityNotFound error (check with IsActivityNotFound) —
+// it returns an ErrActivityNotFoundW worker error (check with IsActivityNotFound) —
 // typically treated as "already settled / nothing to wake".
 //
 // Resolution and delivery are two steps rather than one transaction; this only
