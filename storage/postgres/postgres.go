@@ -1101,6 +1101,24 @@ func (b *PostgresBackend) WakeWaiting(ctx context.Context, activityID uuid.UUID)
 	return true, nil
 }
 
+// LookupIdempotencyActivityID resolves an idempotency key to the activity
+// that currently owns it. The (queue_name, idempotency_key) primary key makes
+// this a single-row point lookup; a miss returns a not-found error.
+func (b *PostgresBackend) LookupIdempotencyActivityID(ctx context.Context, idempotencyKey string) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := b.pool.QueryRow(ctx, `
+		SELECT activity_id FROM runnerq_idempotency
+		WHERE queue_name = $1 AND idempotency_key = $2`,
+		b.queueName, idempotencyKey).Scan(&id)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return uuid.Nil, storage.NewNotFoundError(fmt.Sprintf("no activity owns idempotency key %q", idempotencyKey))
+		}
+		return uuid.Nil, storage.NewInternalError(fmt.Sprintf("Failed to look up idempotency key: %v", err))
+	}
+	return id, nil
+}
+
 // cleanupLockClass namespaces the per-queue advisory lock that elects a
 // single retention sweeper across all processes. Arbitrary but stable.
 const cleanupLockClass = int32(1381913428) // "RQCT"
