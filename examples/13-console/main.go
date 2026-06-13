@@ -112,7 +112,16 @@ func main() {
 		for {
 			n := seq.Add(1)
 			payload, _ := json.Marshal(map[string]int{"order": int(n)})
-			if _, err := engine.GetActivityExecutor().Activity("fulfill_order").Payload(payload).Execute(ctx); err != nil {
+			// A short timeout (well under the 8s "packing" sleep) makes that
+			// sleep YIELD: the order parks as "waiting" in Postgres until the
+			// timer fires, so the console shows the waiting state. Without
+			// this, the sleep fits the default 300s budget and waits
+			// in-process, appearing only as "processing".
+			if _, err := engine.GetActivityExecutor().
+				Activity("fulfill_order").
+				Timeout(4 * time.Second).
+				Payload(payload).
+				Execute(ctx); err != nil {
 				log.Printf("enqueue order %d failed: %v", n, err)
 			}
 			time.Sleep(2 * time.Second)
