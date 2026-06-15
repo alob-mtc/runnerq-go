@@ -42,8 +42,9 @@ type activityQueue interface {
 	ScheduleActivity(ctx context.Context, a *activity) error
 	ProcessScheduledActivities(ctx context.Context) ([]*activity, error)
 	// Yield parks a processing activity as scheduled until wakeAt without
-	// consuming a retry. Used by durable Sleep.
-	Yield(ctx context.Context, a *activity, wakeAt time.Time, workerID string) error
+	// consuming a retry. Used by durable Sleep/WaitForSignal/await. kind and
+	// step describe the wait for observability (recorded on the Yielded event).
+	Yield(ctx context.Context, a *activity, wakeAt time.Time, workerID, kind, step string) error
 	RequeueExpired(ctx context.Context, maxToProcess int) (uint64, error)
 	// EnqueueIdempotent atomically claims the activity's idempotency key and
 	// enqueues it. A nil result means the activity was enqueued; callers must
@@ -53,8 +54,10 @@ type activityQueue interface {
 	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
 	// StoreResult persists a result row. owner is the activity whose workflow
 	// tree governs the row's lifetime (the activity itself for normal results;
-	// the handler's activity for Run/Sleep checkpoints).
-	StoreResult(ctx context.Context, activityID uuid.UUID, owner uuid.UUID, result activityResult) error
+	// the handler's activity for Run/Sleep checkpoints). step is the
+	// checkpoint's human identity ("kind:name") for the console, "" for a
+	// normal result.
+	StoreResult(ctx context.Context, activityID uuid.UUID, owner uuid.UUID, result activityResult, step string) error
 	GetResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error)
 	// WaitForResult blocks until the activity's result exists or ctx is done.
 	WaitForResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error)
@@ -225,8 +228,8 @@ func (a *backendQueueAdapter) RequeueExpired(ctx context.Context, maxToProcess i
 	return a.backend.RequeueExpired(ctx, maxToProcess)
 }
 
-func (a *backendQueueAdapter) Yield(ctx context.Context, act *activity, wakeAt time.Time, workerID string) error {
-	return a.backend.Yield(ctx, act.ID, wakeAt, workerID)
+func (a *backendQueueAdapter) Yield(ctx context.Context, act *activity, wakeAt time.Time, workerID, kind, step string) error {
+	return a.backend.Yield(ctx, act.ID, wakeAt, workerID, kind, step)
 }
 
 func (a *backendQueueAdapter) EnqueueIdempotent(ctx context.Context, act *activity) (*storage.IdempotencyResult, error) {
@@ -238,12 +241,12 @@ func (a *backendQueueAdapter) ExtendLease(ctx context.Context, activityID uuid.U
 	return a.backend.ExtendLease(ctx, activityID, extendBy)
 }
 
-func (a *backendQueueAdapter) StoreResult(ctx context.Context, activityID uuid.UUID, owner uuid.UUID, result activityResult) error {
+func (a *backendQueueAdapter) StoreResult(ctx context.Context, activityID uuid.UUID, owner uuid.UUID, result activityResult, step string) error {
 	backendResult := storage.ActivityResult{
 		Data:  result.Data,
 		State: storage.ResultState(result.State),
 	}
-	return a.backend.StoreResult(ctx, activityID, owner, backendResult)
+	return a.backend.StoreResult(ctx, activityID, owner, backendResult, step)
 }
 
 func (a *backendQueueAdapter) GetResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error) {

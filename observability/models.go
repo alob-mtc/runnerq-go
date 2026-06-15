@@ -75,6 +75,17 @@ type ActivityEvent struct {
 	Detail     json.RawMessage   `json:"detail,omitempty"`
 }
 
+// StepView is one durable checkpoint of an activity (a ctx.Run or ctx.Sleep
+// step) for the console's step-history view. Kind is "run"/"sleep"; Data is the
+// stored result (Run) or the persisted wake deadline (Sleep).
+type StepView struct {
+	Kind      string          `json:"kind"`
+	Name      string          `json:"name"`
+	State     string          `json:"state"` // "Ok" | "Err"
+	Data      json.RawMessage `json:"data,omitempty"`
+	CreatedAt time.Time       `json:"created_at"`
+}
+
 // DeadLetterRecord is an activity that exhausted retries or permanently failed.
 type DeadLetterRecord struct {
 	Activity ActivitySnapshot `json:"activity"`

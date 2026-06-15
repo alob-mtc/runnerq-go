@@ -31,3 +31,6 @@ vendor/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local scratch workspace (e.g. antion-go brought in temporarily)
+temp/

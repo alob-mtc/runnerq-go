@@ -291,17 +291,22 @@ func (b *PostgresBackend) recordEvent(ctx context.Context, tx pgx.Tx, activityID
 // tree governs this row's lifetime (equals activityID for normal results;
 // the handler's activity for Run/Sleep checkpoints) — the retention sweeper
 // deletes result rows by owner alongside the tree.
-func (b *PostgresBackend) storeResultTx(ctx context.Context, tx pgx.Tx, activityID, owner uuid.UUID, result *storage.ActivityResult, now time.Time) error {
+func (b *PostgresBackend) storeResultTx(ctx context.Context, tx pgx.Tx, activityID, owner uuid.UUID, result *storage.ActivityResult, now time.Time, step string) error {
 	stateStr := "Ok"
 	if result.State == storage.ResultErr {
 		stateStr = "Err"
 	}
+	// Empty step → NULL: an activity's own result has no checkpoint identity.
+	var stepArg any
+	if step != "" {
+		stepArg = step
+	}
 	_, err := tx.Exec(ctx, `
-		INSERT INTO runnerq_results (activity_id, queue_name, state, data, created_at, owner_activity_id)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO runnerq_results (activity_id, queue_name, state, data, created_at, owner_activity_id, step)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (activity_id) DO UPDATE
-		SET state = $3, data = $4, created_at = $5, owner_activity_id = $6`,
-		activityID, b.queueName, stateStr, result.Data, now, owner)
+		SET state = $3, data = $4, created_at = $5, owner_activity_id = $6, step = $7`,
+		activityID, b.queueName, stateStr, result.Data, now, owner, stepArg)
 	if err != nil {
 		return storage.NewInternalError(fmt.Sprintf("Failed to store result: %v", err))
 	}
@@ -595,7 +600,7 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 	// transaction means completion and result are atomic — a crash can't leave
 	// a completed activity with no result.
 	ar := &storage.ActivityResult{Data: result, State: storage.ResultOk}
-	if err := b.storeResultTx(ctx, tx, activityID, activityID, ar, now); err != nil {
+	if err := b.storeResultTx(ctx, tx, activityID, activityID, ar, now, ""); err != nil {
 		return err
 	}
 
@@ -697,7 +702,7 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 			"type":      "non_retryable",
 			"failed_at": now.Format(time.RFC3339),
 		}), State: storage.ResultErr}
-		if err := b.storeResultTx(ctx, tx, activityID, activityID, res, now); err != nil {
+		if err := b.storeResultTx(ctx, tx, activityID, activityID, res, now, ""); err != nil {
 			return false, err
 		}
 		if err := b.recordEvent(ctx, tx, activityID, storage.EventFailed, &workerID,
@@ -814,7 +819,7 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		"type":      "dead_letter",
 		"failed_at": now.Format(time.RFC3339),
 	}), State: storage.ResultErr}
-	if err := b.storeResultTx(ctx, tx, activityID, activityID, res, now); err != nil {
+	if err := b.storeResultTx(ctx, tx, activityID, activityID, res, now, ""); err != nil {
 		return false, err
 	}
 	if err := b.recordEvent(ctx, tx, activityID, storage.EventDeadLetter, &workerID,
@@ -930,7 +935,7 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 				"type":      "dead_letter",
 				"failed_at": now.Format(time.RFC3339),
 			}), State: storage.ResultErr}
-			if err := b.storeResultTx(ctx, tx, r.id, r.id, res, now); err != nil {
+			if err := b.storeResultTx(ctx, tx, r.id, r.id, res, now, ""); err != nil {
 				return 0, err
 			}
 			if err := b.recordEvent(ctx, tx, r.id, storage.EventDeadLetter, nil,
@@ -970,7 +975,7 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 // Sleep continuation, not a failure: retry_count is untouched and started_at
 // is cleared for the next attempt. Fenced on workerID like the acks so a
 // stale worker can't park a row another worker has since reclaimed.
-func (b *PostgresBackend) Yield(ctx context.Context, activityID uuid.UUID, wakeAt time.Time, workerID string) error {
+func (b *PostgresBackend) Yield(ctx context.Context, activityID uuid.UUID, wakeAt time.Time, workerID, kind, step string) error {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
 		return storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
@@ -996,8 +1001,18 @@ func (b *PostgresBackend) Yield(ctx context.Context, activityID uuid.UUID, wakeA
 		return storage.NewNotFoundError(fmt.Sprintf("Activity %s is not in a claimable state for yield", activityID))
 	}
 
+	// kind/step describe the wait (sleep/signal/await + the step or signal
+	// name) so the console can show "why is it Waiting"; omitted when empty so
+	// the detail stays small.
+	yieldDetail := map[string]any{"wake_at": wakeAt.Format(time.RFC3339)}
+	if kind != "" {
+		yieldDetail["kind"] = kind
+	}
+	if step != "" {
+		yieldDetail["step"] = step
+	}
 	if err := b.recordEvent(ctx, tx, activityID, storage.EventYielded, &workerID,
-		toDetail(map[string]any{"wake_at": wakeAt.Format(time.RFC3339)})); err != nil {
+		toDetail(yieldDetail)); err != nil {
 		return err
 	}
 
@@ -1042,7 +1057,7 @@ func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UU
 	}
 
 	res := &storage.ActivityResult{Data: payload, State: storage.ResultOk}
-	if err := b.storeResultTx(ctx, tx, signalID, activityID, res, now); err != nil {
+	if err := b.storeResultTx(ctx, tx, signalID, activityID, res, now, ""); err != nil {
 		return err
 	}
 
@@ -1288,7 +1303,7 @@ func (b *PostgresBackend) RecordSpawnLinked(ctx context.Context, childID, parent
 	return nil
 }
 
-func (b *PostgresBackend) StoreResult(ctx context.Context, activityID uuid.UUID, ownerActivityID uuid.UUID, result storage.ActivityResult) error {
+func (b *PostgresBackend) StoreResult(ctx context.Context, activityID uuid.UUID, ownerActivityID uuid.UUID, result storage.ActivityResult, step string) error {
 	stateStr := "Ok"
 	if result.State == storage.ResultErr {
 		stateStr = "Err"
@@ -1307,7 +1322,7 @@ func (b *PostgresBackend) StoreResult(ctx context.Context, activityID uuid.UUID,
 	}
 	defer tx.Rollback(ctx)
 
-	if err := b.storeResultTx(ctx, tx, activityID, ownerActivityID, &result, now); err != nil {
+	if err := b.storeResultTx(ctx, tx, activityID, ownerActivityID, &result, now, step); err != nil {
 		return err
 	}
 	if err := b.recordEvent(ctx, tx, activityID, storage.EventResultStored, nil,
@@ -1902,6 +1917,44 @@ func (b *PostgresBackend) ListCronActivities(ctx context.Context, offset, limit 
 	defer rows.Close()
 
 	return b.scanSnapshots(rows)
+}
+
+// GetActivitySteps returns an activity's durable checkpoint rows (its ctx.Run /
+// ctx.Sleep steps), oldest first. Hits idx_runnerq_results_owner; console-only,
+// never a hot path. step is stored as "kind:name" and split here.
+func (b *PostgresBackend) GetActivitySteps(ctx context.Context, ownerActivityID uuid.UUID) ([]storage.StepRecord, error) {
+	rows, err := b.pool.Query(ctx, `
+		SELECT step, state, data, created_at
+		FROM runnerq_results
+		WHERE queue_name = $1 AND owner_activity_id = $2 AND step IS NOT NULL
+		ORDER BY created_at ASC`,
+		b.queueName, ownerActivityID)
+	if err != nil {
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to get activity steps: %v", err))
+	}
+	defer rows.Close()
+
+	var steps []storage.StepRecord
+	for rows.Next() {
+		var step, stateStr string
+		var data json.RawMessage
+		var createdAt time.Time
+		if err := rows.Scan(&step, &stateStr, &data, &createdAt); err != nil {
+			return nil, storage.NewInternalError(fmt.Sprintf("Failed to scan step: %v", err))
+		}
+		kind, name := step, ""
+		if i := strings.IndexByte(step, ':'); i >= 0 {
+			kind, name = step[:i], step[i+1:]
+		}
+		state := storage.ResultOk
+		if stateStr != "Ok" {
+			state = storage.ResultErr
+		}
+		steps = append(steps, storage.StepRecord{
+			Kind: kind, Name: name, State: state, Data: data, CreatedAt: createdAt,
+		})
+	}
+	return steps, nil
 }
 
 func (b *PostgresBackend) GetSubtree(ctx context.Context, rootID uuid.UUID) ([]storage.ActivitySnapshot, error) {

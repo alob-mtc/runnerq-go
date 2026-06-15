@@ -357,3 +357,98 @@ func TestSleepYieldsBeyondTimeoutBudget(t *testing.T) {
 		t.Fatal("no Yielded event recorded")
 	}
 }
+
+// A workflow's ctx.Run and ctx.Sleep checkpoints are recorded with their human
+// identity so the console can show step history. (Feature A.)
+func TestStepHistoryRecorded(t *testing.T) {
+	h := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		if _, err := ctx.Run("alpha", func() (json.RawMessage, error) {
+			return json.RawMessage(`{"a":1}`), nil
+		}); err != nil {
+			return nil, err
+		}
+		if err := ctx.Sleep("nap", 10*time.Millisecond); err != nil {
+			return nil, err
+		}
+		if _, err := ctx.Run("beta", func() (json.RawMessage, error) {
+			return json.RawMessage(`"ok"`), nil
+		}); err != nil {
+			return nil, err
+		}
+		return json.RawMessage(`{"done":true}`), nil
+	}}
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("func", h) })
+
+	fut, err := rig.engine.GetActivityExecutor().Activity("func").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	rig.await(t, fut.activityID, 20*time.Second)
+
+	steps, err := rig.backend.GetActivitySteps(context.Background(), fut.activityID)
+	if err != nil {
+		t.Fatalf("steps: %v", err)
+	}
+	want := []struct{ kind, name string }{{"run", "alpha"}, {"sleep", "nap"}, {"run", "beta"}}
+	if len(steps) != len(want) {
+		t.Fatalf("got %d steps, want %d: %+v", len(steps), len(want), steps)
+	}
+	for i, w := range want {
+		if steps[i].Kind != w.kind || steps[i].Name != w.name {
+			t.Fatalf("step %d = %q:%q, want %q:%q", i, steps[i].Kind, steps[i].Name, w.kind, w.name)
+		}
+		if steps[i].State != storage.ResultOk {
+			t.Fatalf("step %q state = %v, want Ok", steps[i].Name, steps[i].State)
+		}
+	}
+	var alpha map[string]int
+	if err := json.Unmarshal(steps[0].Data, &alpha); err != nil || alpha["a"] != 1 {
+		t.Fatalf("alpha stored data = %s, want {\"a\":1}", steps[0].Data)
+	}
+	// The activity's own final result must NOT appear as a step.
+	for _, s := range steps {
+		if s.Name == "" {
+			t.Fatalf("unnamed (own-result) row leaked into step history: %+v", s)
+		}
+	}
+}
+
+// A parked durable wait records WHY on the Yielded event (kind + step), so the
+// console can show "Sleeping…/Waiting for signal…" instead of bare "Waiting".
+// (Feature B.)
+func TestYieldEventCarriesWaitReason(t *testing.T) {
+	h := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		// 4s wait in a 2s budget → parks, recording a Yielded event.
+		if err := ctx.Sleep("cool-off", 4*time.Second); err != nil {
+			return nil, err
+		}
+		return json.RawMessage(`{"slept":true}`), nil
+	}}
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("func", h) })
+
+	fut, err := rig.engine.GetActivityExecutor().
+		Activity("func").Timeout(2 * time.Second).Payload(json.RawMessage(`{}`)).Execute(context.Background())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	rig.await(t, fut.activityID, 30*time.Second)
+
+	events, err := rig.backend.GetActivityEvents(context.Background(), fut.activityID, 100)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	found := false
+	for _, ev := range events {
+		if ev.EventType != storage.EventYielded {
+			continue
+		}
+		var d map[string]any
+		_ = json.Unmarshal(ev.Detail, &d)
+		if d["kind"] == "sleep" && d["step"] == "cool-off" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no Yielded event carrying kind=sleep step=cool-off")
+	}
+}
