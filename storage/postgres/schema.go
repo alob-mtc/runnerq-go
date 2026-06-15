@@ -126,6 +126,15 @@ CREATE INDEX IF NOT EXISTS idx_runnerq_results_owner
     ON runnerq_results(queue_name, owner_activity_id)
     WHERE owner_activity_id IS NOT NULL;
 
+-- step is the human identity of a checkpoint row, "kind:name" (e.g.
+-- "run:create-transfer", "sleep:retry-backoff") — the same string the checkpoint
+-- ID is derived from, persisted so the console can show a workflow's durable
+-- step history (the checkpoint ID itself is a one-way hash). NULL for an
+-- activity's own final result and for legacy rows. No dedicated index: read only
+-- by owner (already indexed above) on the console path, never on a hot path.
+ALTER TABLE runnerq_results
+    ADD COLUMN IF NOT EXISTS step TEXT;
+
 -- Retention sweep: find roots that have been terminal longer than the TTL.
 CREATE INDEX IF NOT EXISTS idx_runnerq_root_terminal_age
     ON runnerq_activities(queue_name, status, completed_at)

@@ -26,6 +26,7 @@ func RunnerQUI(inspector *observability.QueueInspector) http.Handler {
 	mux.HandleFunc("GET /api/observability/cron", cronActivitiesHandler(inspector))
 	mux.HandleFunc("GET /api/observability/activities/{key}", activityCollectionOrDetail(inspector))
 	mux.HandleFunc("GET /api/observability/activities/{id}/events", activityEventsHandler(inspector))
+	mux.HandleFunc("GET /api/observability/activities/{id}/steps", activityStepsHandler(inspector))
 	mux.HandleFunc("GET /api/observability/activities/{id}/result", activityResultHandler(inspector))
 	mux.HandleFunc("GET /api/observability/activities/{id}/subtree", subtreeHandler(inspector))
 	mux.HandleFunc("GET /api/observability/activities/{id}/children", childrenHandler(inspector))
@@ -43,6 +44,7 @@ func ObservabilityAPI(inspector *observability.QueueInspector) http.Handler {
 	mux.HandleFunc("GET /cron", cronActivitiesHandler(inspector))
 	mux.HandleFunc("GET /activities/{key}", activityCollectionOrDetail(inspector))
 	mux.HandleFunc("GET /activities/{id}/events", activityEventsHandler(inspector))
+	mux.HandleFunc("GET /activities/{id}/steps", activityStepsHandler(inspector))
 	mux.HandleFunc("GET /activities/{id}/result", activityResultHandler(inspector))
 	mux.HandleFunc("GET /activities/{id}/subtree", subtreeHandler(inspector))
 	mux.HandleFunc("GET /activities/{id}/children", childrenHandler(inspector))
@@ -179,6 +181,22 @@ func activityEventsHandler(inspector *observability.QueueInspector) http.Handler
 			return
 		}
 		writeJSON(w, http.StatusOK, events)
+	}
+}
+
+func activityStepsHandler(inspector *observability.QueueInspector) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := uuid.Parse(r.PathValue("id"))
+		if err != nil {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+		steps, err := inspector.GetActivitySteps(r.Context(), id)
+		if err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, steps)
 	}
 }
 

@@ -265,6 +265,30 @@ func (q *QueueInspector) GetChildren(ctx context.Context, parentID uuid.UUID, of
 	return convertSnapshots(snapshots), nil
 }
 
+// GetActivitySteps returns an activity's durable checkpoint history (its
+// ctx.Run / ctx.Sleep steps), oldest first.
+func (q *QueueInspector) GetActivitySteps(ctx context.Context, activityID uuid.UUID) ([]StepView, error) {
+	recs, err := q.backend.GetActivitySteps(ctx, activityID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]StepView, 0, len(recs))
+	for _, r := range recs {
+		state := "Ok"
+		if r.State != storage.ResultOk {
+			state = "Err"
+		}
+		out = append(out, StepView{
+			Kind:      r.Kind,
+			Name:      r.Name,
+			State:     state,
+			Data:      r.Data,
+			CreatedAt: r.CreatedAt,
+		})
+	}
+	return out, nil
+}
+
 // GetSubtree returns all activities in the lineage tree rooted at rootID.
 func (q *QueueInspector) GetSubtree(ctx context.Context, rootID uuid.UUID) ([]ActivitySnapshot, error) {
 	snapshots, err := q.backend.GetSubtree(ctx, rootID)

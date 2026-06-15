@@ -494,7 +494,7 @@ func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result 
 // requeues it, and the handler replays to the same Sleep — degraded latency
 // and one consumed retry, not lost work.
 func (e *WorkerEngine) handleYield(ctx context.Context, act *activity, ys *yieldPark, workerLabel string, workerID int, activityID any, activityType string) {
-	if err := e.queue.Yield(ctx, act, ys.wakeAt, workerLabel); err != nil {
+	if err := e.queue.Yield(ctx, act, ys.wakeAt, workerLabel, ys.kind, ys.step); err != nil {
 		slog.Error("Failed to park yielding activity; lease expiry will recover it",
 			"worker_id", workerID, "activity_id", activityID, "activity_type", activityType,
 			"wake_at", ys.wakeAt, "error", err)

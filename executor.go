@@ -122,6 +122,7 @@ func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error)
 	// closes the race with a child that completed while we were parking.
 	return nil, &yieldPark{
 		wakeAt:  time.Now().UTC().Add(signalParkHorizon),
+		kind:    "await",
 		step:    "await:" + f.activityID.String(),
 		recheck: f.activityID,
 	}

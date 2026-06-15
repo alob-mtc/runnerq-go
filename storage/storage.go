@@ -84,6 +84,18 @@ type ActivityResult struct {
 	State ResultState
 }
 
+// StepRecord is one durable checkpoint of an activity (a ctx.Run or ctx.Sleep
+// step), decoded for inspection. Kind is "run"/"sleep"; Name is the
+// user-supplied step name. Data is the stored result (for Run) or the persisted
+// wake deadline (for Sleep).
+type StepRecord struct {
+	Kind      string
+	Name      string
+	State     ResultState
+	Data      json.RawMessage
+	CreatedAt time.Time
+}
+
 // RetentionPolicy controls how long terminal workflow trees are kept before
 // the retention sweeper deletes them (activities, events, results including
 // Run/Sleep checkpoints, and idempotency keys). A zero duration means "keep
@@ -273,15 +285,19 @@ type QueueStorage interface {
 	// doesn't fit the current attempt's timeout budget. Must be fenced on
 	// workerID like AckSuccess/AckFailure (only the claiming worker may
 	// yield) and return a not-found error when the row is no longer claimed
-	// by that worker.
-	Yield(ctx context.Context, activityID uuid.UUID, wakeAt time.Time, workerID string) error
+	// by that worker. kind ("sleep"/"signal"/"await") and step (the step or
+	// signal name) describe the wait for observability and are recorded on the
+	// Yielded event only; both may be empty and no row state depends on them.
+	Yield(ctx context.Context, activityID uuid.UUID, wakeAt time.Time, workerID, kind, step string) error
 	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
 	// StoreResult persists a result row. ownerActivityID is the activity
 	// whose lifetime governs the row: pass the activity's own ID for normal
 	// results, or the handler's activity ID for Run/Sleep checkpoints whose
-	// activityID is synthetic. The retention sweeper deletes result rows
-	// together with their owner's workflow tree.
-	StoreResult(ctx context.Context, activityID uuid.UUID, ownerActivityID uuid.UUID, result ActivityResult) error
+	// activityID is synthetic. step is the checkpoint's human identity
+	// ("kind:name", e.g. "run:create-transfer") for the console's step history,
+	// or "" for an activity's own result. The retention sweeper deletes result
+	// rows together with their owner's workflow tree.
+	StoreResult(ctx context.Context, activityID uuid.UUID, ownerActivityID uuid.UUID, result ActivityResult, step string) error
 	// WakeWaiting makes a yield-parked ('waiting') activity immediately
 	// runnable; false when the activity is in any other state. The engine
 	// uses it to close the park race (a result committing between a
@@ -347,6 +363,11 @@ type InspectionStorage interface {
 	ListDeadLetter(ctx context.Context, offset, limit int) ([]DeadLetterRecord, error)
 	GetActivity(ctx context.Context, activityID uuid.UUID) (*ActivitySnapshot, error)
 	GetActivityEvents(ctx context.Context, activityID uuid.UUID, limit int) ([]ActivityEvent, error)
+	// GetActivitySteps returns the durable checkpoint rows owned by an activity
+	// (its ctx.Run / ctx.Sleep steps), oldest first — the workflow's step
+	// history for the console. Rows without a step identity (the activity's own
+	// result) are excluded. Reads by owner via the existing owner index.
+	GetActivitySteps(ctx context.Context, ownerActivityID uuid.UUID) ([]StepRecord, error)
 	// GetChildren returns direct children of a parent activity.
 	GetChildren(ctx context.Context, parentID uuid.UUID, offset, limit int) ([]ActivitySnapshot, error)
 	// GetSubtree returns all activities in the tree rooted at rootID, including the root itself.

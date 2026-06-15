@@ -2271,6 +2271,7 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
   const [activity, setActivity] = React.useState(null);
   const [subtree, setSubtree] = React.useState(null);
   const [events, setEvents] = React.useState(null);
+  const [steps, setSteps] = React.useState(null);
   const [result, setResult] = React.useState(null);
   const [activeTab, setActiveTab] = React.useState('history');
   const [selectedAct, setSelectedAct] = React.useState(activityId);
@@ -2281,6 +2282,7 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
     setActivity(null);
     setSubtree(null);
     setEvents(null);
+    setSteps(null);
     setResult(null);
     setSelectedAct(activityId);
     setErr(null);
@@ -2341,6 +2343,7 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
   // activity. Live ticks for the same selectedAct don't clear.
   React.useEffect(() => {
     setEvents(null);
+    setSteps(null);
     setResult(null);
   }, [selectedAct]);
 
@@ -2355,6 +2358,11 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
         if (cancelled) return;
         setEvents(ev || []);
       } catch (e) { /* keep previous events */ }
+      try {
+        const sp = await api('/activities/' + selectedAct + '/steps');
+        if (cancelled) return;
+        setSteps(sp || []);
+      } catch (e) { /* keep previous steps */ }
       try {
         const rs = await api('/activities/' + selectedAct + '/result');
         if (cancelled) return;
@@ -2395,6 +2403,7 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
 
   const tabs = [
     { id: 'history', label: 'History', count: eventCount },
+    { id: 'steps', label: 'Steps', count: steps ? steps.length : 0 },
     { id: 'graph', label: 'Graph', count: tree.length },
     { id: 'metadata', label: 'Metadata' },
     { id: 'workers', label: 'Workers', count: workerSet.size },
@@ -2402,6 +2411,7 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
   ];
 
   const selected = treeById[selectedAct] || activity;
+  const blocked = blockedInfoFor(selected, events);
 
   return (
     <div className="page-scroll">
@@ -2428,9 +2438,16 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
         <div style={{ minWidth: 0 }}>
           {activeTab === 'history' && (
             <>
+              {blocked && <BlockedBanner info={blocked} />}
               <IORow activity={selected} result={result} onCopy={onCopy} />
               <Gantt tree={tree} startMs={startMs} totalMs={totalMs} selectedAct={selectedAct} onSelect={setSelectedAct} />
               <EventLog events={events} />
+            </>
+          )}
+          {activeTab === 'steps' && (
+            <>
+              {blocked && <BlockedBanner info={blocked} />}
+              <StepsView steps={steps} onCopy={onCopy} />
             </>
           )}
           {activeTab === 'graph' && (
@@ -2787,6 +2804,105 @@ function DAG({ tree, selectedAct, onSelect }) {
   );
 }
 
+// blockedInfoFor extracts why an activity is currently parked, from its latest
+// Yielded event. Returns null unless the activity is Waiting/Scheduled.
+function blockedInfoFor(activity, events) {
+  if (!activity || (activity.status !== 'Waiting' && activity.status !== 'Scheduled')) return null;
+  let y = null;
+  (events || []).forEach(e => { if (e.event_type === 'Yielded') y = e; });
+  let kind = '', step = '', wakeAt = activity.scheduled_at || null;
+  if (y && y.detail) {
+    try {
+      const d = typeof y.detail === 'string' ? JSON.parse(y.detail) : y.detail;
+      if (d.kind) kind = d.kind;
+      if (d.step) step = d.step;
+      if (d.wake_at) wakeAt = d.wake_at;
+    } catch (_) {}
+  }
+  return { kind: kind, step: step, wakeAt: wakeAt, status: activity.status };
+}
+
+// fmtUntil renders a coarse "in 2h 14m" relative to now.
+function fmtUntil(iso) {
+  if (!iso) return '';
+  const ms = new Date(iso).getTime() - Date.now();
+  if (ms <= 0) return 'due now';
+  const s = Math.round(ms / 1000);
+  if (s < 60) return 'in ' + s + 's';
+  const m = Math.round(s / 60);
+  if (m < 60) return 'in ' + m + 'm';
+  const h = Math.floor(m / 60);
+  return 'in ' + h + 'h ' + (m % 60) + 'm';
+}
+
+// BlockedBanner explains a parked activity: sleeping / waiting-for-signal /
+// awaiting-child, with a wake countdown — decoded from the Yielded event.
+function BlockedBanner({ info }) {
+  if (!info) return null;
+  let icon = '⏳', text;
+  if (info.kind === 'sleep') {
+    text = 'Sleeping';
+  } else if (info.kind === 'signal') {
+    icon = '📨'; text = 'Waiting for signal' + (info.step ? ' “' + info.step + '”' : '');
+  } else if (info.kind === 'await') {
+    icon = '⛓'; text = 'Awaiting child ' + shortId((info.step || '').replace(/^await:/, '')) + '…';
+  } else {
+    text = info.status === 'Scheduled' ? 'Scheduled' : 'Waiting';
+  }
+  const showWake = info.wakeAt && info.kind !== 'await';
+  return (
+    <div className="card" style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', marginBottom: 14, borderLeft: '3px solid var(--amber)' }}>
+      <span style={{ fontSize: 16 }}>{icon}</span>
+      <strong>{text}</strong>
+      {showWake && (
+        <span style={{ marginLeft: 'auto', color: 'var(--fg-2)', fontSize: 12 }}>
+          {info.kind === 'signal' ? 'times out ' : 'wakes '}{fmtUntil(info.wakeAt)}
+          <span style={{ color: 'var(--fg-3)', marginLeft: 6, fontFamily: 'var(--font-mono)' }}>{fmtTsShort(info.wakeAt)}</span>
+        </span>
+      )}
+    </div>
+  );
+}
+
+// StepsView lists an activity's durable checkpoint history (ctx.Run / ctx.Sleep),
+// oldest first — the workflow's internal progress.
+function StepsView({ steps }) {
+  if (!steps) return <div className="card eventlog"><div className="empty">Loading steps…</div></div>;
+  if (steps.length === 0) return <div className="card eventlog"><div className="empty">No durable steps recorded for this activity.</div></div>;
+  const kindLabel = (k) => k === 'sleep' ? '⏱ sleep' : k === 'signal' ? '📨 signal' : '▶ run';
+  return (
+    <div className="card eventlog">
+      <div className="eventlog-toolbar">
+        <div className="left"><strong>{steps.length}</strong> <span>durable steps (oldest first)</span></div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th style={{ width: 60 }}>#</th>
+            <th style={{ width: 220 }}>Step</th>
+            <th style={{ width: 120 }}>Kind</th>
+            <th style={{ width: 90 }}>State</th>
+            <th style={{ width: 180 }}>At</th>
+            <th>Detail</th>
+          </tr>
+        </thead>
+        <tbody>
+          {steps.map((s, i) => (
+            <tr key={i}>
+              <td><span className="id">#{i + 1}</span></td>
+              <td><span className="kind">{s.name || '—'}</span></td>
+              <td>{kindLabel(s.kind)}</td>
+              <td><span className={'pill ' + (s.state === 'Ok' ? 'green' : 'red')}>{s.state === 'Ok' ? 'ok' : 'error'}</span></td>
+              <td className="ts">{fmtTsShort(s.created_at)}</td>
+              <td className="ts">{s.data ? JSON.stringify(s.data).slice(0, 120) : ''}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function EventLog({ events }) {
   const [sel, setSel] = React.useState(null);
   if (!events) return <div className="card eventlog"><div className="empty">Loading events…</div></div>;
@@ -2798,6 +2914,7 @@ function EventLog({ events }) {
     if (t.indexOf('failed') >= 0 || t.indexOf('deadletter') >= 0) return 'red';
     if (t.indexOf('retry') >= 0 || t.indexOf('requeue') >= 0) return 'amber';
     if (t.indexOf('start') >= 0 || t.indexOf('dequeue') >= 0 || t.indexOf('lease') >= 0) return 'blue';
+    if (t.indexOf('yield') >= 0 || t.indexOf('signal') >= 0) return 'amber';
     if (t.indexOf('spawn') >= 0 || t.indexOf('schedule') >= 0 || t.indexOf('enqueue') >= 0) return 'purple';
     return '';
   };
@@ -2807,6 +2924,15 @@ function EventLog({ events }) {
     try {
       const d = typeof e.detail === 'string' ? JSON.parse(e.detail) : e.detail;
       if (d.error) return String(d.error).slice(0, 80);
+      // Durable wait (Yielded): show why + until when.
+      if (d.kind || (d.wake_at && e.event_type === 'Yielded')) {
+        const label = d.kind === 'sleep' ? 'sleeping'
+          : d.kind === 'signal' ? ('waiting for signal ' + (d.step || ''))
+          : d.kind === 'await' ? 'awaiting child'
+          : 'waiting';
+        return d.wake_at ? (label + ' · until ' + fmtTsShort(d.wake_at)) : label;
+      }
+      if (d.signal_id != null) return 'signal delivered' + (d.woke ? ' (woke waiter)' : '');
       if (d.parent_activity_id) return 'from parent ' + shortId(d.parent_activity_id) + '…';
       if (d.scheduled_at) return 'scheduled at ' + fmtTsShort(d.scheduled_at);
       if (d.retry_count != null) return 'retry #' + d.retry_count;

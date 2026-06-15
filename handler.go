@@ -109,14 +109,14 @@ func (c ActivityContext) Run(name string, fn func() (json.RawMessage, error)) (j
 			// Permanent failure: checkpoint it so retries of the PARENT (for
 			// unrelated reasons) don't re-run a step that failed for good.
 			failureJSON, _ := json.Marshal(map[string]string{"error": fnErr.Error()})
-			if err := c.queue.StoreResult(c.Ctx, checkID, c.ActivityID, activityResult{Data: failureJSON, State: ResultErr}); err != nil {
+			if err := c.queue.StoreResult(c.Ctx, checkID, c.ActivityID, activityResult{Data: failureJSON, State: ResultErr}, "run:"+name); err != nil {
 				return nil, err
 			}
 		}
 		return nil, fnErr
 	}
 
-	if err := c.queue.StoreResult(c.Ctx, checkID, c.ActivityID, activityResult{Data: out, State: ResultOk}); err != nil {
+	if err := c.queue.StoreResult(c.Ctx, checkID, c.ActivityID, activityResult{Data: out, State: ResultOk}, "run:"+name); err != nil {
 		// The side effect happened but the checkpoint didn't commit; surface
 		// a retryable error so the attempt retries — fn will run again, which
 		// is the documented at-least-once edge.
@@ -144,6 +144,7 @@ const yieldMargin = 2 * time.Second
 // wakes the activity if it exists.
 type yieldPark struct {
 	wakeAt  time.Time
+	kind    string // "sleep" | "signal" | "await" — for the Yielded event / console
 	step    string
 	recheck uuid.UUID // result ID to re-check post-park; uuid.Nil = none
 }
@@ -200,7 +201,7 @@ func (c ActivityContext) Sleep(name string, d time.Duration) error {
 		cpJSON, _ := json.Marshal(map[string]time.Time{"wake_at": wakeAt})
 		// Persist BEFORE waiting, so a crash mid-sleep resumes the remainder
 		// instead of restarting the full duration.
-		if err := c.queue.StoreResult(c.Ctx, checkID, c.ActivityID, activityResult{Data: cpJSON, State: ResultOk}); err != nil {
+		if err := c.queue.StoreResult(c.Ctx, checkID, c.ActivityID, activityResult{Data: cpJSON, State: ResultOk}, "sleep:"+name); err != nil {
 			return err
 		}
 	}
@@ -219,7 +220,7 @@ func (c ActivityContext) Sleep(name string, d time.Duration) error {
 	if deadline, ok := c.Ctx.Deadline(); ok {
 		margin := max(min(yieldMargin, time.Until(deadline)/2), 0)
 		if wakeAt.After(deadline.Add(-margin)) {
-			return &yieldPark{wakeAt: wakeAt, step: name}
+			return &yieldPark{wakeAt: wakeAt, kind: "sleep", step: name}
 		}
 	}
 
@@ -290,7 +291,8 @@ func (c ActivityContext) WaitForSignal(name string, timeout time.Duration) (json
 			deadline = &d
 		}
 		cpJSON, _ := json.Marshal(map[string]*time.Time{"deadline": deadline})
-		if err := c.queue.StoreResult(c.Ctx, waitID, c.ActivityID, activityResult{Data: cpJSON, State: ResultOk}); err != nil {
+		// Step left "" this pass: signal step history is the follow-up (C).
+		if err := c.queue.StoreResult(c.Ctx, waitID, c.ActivityID, activityResult{Data: cpJSON, State: ResultOk}, ""); err != nil {
 			return nil, err
 		}
 	}
@@ -331,7 +333,7 @@ func (c ActivityContext) WaitForSignal(name string, timeout time.Duration) (json
 		if ctxDeadline, ok := c.Ctx.Deadline(); ok {
 			margin := max(min(yieldMargin, time.Until(ctxDeadline)/2), 0)
 			if wake.After(ctxDeadline.Add(-margin)) {
-				return nil, &yieldPark{wakeAt: wake, step: name, recheck: sigID}
+				return nil, &yieldPark{wakeAt: wake, kind: "signal", step: name, recheck: sigID}
 			}
 		}
 
