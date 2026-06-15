@@ -766,6 +766,14 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
 }
 .dag-node-body .k { color: var(--fg-3); }
 .dag-node-body .v { color: var(--fg-1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dag-steps { display: flex; flex-wrap: nowrap; gap: 4px; padding: 0 10px 8px; overflow: hidden; }
+.dag-step {
+  font-family: var(--font-mono); font-size: 9.5px; color: var(--fg-2);
+  background: var(--bg-3); border: 1px solid var(--line); border-radius: 4px;
+  padding: 1px 5px; white-space: nowrap; max-width: 84px; overflow: hidden; text-overflow: ellipsis;
+}
+.dag-step.err { color: var(--red); border-color: var(--red-line); }
+.dag-step.more { color: var(--fg-3); }
 .dag-controls {
   position: absolute; left: 12px; bottom: 12px;
   display: flex; flex-direction: column;
@@ -2273,6 +2281,7 @@ function RunsListPage({ manualTick, urlParams = {} }) {
 function RunDetailPage({ activityId, manualTick, onCopy }) {
   const [activity, setActivity] = React.useState(null);
   const [subtree, setSubtree] = React.useState(null);
+  const [subtreeSteps, setSubtreeSteps] = React.useState(null);
   const [events, setEvents] = React.useState(null);
   const [steps, setSteps] = React.useState(null);
   const [result, setResult] = React.useState(null);
@@ -2284,6 +2293,7 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
   React.useEffect(() => {
     setActivity(null);
     setSubtree(null);
+    setSubtreeSteps(null);
     setEvents(null);
     setSteps(null);
     setResult(null);
@@ -2341,6 +2351,19 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
     return () => { cancelled = true; };
   }, [activityId, manualTick, liveTick]);
 
+  // Durable steps for every node in the tree (one query), so the Graph can show
+  // step sub-nodes under each activity.
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const ss = await api('/activities/' + activityId + '/subtree-steps');
+        if (!cancelled) setSubtreeSteps(ss || []);
+      } catch (e) { /* keep previous */ }
+    })();
+    return () => { cancelled = true; };
+  }, [activityId, manualTick, liveTick]);
+
   // When the user picks a different node, drop the previous activity's events
   // and result immediately so the panel doesn't show stale rows for the wrong
   // activity. Live ticks for the same selectedAct don't clear.
@@ -2383,6 +2406,9 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
   if (!activity) return <div className="empty-state">Loading…</div>;
 
   const tree = (subtree && subtree.length > 0) ? subtree : [activity];
+  // Group the tree's durable steps by owning activity for the Graph's sub-nodes.
+  const stepsByOwner = {};
+  (subtreeSteps || []).forEach(s => { (stepsByOwner[s.owner] = stepsByOwner[s.owner] || []).push(s); });
   const treeById = {};
   tree.forEach(a => { treeById[a.id] = a; });
   const root = tree.find(a => !a.parent_activity_id) || activity;
@@ -2459,7 +2485,7 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
           {activeTab === 'signals' && <SignalsView steps={steps} blocked={blocked} />}
           {activeTab === 'graph' && (
             <>
-              <DAG tree={tree} selectedAct={selectedAct} onSelect={setSelectedAct} />
+              <DAG tree={tree} selectedAct={selectedAct} onSelect={setSelectedAct} stepsByOwner={stepsByOwner} />
               <EventLog events={events} />
             </>
           )}
@@ -2698,12 +2724,26 @@ function Gantt({ tree, startMs, totalMs, selectedAct, onSelect }) {
   );
 }
 
-function DAG({ tree, selectedAct, onSelect }) {
+// stepEdgeLabel extracts the ctx.Step name a child was spawned under, from its
+// idempotency key "rq:step:<root>:<parent>:<name>". "" for non-Step children.
+function stepEdgeLabel(key) {
+  if (!key || key.indexOf('rq:step:') !== 0) return '';
+  const parts = key.slice('rq:step:'.length).split(':'); // [root, parent, ...name]
+  return parts.length >= 3 ? parts.slice(2).join(':') : '';
+}
+
+function stepGlyph(kind) {
+  return kind === 'sleep' ? '⏱' : kind === 'signal' ? '📨' : '▶';
+}
+
+function DAG({ tree, selectedAct, onSelect, stepsByOwner }) {
   const NODE_W = 220;
-  const NODE_H = 86;
+  const NODE_H = 112;
   const COL_GAP = 80;
   const ROW_GAP = 24;
   const PAD = 24;
+  const byId = {};
+  tree.forEach(a => { byId[a.id] = a; });
 
   const byDepth = {};
   tree.forEach(a => {
@@ -2766,7 +2806,18 @@ function DAG({ tree, selectedAct, onSelect }) {
               const p2 = { x: b.x, y: b.y + NODE_H / 2 };
               const mid = (p1.x + p2.x) / 2;
               const d = 'M' + p1.x + ',' + p1.y + ' C' + mid + ',' + p1.y + ' ' + mid + ',' + p2.y + ' ' + p2.x + ',' + p2.y;
-              return <path key={i} d={d} fill="none" stroke="rgba(124,92,255,0.5)" strokeWidth="1.5" strokeDasharray="4 4" markerEnd="url(#arrow)" />;
+              const label = byId[to] ? stepEdgeLabel(byId[to].idempotency_key) : '';
+              return (
+                <g key={i}>
+                  <path d={d} fill="none" stroke="rgba(124,92,255,0.5)" strokeWidth="1.5" strokeDasharray="4 4" markerEnd="url(#arrow)" />
+                  {label && (
+                    <text x={mid} y={(p1.y + p2.y) / 2 - 5} textAnchor="middle"
+                          fill="var(--fg-3)" fontSize="10" fontFamily="var(--font-mono)">
+                      {'step: ' + label}
+                    </text>
+                  )}
+                </g>
+              );
             })}
           </svg>
 
@@ -2796,6 +2847,20 @@ function DAG({ tree, selectedAct, onSelect }) {
                     </>
                   )}
                 </div>
+                {(() => {
+                  const ns = (stepsByOwner && stepsByOwner[a.id]) || [];
+                  if (ns.length === 0) return null;
+                  return (
+                    <div className="dag-steps" title={ns.map(s => s.kind + ':' + s.name).join(', ')}>
+                      {ns.slice(0, 5).map((s, j) => (
+                        <span key={j} className={'dag-step' + (s.state === 'Err' ? ' err' : '')}>
+                          {stepGlyph(s.kind)} {s.name}
+                        </span>
+                      ))}
+                      {ns.length > 5 && <span className="dag-step more">+{ns.length - 5}</span>}
+                    </div>
+                  );
+                })()}
               </div>
             );
           })}

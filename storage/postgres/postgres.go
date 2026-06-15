@@ -1959,7 +1959,50 @@ func (b *PostgresBackend) GetActivitySteps(ctx context.Context, ownerActivityID 
 			state = storage.ResultErr
 		}
 		steps = append(steps, storage.StepRecord{
-			Kind: kind, Name: name, State: state, Data: data, CreatedAt: createdAt,
+			Owner: ownerActivityID, Kind: kind, Name: name, State: state, Data: data, CreatedAt: createdAt,
+		})
+	}
+	return steps, nil
+}
+
+// GetSubtreeSteps returns durable checkpoint rows for the whole tree rooted at
+// rootID, each tagged with its owner. One query (owner-index assisted) so the
+// console can render steps under every graph node without N round trips.
+func (b *PostgresBackend) GetSubtreeSteps(ctx context.Context, rootID uuid.UUID) ([]storage.StepRecord, error) {
+	rows, err := b.pool.Query(ctx, `
+		SELECT owner_activity_id, step, state, data, created_at
+		FROM runnerq_results
+		WHERE queue_name = $1 AND step IS NOT NULL
+		  AND owner_activity_id IN (
+			SELECT id FROM runnerq_activities
+			WHERE queue_name = $1 AND (id = $2 OR root_activity_id = $2)
+		  )
+		ORDER BY owner_activity_id, created_at ASC`,
+		b.queueName, rootID)
+	if err != nil {
+		return nil, storage.NewInternalError(fmt.Sprintf("Failed to get subtree steps: %v", err))
+	}
+	defer rows.Close()
+
+	var steps []storage.StepRecord
+	for rows.Next() {
+		var owner uuid.UUID
+		var step, stateStr string
+		var data json.RawMessage
+		var createdAt time.Time
+		if err := rows.Scan(&owner, &step, &stateStr, &data, &createdAt); err != nil {
+			return nil, storage.NewInternalError(fmt.Sprintf("Failed to scan subtree step: %v", err))
+		}
+		kind, name := step, ""
+		if i := strings.IndexByte(step, ':'); i >= 0 {
+			kind, name = step[:i], step[i+1:]
+		}
+		state := storage.ResultOk
+		if stateStr != "Ok" {
+			state = storage.ResultErr
+		}
+		steps = append(steps, storage.StepRecord{
+			Owner: owner, Kind: kind, Name: name, State: state, Data: data, CreatedAt: createdAt,
 		})
 	}
 	return steps, nil

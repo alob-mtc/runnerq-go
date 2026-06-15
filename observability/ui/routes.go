@@ -29,6 +29,7 @@ func RunnerQUI(inspector *observability.QueueInspector) http.Handler {
 	mux.HandleFunc("GET /api/observability/activities/{id}/steps", activityStepsHandler(inspector))
 	mux.HandleFunc("GET /api/observability/activities/{id}/result", activityResultHandler(inspector))
 	mux.HandleFunc("GET /api/observability/activities/{id}/subtree", subtreeHandler(inspector))
+	mux.HandleFunc("GET /api/observability/activities/{id}/subtree-steps", subtreeStepsHandler(inspector))
 	mux.HandleFunc("GET /api/observability/activities/{id}/children", childrenHandler(inspector))
 	mux.HandleFunc("GET /api/observability/dead-letter", deadLettersHandler(inspector))
 	mux.HandleFunc("GET /api/observability/stream", eventStreamHandler(inspector, sseSema))
@@ -47,6 +48,7 @@ func ObservabilityAPI(inspector *observability.QueueInspector) http.Handler {
 	mux.HandleFunc("GET /activities/{id}/steps", activityStepsHandler(inspector))
 	mux.HandleFunc("GET /activities/{id}/result", activityResultHandler(inspector))
 	mux.HandleFunc("GET /activities/{id}/subtree", subtreeHandler(inspector))
+	mux.HandleFunc("GET /activities/{id}/subtree-steps", subtreeStepsHandler(inspector))
 	mux.HandleFunc("GET /activities/{id}/children", childrenHandler(inspector))
 	mux.HandleFunc("GET /dead-letter", deadLettersHandler(inspector))
 	mux.HandleFunc("GET /stream", eventStreamHandler(inspector, sseSema))
@@ -297,6 +299,35 @@ func subtreeHandler(inspector *observability.QueueInspector) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, items)
+	}
+}
+
+func subtreeStepsHandler(inspector *observability.QueueInspector) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := uuid.Parse(r.PathValue("id"))
+		if err != nil {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+		act, err := inspector.GetActivity(r.Context(), id)
+		if err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		if act == nil {
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
+		rootID := id
+		if act.RootActivityID != nil {
+			rootID = *act.RootActivityID
+		}
+		steps, err := inspector.GetSubtreeSteps(r.Context(), rootID)
+		if err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, steps)
 	}
 }
 

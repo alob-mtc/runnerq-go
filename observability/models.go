@@ -79,6 +79,7 @@ type ActivityEvent struct {
 // step) for the console's step-history view. Kind is "run"/"sleep"; Data is the
 // stored result (Run) or the persisted wake deadline (Sleep).
 type StepView struct {
+	Owner     uuid.UUID       `json:"owner"`
 	Kind      string          `json:"kind"`
 	Name      string          `json:"name"`
 	State     string          `json:"state"` // "Ok" | "Err"

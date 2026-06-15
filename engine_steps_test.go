@@ -452,3 +452,67 @@ func TestYieldEventCarriesWaitReason(t *testing.T) {
 		t.Fatalf("no Yielded event carrying kind=sleep step=cool-off")
 	}
 }
+
+// GetSubtreeSteps returns durable steps for every activity in the tree, tagged
+// with their owner — and the child carries the Step name in its idempotency key
+// (what the Graph edge labels are parsed from). (E.)
+func TestSubtreeStepsAndEdgeLabels(t *testing.T) {
+	child := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		if _, err := ctx.Run("work", func() (json.RawMessage, error) { return json.RawMessage(`{}`), nil }); err != nil {
+			return nil, err
+		}
+		return json.RawMessage(`{"child":true}`), nil
+	}}
+	parent := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		if _, err := ctx.Run("prep", func() (json.RawMessage, error) { return json.RawMessage(`{}`), nil }); err != nil {
+			return nil, err
+		}
+		fut, err := ctx.ActivityExecutor.Activity("child").Step("worker").Payload(json.RawMessage(`{}`)).Execute(ctx.Ctx)
+		if err != nil {
+			return nil, err
+		}
+		return fut.GetResult(ctx.Ctx)
+	}}
+	rig := newStepsRig(t, func(e *WorkerEngine) {
+		e.RegisterActivity("parent", parent)
+		e.RegisterActivity("child", child)
+	})
+
+	fut, err := rig.engine.GetActivityExecutor().Activity("parent").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	rig.await(t, fut.activityID, 20*time.Second)
+
+	steps, err := rig.backend.GetSubtreeSteps(context.Background(), fut.activityID)
+	if err != nil {
+		t.Fatalf("subtree steps: %v", err)
+	}
+	var prepOwner, workOwner uuid.UUID
+	for _, s := range steps {
+		switch s.Name {
+		case "prep":
+			prepOwner = s.Owner
+		case "work":
+			workOwner = s.Owner
+		}
+	}
+	if prepOwner != fut.activityID {
+		t.Fatalf("'prep' owner = %s, want parent %s", prepOwner, fut.activityID)
+	}
+	if workOwner == uuid.Nil || workOwner == fut.activityID {
+		t.Fatalf("'work' owner = %s, want the child (≠ parent)", workOwner)
+	}
+
+	// The child carries the Step name in its idempotency key — the Graph parses
+	// the edge label from this.
+	childSnap, err := rig.backend.GetActivity(context.Background(), workOwner)
+	if err != nil || childSnap == nil {
+		t.Fatalf("get child: %v", err)
+	}
+	if childSnap.IdempotencyKey == nil ||
+		!strings.HasPrefix(*childSnap.IdempotencyKey, "rq:step:") ||
+		!strings.HasSuffix(*childSnap.IdempotencyKey, ":worker") {
+		t.Fatalf("child idempotency key = %v, want rq:step:...:worker", childSnap.IdempotencyKey)
+	}
+}

@@ -101,7 +101,7 @@ type NotifyCustomer struct {
 
 func (h *NotifyCustomer) ActivityType() string { return "notify_customer" }
 func (h *NotifyCustomer) Handle(_ runnerq.ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
-	time.Sleep(4 * time.Second)
+	time.Sleep(20 * time.Second)
 	return json.RawMessage(`{"notified":true,"channel":"email"}`), nil
 }
 
