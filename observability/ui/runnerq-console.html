@@ -603,6 +603,20 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
 .gantt .row .name .pip { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
 .gantt .row .name .depth-prefix { color: var(--fg-4); white-space: pre; }
 .gantt .row .track { position: relative; height: 100%; border-radius: 4px; }
+/* Durable-step markers plotted on the selected activity's timeline. */
+.gantt .row .track .gantt-step {
+  position: absolute; top: 0; bottom: 0; width: 0;
+  border-left: 1.5px dashed var(--purple-line);
+  z-index: 2;
+}
+.gantt .row .track .gantt-step .g {
+  position: absolute; top: -1px; left: 3px;
+  font-size: 8.5px; line-height: 1.2; color: var(--purple-2);
+  font-family: var(--font-mono); white-space: nowrap; pointer-events: none;
+  max-width: 90px; overflow: hidden; text-overflow: ellipsis;
+}
+.gantt .row .track .gantt-step.err { border-color: var(--red-line); }
+.gantt .row .track .gantt-step.err .g { color: var(--red); }
 .gantt .row .duration {
   text-align: right;
   font-size: 11px;
@@ -766,14 +780,6 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
 }
 .dag-node-body .k { color: var(--fg-3); }
 .dag-node-body .v { color: var(--fg-1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dag-steps { display: flex; flex-wrap: nowrap; gap: 4px; padding: 0 10px 8px; overflow: hidden; }
-.dag-step {
-  font-family: var(--font-mono); font-size: 9.5px; color: var(--fg-2);
-  background: var(--bg-3); border: 1px solid var(--line); border-radius: 4px;
-  padding: 1px 5px; white-space: nowrap; max-width: 84px; overflow: hidden; text-overflow: ellipsis;
-}
-.dag-step.err { color: var(--red); border-color: var(--red-line); }
-.dag-step.more { color: var(--fg-3); }
 .dag-controls {
   position: absolute; left: 12px; bottom: 12px;
   display: flex; flex-direction: column;
@@ -2281,7 +2287,6 @@ function RunsListPage({ manualTick, urlParams = {} }) {
 function RunDetailPage({ activityId, manualTick, onCopy }) {
   const [activity, setActivity] = React.useState(null);
   const [subtree, setSubtree] = React.useState(null);
-  const [subtreeSteps, setSubtreeSteps] = React.useState(null);
   const [events, setEvents] = React.useState(null);
   const [steps, setSteps] = React.useState(null);
   const [result, setResult] = React.useState(null);
@@ -2293,7 +2298,6 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
   React.useEffect(() => {
     setActivity(null);
     setSubtree(null);
-    setSubtreeSteps(null);
     setEvents(null);
     setSteps(null);
     setResult(null);
@@ -2351,19 +2355,6 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
     return () => { cancelled = true; };
   }, [activityId, manualTick, liveTick]);
 
-  // Durable steps for every node in the tree (one query), so the Graph can show
-  // step sub-nodes under each activity.
-  React.useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const ss = await api('/activities/' + activityId + '/subtree-steps');
-        if (!cancelled) setSubtreeSteps(ss || []);
-      } catch (e) { /* keep previous */ }
-    })();
-    return () => { cancelled = true; };
-  }, [activityId, manualTick, liveTick]);
-
   // When the user picks a different node, drop the previous activity's events
   // and result immediately so the panel doesn't show stale rows for the wrong
   // activity. Live ticks for the same selectedAct don't clear.
@@ -2406,9 +2397,6 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
   if (!activity) return <div className="empty-state">Loading…</div>;
 
   const tree = (subtree && subtree.length > 0) ? subtree : [activity];
-  // Group the tree's durable steps by owning activity for the Graph's sub-nodes.
-  const stepsByOwner = {};
-  (subtreeSteps || []).forEach(s => { (stepsByOwner[s.owner] = stepsByOwner[s.owner] || []).push(s); });
   const treeById = {};
   tree.forEach(a => { treeById[a.id] = a; });
   const root = tree.find(a => !a.parent_activity_id) || activity;
@@ -2472,7 +2460,7 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
             <>
               {blocked && <BlockedBanner info={blocked} />}
               <IORow activity={selected} result={result} onCopy={onCopy} />
-              <Gantt tree={tree} startMs={startMs} totalMs={totalMs} selectedAct={selectedAct} onSelect={setSelectedAct} />
+              <Gantt tree={tree} startMs={startMs} totalMs={totalMs} selectedAct={selectedAct} onSelect={setSelectedAct} steps={steps} />
               <EventLog events={events} />
             </>
           )}
@@ -2485,7 +2473,7 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
           {activeTab === 'signals' && <SignalsView steps={steps} blocked={blocked} />}
           {activeTab === 'graph' && (
             <>
-              <DAG tree={tree} selectedAct={selectedAct} onSelect={setSelectedAct} stepsByOwner={stepsByOwner} />
+              <DAG tree={tree} selectedAct={selectedAct} onSelect={setSelectedAct} />
               <EventLog events={events} />
             </>
           )}
@@ -2645,7 +2633,7 @@ function IORow({ activity, result, onCopy }) {
   );
 }
 
-function Gantt({ tree, startMs, totalMs, selectedAct, onSelect }) {
+function Gantt({ tree, startMs, totalMs, selectedAct, onSelect, steps }) {
   const sorted = [...tree].sort((a, b) => {
     const ad = a.depth || 0, bd = b.depth || 0;
     if (ad !== bd) return ad - bd;
@@ -2707,6 +2695,17 @@ function Gantt({ tree, startMs, totalMs, selectedAct, onSelect }) {
                 <div className={'bar ' + sc} style={{ left: left + '%', width: width + '%' }} title={a.activity_type + ' · ' + fmtDuration(dur)}>
                   {width > 8 ? a.activity_type : ''}
                 </div>
+                {a.id === selectedAct && (steps || []).map((s, i) => {
+                  const x = ((new Date(s.created_at).getTime() - startMs) / totalMs) * 100;
+                  if (x < -1 || x > 101) return null;
+                  return (
+                    <span key={i} className={'gantt-step' + (s.state === 'Err' ? ' err' : '')}
+                          style={{ left: x + '%' }}
+                          title={stepGlyph(s.kind) + ' ' + s.kind + ':' + s.name + ' · ' + s.state + ' · ' + fmtTsShort(s.created_at)}>
+                      <span className="g">{stepGlyph(s.kind)} {s.name}</span>
+                    </span>
+                  );
+                })}
               </div>
               <div className="duration">{fmtDuration(dur)}</div>
             </div>
@@ -2736,9 +2735,9 @@ function stepGlyph(kind) {
   return kind === 'sleep' ? '⏱' : kind === 'signal' ? '📨' : '▶';
 }
 
-function DAG({ tree, selectedAct, onSelect, stepsByOwner }) {
+function DAG({ tree, selectedAct, onSelect }) {
   const NODE_W = 220;
-  const NODE_H = 112;
+  const NODE_H = 86;
   const COL_GAP = 80;
   const ROW_GAP = 24;
   const PAD = 24;
@@ -2847,20 +2846,6 @@ function DAG({ tree, selectedAct, onSelect, stepsByOwner }) {
                     </>
                   )}
                 </div>
-                {(() => {
-                  const ns = (stepsByOwner && stepsByOwner[a.id]) || [];
-                  if (ns.length === 0) return null;
-                  return (
-                    <div className="dag-steps" title={ns.map(s => s.kind + ':' + s.name).join(', ')}>
-                      {ns.slice(0, 5).map((s, j) => (
-                        <span key={j} className={'dag-step' + (s.state === 'Err' ? ' err' : '')}>
-                          {stepGlyph(s.kind)} {s.name}
-                        </span>
-                      ))}
-                      {ns.length > 5 && <span className="dag-step more">+{ns.length - 5}</span>}
-                    </div>
-                  );
-                })()}
               </div>
             );
           })}

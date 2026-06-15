@@ -272,20 +272,6 @@ func (q *QueueInspector) GetActivitySteps(ctx context.Context, activityID uuid.U
 	if err != nil {
 		return nil, err
 	}
-	return toStepViews(recs), nil
-}
-
-// GetSubtreeSteps returns the durable checkpoint history for every activity in
-// the tree rooted at rootID (each StepView tagged with its Owner).
-func (q *QueueInspector) GetSubtreeSteps(ctx context.Context, rootID uuid.UUID) ([]StepView, error) {
-	recs, err := q.backend.GetSubtreeSteps(ctx, rootID)
-	if err != nil {
-		return nil, err
-	}
-	return toStepViews(recs), nil
-}
-
-func toStepViews(recs []storage.StepRecord) []StepView {
 	out := make([]StepView, 0, len(recs))
 	for _, r := range recs {
 		state := "Ok"
@@ -293,7 +279,6 @@ func toStepViews(recs []storage.StepRecord) []StepView {
 			state = "Err"
 		}
 		out = append(out, StepView{
-			Owner:     r.Owner,
 			Kind:      r.Kind,
 			Name:      r.Name,
 			State:     state,
@@ -301,7 +286,7 @@ func toStepViews(recs []storage.StepRecord) []StepView {
 			CreatedAt: r.CreatedAt,
 		})
 	}
-	return out
+	return out, nil
 }
 
 // GetSubtree returns all activities in the lineage tree rooted at rootID.

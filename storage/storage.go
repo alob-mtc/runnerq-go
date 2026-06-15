@@ -89,7 +89,6 @@ type ActivityResult struct {
 // user-supplied step name. Data is the stored result (for Run) or the persisted
 // wake deadline (for Sleep).
 type StepRecord struct {
-	Owner     uuid.UUID
 	Kind      string
 	Name      string
 	State     ResultState
@@ -373,10 +372,6 @@ type InspectionStorage interface {
 	// history for the console. Rows without a step identity (the activity's own
 	// result) are excluded. Reads by owner via the existing owner index.
 	GetActivitySteps(ctx context.Context, ownerActivityID uuid.UUID) ([]StepRecord, error)
-	// GetSubtreeSteps returns the durable checkpoint rows for every activity in
-	// the tree rooted at rootID, each tagged with its owner — one query for the
-	// whole workflow so the console can show steps under each graph node.
-	GetSubtreeSteps(ctx context.Context, rootID uuid.UUID) ([]StepRecord, error)
 	// GetChildren returns direct children of a parent activity.
 	GetChildren(ctx context.Context, parentID uuid.UUID, offset, limit int) ([]ActivitySnapshot, error)
 	// GetSubtree returns all activities in the tree rooted at rootID, including the root itself.

@@ -453,20 +453,13 @@ func TestYieldEventCarriesWaitReason(t *testing.T) {
 	}
 }
 
-// GetSubtreeSteps returns durable steps for every activity in the tree, tagged
-// with their owner — and the child carries the Step name in its idempotency key
-// (what the Graph edge labels are parsed from). (E.)
-func TestSubtreeStepsAndEdgeLabels(t *testing.T) {
-	child := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
-		if _, err := ctx.Run("work", func() (json.RawMessage, error) { return json.RawMessage(`{}`), nil }); err != nil {
-			return nil, err
-		}
+// A ctx.Step child carries the Step name in its idempotency key — the data the
+// Graph parses parent→child edge labels from. (E: edge labels.)
+func TestStepChildCarriesStepNameInKey(t *testing.T) {
+	child := &funcHandler{fn: func(_ ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 		return json.RawMessage(`{"child":true}`), nil
 	}}
 	parent := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
-		if _, err := ctx.Run("prep", func() (json.RawMessage, error) { return json.RawMessage(`{}`), nil }); err != nil {
-			return nil, err
-		}
 		fut, err := ctx.ActivityExecutor.Activity("child").Step("worker").Payload(json.RawMessage(`{}`)).Execute(ctx.Ctx)
 		if err != nil {
 			return nil, err
@@ -484,35 +477,12 @@ func TestSubtreeStepsAndEdgeLabels(t *testing.T) {
 	}
 	rig.await(t, fut.activityID, 20*time.Second)
 
-	steps, err := rig.backend.GetSubtreeSteps(context.Background(), fut.activityID)
-	if err != nil {
-		t.Fatalf("subtree steps: %v", err)
+	kids, err := rig.backend.GetChildren(context.Background(), fut.activityID, 0, 10)
+	if err != nil || len(kids) != 1 {
+		t.Fatalf("children = %v (err %v), want 1", kids, err)
 	}
-	var prepOwner, workOwner uuid.UUID
-	for _, s := range steps {
-		switch s.Name {
-		case "prep":
-			prepOwner = s.Owner
-		case "work":
-			workOwner = s.Owner
-		}
-	}
-	if prepOwner != fut.activityID {
-		t.Fatalf("'prep' owner = %s, want parent %s", prepOwner, fut.activityID)
-	}
-	if workOwner == uuid.Nil || workOwner == fut.activityID {
-		t.Fatalf("'work' owner = %s, want the child (≠ parent)", workOwner)
-	}
-
-	// The child carries the Step name in its idempotency key — the Graph parses
-	// the edge label from this.
-	childSnap, err := rig.backend.GetActivity(context.Background(), workOwner)
-	if err != nil || childSnap == nil {
-		t.Fatalf("get child: %v", err)
-	}
-	if childSnap.IdempotencyKey == nil ||
-		!strings.HasPrefix(*childSnap.IdempotencyKey, "rq:step:") ||
-		!strings.HasSuffix(*childSnap.IdempotencyKey, ":worker") {
-		t.Fatalf("child idempotency key = %v, want rq:step:...:worker", childSnap.IdempotencyKey)
+	key := kids[0].IdempotencyKey
+	if key == nil || !strings.HasPrefix(*key, "rq:step:") || !strings.HasSuffix(*key, ":worker") {
+		t.Fatalf("child idempotency key = %v, want rq:step:...:worker", key)
 	}
 }
