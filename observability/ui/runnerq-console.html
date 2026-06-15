@@ -2695,17 +2695,35 @@ function Gantt({ tree, startMs, totalMs, selectedAct, onSelect, steps }) {
                 <div className={'bar ' + sc} style={{ left: left + '%', width: width + '%' }} title={a.activity_type + ' · ' + fmtDuration(dur)}>
                   {width > 8 ? a.activity_type : ''}
                 </div>
-                {a.id === selectedAct && (steps || []).map((s, i) => {
-                  const x = ((new Date(s.created_at).getTime() - startMs) / totalMs) * 100;
-                  if (x < -1 || x > 101) return null;
-                  return (
-                    <span key={i} className={'gantt-step' + (s.state === 'Err' ? ' err' : '')}
-                          style={{ left: x + '%' }}
-                          title={stepGlyph(s.kind) + ' ' + s.kind + ':' + s.name + ' · ' + s.state + ' · ' + fmtTsShort(s.created_at)}>
-                      <span className="g">{stepGlyph(s.kind)} {s.name}</span>
-                    </span>
-                  );
-                })}
+                {a.id === selectedAct && (() => {
+                  // Plot steps at their timestamps, clustering ones that land at
+                  // ~the same time (e.g. settle + sleep right after a signal) so
+                  // labels don't overlap. Isolated markers show the name; clusters
+                  // show stacked glyphs + count, with details in the tooltip.
+                  const pts = (steps || [])
+                    .map(s => ({ s: s, x: ((new Date(s.created_at).getTime() - startMs) / totalMs) * 100 }))
+                    .filter(p => p.x >= -1 && p.x <= 101)
+                    .sort((p, q) => p.x - q.x);
+                  const clusters = [];
+                  pts.forEach(p => {
+                    const last = clusters[clusters.length - 1];
+                    if (last && p.x - last.x < 1.5) last.items.push(p.s);
+                    else clusters.push({ x: p.x, items: [p.s] });
+                  });
+                  return clusters.map((c, i) => {
+                    const err = c.items.some(s => s.state === 'Err');
+                    const glyphs = c.items.map(s => stepGlyph(s.kind)).join('');
+                    const label = c.items.length === 1
+                      ? (stepGlyph(c.items[0].kind) + ' ' + c.items[0].name)
+                      : (glyphs + ' ×' + c.items.length);
+                    const title = c.items.map(s => stepGlyph(s.kind) + ' ' + s.kind + ':' + s.name + ' · ' + s.state + ' · ' + fmtTsShort(s.created_at)).join('\n');
+                    return (
+                      <span key={i} className={'gantt-step' + (err ? ' err' : '')} style={{ left: c.x + '%' }} title={title}>
+                        <span className="g">{label}</span>
+                      </span>
+                    );
+                  });
+                })()}
               </div>
               <div className="duration">{fmtDuration(dur)}</div>
             </div>
