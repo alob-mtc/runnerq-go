@@ -1034,7 +1034,7 @@ func (b *PostgresBackend) Yield(ctx context.Context, activityID uuid.UUID, wakeA
 // signalID (owned by the target activity for retention) and wakes the target
 // if it is parked as scheduled — a yielded WaitForSignal resumes immediately
 // instead of waiting out its park deadline. Store + wake commit atomically.
-func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UUID, signalID uuid.UUID, payload json.RawMessage) error {
+func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UUID, signalID uuid.UUID, name string, payload json.RawMessage) error {
 	now := time.Now().UTC()
 
 	tx, err := b.pool.Begin(ctx)
@@ -1056,8 +1056,12 @@ func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UU
 		return storage.NewNotFoundError(fmt.Sprintf("Activity %s not found for signal delivery", activityID))
 	}
 
+	signalStep := ""
+	if name != "" {
+		signalStep = "signal:" + name
+	}
 	res := &storage.ActivityResult{Data: payload, State: storage.ResultOk}
-	if err := b.storeResultTx(ctx, tx, signalID, activityID, res, now, ""); err != nil {
+	if err := b.storeResultTx(ctx, tx, signalID, activityID, res, now, signalStep); err != nil {
 		return err
 	}
 
@@ -1076,8 +1080,12 @@ func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UU
 	}
 	woke := tag.RowsAffected() > 0
 
+	signalDetail := map[string]any{"signal_id": signalID, "woke": woke}
+	if name != "" {
+		signalDetail["name"] = name
+	}
 	if err := b.recordEvent(ctx, tx, activityID, storage.EventSignaled, nil,
-		toDetail(map[string]any{"signal_id": signalID, "woke": woke})); err != nil {
+		toDetail(signalDetail)); err != nil {
 		return err
 	}
 

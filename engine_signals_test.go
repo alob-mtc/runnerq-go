@@ -296,3 +296,69 @@ func TestSignalByKeyUnknownKeyIsNotFound(t *testing.T) {
 		t.Fatalf("error = %v, want IsActivityNotFound", err)
 	}
 }
+
+// A delivered signal is recorded with its human name — on the result row (so it
+// shows in the console's Steps/Signals views) and on the Signaled event. (C.)
+func TestSignalRecordedWithName(t *testing.T) {
+	h := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		return ctx.WaitForSignal("approve", 0)
+	}}
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("gate", h) })
+
+	fut, err := rig.engine.GetActivityExecutor().Activity("gate").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	// Wait until parked, then deliver the named signal.
+	deadline := time.After(15 * time.Second)
+	for {
+		snap, _ := rig.backend.GetActivity(context.Background(), fut.activityID)
+		if snap != nil && snap.Status == "Waiting" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("activity never parked")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if err := SignalActivity(context.Background(), rig.backend, fut.activityID, "approve", json.RawMessage(`{"by":"ops"}`)); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+	rig.await(t, fut.activityID, 20*time.Second)
+
+	// The delivered signal appears as a named "signal" step.
+	steps, err := rig.backend.GetActivitySteps(context.Background(), fut.activityID)
+	if err != nil {
+		t.Fatalf("steps: %v", err)
+	}
+	found := false
+	for _, s := range steps {
+		if s.Kind == "signal" && s.Name == "approve" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no signal step named 'approve' in %+v", steps)
+	}
+
+	// The Signaled event carries the name.
+	events, err := rig.backend.GetActivityEvents(context.Background(), fut.activityID, 100)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	named := false
+	for _, ev := range events {
+		if ev.EventType != storage.EventSignaled {
+			continue
+		}
+		var d map[string]any
+		_ = json.Unmarshal(ev.Detail, &d)
+		if d["name"] == "approve" {
+			named = true
+		}
+	}
+	if !named {
+		t.Fatal("no Signaled event carrying name=approve")
+	}
+}
