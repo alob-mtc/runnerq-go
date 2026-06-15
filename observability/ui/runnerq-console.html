@@ -2822,6 +2822,14 @@ function blockedInfoFor(activity, events) {
   return { kind: kind, step: step, wakeAt: wakeAt, status: activity.status };
 }
 
+// farFuture reports whether a wake time is so distant it's really "no
+// deadline" — an unbounded WaitForSignal parks ~100 years out (signalParkHorizon),
+// so anything past a year is an indefinite wait, not a real timeout.
+function farFuture(iso) {
+  if (!iso) return false;
+  return new Date(iso).getTime() - Date.now() > 365 * 24 * 3600 * 1000;
+}
+
 // fmtUntil renders a coarse "in 2h 14m" relative to now.
 function fmtUntil(iso) {
   if (!iso) return '';
@@ -2849,11 +2857,15 @@ function BlockedBanner({ info }) {
   } else {
     text = info.status === 'Scheduled' ? 'Scheduled' : 'Waiting';
   }
-  const showWake = info.wakeAt && info.kind !== 'await';
+  // A signal wait with no timeout parks ~100y out — that's not a deadline, so
+  // don't render a fake countdown for it.
+  const indefinite = info.kind === 'signal' && farFuture(info.wakeAt);
+  const showWake = info.wakeAt && info.kind !== 'await' && !indefinite;
   return (
     <div className="card" style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', marginBottom: 14, borderLeft: '3px solid var(--amber)' }}>
       <span style={{ fontSize: 16 }}>{icon}</span>
       <strong>{text}</strong>
+      {indefinite && <span style={{ color: 'var(--fg-3)', fontSize: 12 }}>no timeout</span>}
       {showWake && (
         <span style={{ marginLeft: 'auto', color: 'var(--fg-2)', fontSize: 12 }}>
           {info.kind === 'signal' ? 'times out ' : 'wakes '}{fmtUntil(info.wakeAt)}
@@ -2930,7 +2942,8 @@ function EventLog({ events }) {
           : d.kind === 'signal' ? ('waiting for signal ' + (d.step || ''))
           : d.kind === 'await' ? 'awaiting child'
           : 'waiting';
-        return d.wake_at ? (label + ' · until ' + fmtTsShort(d.wake_at)) : label;
+        // Don't print an "until" for an indefinite signal wait (parks ~100y out).
+        return (d.wake_at && !farFuture(d.wake_at)) ? (label + ' · until ' + fmtTsShort(d.wake_at)) : label;
       }
       if (d.signal_id != null) return 'signal delivered' + (d.woke ? ' (woke waiter)' : '');
       if (d.parent_activity_id) return 'from parent ' + shortId(d.parent_activity_id) + '…';
