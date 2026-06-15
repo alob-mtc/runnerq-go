@@ -114,7 +114,7 @@ func main() {
 	}
 	defer backend.Close()
 
-	engine, err := runnerq.Builder().Backend(backend).MaxWorkers(8).Build()
+	engine, err := runnerq.Builder().Backend(backend).MaxWorkers(20).Build()
 	if err != nil {
 		log.Fatalf("build: %v", err)
 	}

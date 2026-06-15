@@ -2401,17 +2401,20 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
   tree.forEach(a => { if (a.current_worker_id) workerSet.add(a.current_worker_id); });
   const pending = tree.filter(a => ['Pending', 'Scheduled'].indexOf(a.status) >= 0).length;
 
+  const selected = treeById[selectedAct] || activity;
+  const blocked = blockedInfoFor(selected, events);
+  const signalCount = (steps ? steps.filter(s => s.kind === 'signal').length : 0)
+    + (blocked && blocked.kind === 'signal' ? 1 : 0);
+
   const tabs = [
     { id: 'history', label: 'History', count: eventCount },
     { id: 'steps', label: 'Steps', count: steps ? steps.length : 0 },
+    { id: 'signals', label: 'Signals', count: signalCount },
     { id: 'graph', label: 'Graph', count: tree.length },
     { id: 'metadata', label: 'Metadata' },
     { id: 'workers', label: 'Workers', count: workerSet.size },
     { id: 'pending', label: 'Pending', count: pending },
   ];
-
-  const selected = treeById[selectedAct] || activity;
-  const blocked = blockedInfoFor(selected, events);
 
   return (
     <div className="page-scroll">
@@ -2450,6 +2453,7 @@ function RunDetailPage({ activityId, manualTick, onCopy }) {
               <StepsView steps={steps} onCopy={onCopy} />
             </>
           )}
+          {activeTab === 'signals' && <SignalsView steps={steps} blocked={blocked} />}
           {activeTab === 'graph' && (
             <>
               <DAG tree={tree} selectedAct={selectedAct} onSelect={setSelectedAct} />
@@ -2915,6 +2919,58 @@ function StepsView({ steps }) {
   );
 }
 
+// SignalsView shows the signals an activity is involved with: the one it's
+// currently awaiting (from the blocked-on info) and the ones already delivered
+// (named "signal:*" checkpoint rows), with their payloads.
+function SignalsView({ steps, blocked }) {
+  if (!steps) return <div className="card eventlog"><div className="empty">Loading signals…</div></div>;
+  const delivered = steps.filter(s => s.kind === 'signal');
+  const awaiting = blocked && blocked.kind === 'signal'
+    ? { name: blocked.step, indefinite: farFuture(blocked.wakeAt), wakeAt: blocked.wakeAt }
+    : null;
+  if (!awaiting && delivered.length === 0) {
+    return <div className="card eventlog"><div className="empty">No signals for this activity.</div></div>;
+  }
+  return (
+    <div className="card eventlog">
+      <div className="eventlog-toolbar">
+        <div className="left"><strong>{delivered.length}</strong> <span>delivered{awaiting ? ', 1 awaiting' : ''}</span></div>
+      </div>
+      {awaiting && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', borderBottom: '1px solid var(--line)' }}>
+          <span style={{ fontSize: 15 }}>📨</span>
+          <strong>Awaiting “{awaiting.name}”</strong>
+          <span style={{ marginLeft: 'auto', color: 'var(--fg-3)', fontSize: 12 }}>
+            {awaiting.indefinite ? 'no timeout' : ('times out ' + fmtUntil(awaiting.wakeAt))}
+          </span>
+        </div>
+      )}
+      {delivered.length > 0 && (
+        <table>
+          <thead>
+            <tr>
+              <th style={{ width: 60 }}>#</th>
+              <th style={{ width: 240 }}>Signal</th>
+              <th style={{ width: 180 }}>Delivered</th>
+              <th>Payload</th>
+            </tr>
+          </thead>
+          <tbody>
+            {delivered.map((s, i) => (
+              <tr key={i}>
+                <td><span className="id">#{i + 1}</span></td>
+                <td><span className="kind">{s.name || '—'}</span></td>
+                <td className="ts">{fmtTsShort(s.created_at)}</td>
+                <td className="ts">{s.data ? JSON.stringify(s.data).slice(0, 160) : '(no payload)'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
 function EventLog({ events }) {
   const [sel, setSel] = React.useState(null);
   if (!events) return <div className="card eventlog"><div className="empty">Loading events…</div></div>;
@@ -2945,7 +3001,7 @@ function EventLog({ events }) {
         // Don't print an "until" for an indefinite signal wait (parks ~100y out).
         return (d.wake_at && !farFuture(d.wake_at)) ? (label + ' · until ' + fmtTsShort(d.wake_at)) : label;
       }
-      if (d.signal_id != null) return 'signal delivered' + (d.woke ? ' (woke waiter)' : '');
+      if (d.signal_id != null) return 'signal ' + (d.name ? '“' + d.name + '” ' : '') + 'delivered' + (d.woke ? ' (woke waiter)' : '');
       if (d.parent_activity_id) return 'from parent ' + shortId(d.parent_activity_id) + '…';
       if (d.scheduled_at) return 'scheduled at ' + fmtTsShort(d.scheduled_at);
       if (d.retry_count != null) return 'retry #' + d.retry_count;

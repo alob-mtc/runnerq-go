@@ -23,7 +23,7 @@ func SignalActivity(ctx context.Context, backend storage.Storage, activityID uui
 		return &WorkerError{Kind: ErrQueue, Message: "signal name must be non-empty"}
 	}
 	sigID := deriveCheckpointID(activityID, "signal", name)
-	if err := backend.SignalActivity(ctx, activityID, sigID, payload); err != nil {
+	if err := backend.SignalActivity(ctx, activityID, sigID, name, payload); err != nil {
 		return signalDeliveryError(err)
 	}
 	return nil

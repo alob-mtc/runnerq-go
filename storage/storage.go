@@ -313,7 +313,11 @@ type QueueStorage interface {
 	// activities would leak uncollectable rows. Atomic: store + wake commit
 	// together. Repeated signals with the same signalID overwrite the
 	// payload (last write wins).
-	SignalActivity(ctx context.Context, activityID uuid.UUID, signalID uuid.UUID, payload json.RawMessage) error
+	// SignalActivity stores a signal payload under signalID (owned by the
+	// target activity) and wakes the target if parked. name is the human signal
+	// name, recorded on the result row (as "signal:<name>") and the Signaled
+	// event so the console can show which signal was delivered; "" is allowed.
+	SignalActivity(ctx context.Context, activityID uuid.UUID, signalID uuid.UUID, name string, payload json.RawMessage) error
 	// LookupIdempotencyActivityID returns the activity ID that currently owns
 	// idempotencyKey in this queue, so a caller can address a signal by
 	// business idempotency key instead of by internal activity ID (see
