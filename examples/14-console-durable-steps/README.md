@@ -22,8 +22,10 @@ workflow by its business key.
 ```sh
 docker compose up -d        # from the examples/ directory
 go run .
-# open http://localhost:8081/console/
+# open http://localhost:8082/console/   (set PORT to change; default 8082)
 ```
+
+It serves on `:8082` by default so it can run alongside `13-console` (`:8081`).
 
 Click a recent payment and open the **Steps** tab. Watch the step list fill
 (`authorize → settle → clearing`) and the **Blocked-on** banner cycle through

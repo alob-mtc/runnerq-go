@@ -168,14 +168,24 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/console/", http.StripPrefix("/console", ui.RunnerQUI(inspector)))
 
+	// PORT lets this run alongside other console examples (13-console defaults
+	// to 8081 too). Default 8082 to avoid colliding with it out of the box.
+	addr := ":" + consolePort()
 	fmt.Println("payments are flowing — open the console and click a recent payment:")
-	fmt.Println("  http://localhost:8081/console/")
+	fmt.Printf("  http://localhost%s/console/\n", addr)
 	fmt.Println("watch the Steps tab fill (authorize → settle → clearing) and the")
 	fmt.Println("Blocked-on banner cycle: Waiting for signal → Sleeping → Awaiting child.")
 	fmt.Println("(Ctrl-C to stop)")
-	if err := http.ListenAndServe(":8081", mux); err != nil {
+	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func consolePort() string {
+	if v := os.Getenv("PORT"); v != "" {
+		return v
+	}
+	return "8082"
 }
 
 func databaseURL() string {
