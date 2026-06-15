@@ -320,6 +320,7 @@ a { color: inherit; text-decoration: none; cursor: pointer; }
 .status-chip.retrying .pip { background: var(--amber); animation: pulse 1.4s ease-in-out infinite; }
 .status-chip.scheduled .pip { background: var(--purple); }
 .status-chip.pending .pip { background: var(--fg-3); }
+.sched-reason { font-size: 10px; color: var(--fg-3); margin-top: 3px; font-family: var(--font-mono); white-space: nowrap; }
 
 @keyframes pulse {
   0%,100% { opacity: 1; transform: scale(1); }
@@ -2208,6 +2209,7 @@ function RunsListPage({ manualTick, urlParams = {} }) {
                 const dur = activityDurationMs(r);
                 const prio = priorityLabel(r.priority);
                 const worker = r.current_worker_id || r.last_worker_id;
+                const reason = scheduleReason(r);
                 return (
                   <tr
                     key={r.id}
@@ -2228,6 +2230,7 @@ function RunsListPage({ manualTick, urlParams = {} }) {
                         <span className="pip" />
                         {r.status}
                       </span>
+                      {reason && <div className="sched-reason">{reason.label}{reason.when ? ' · ' + reason.when : ''}</div>}
                     </td>
                     <td>
                       <div className="ts-cell">
@@ -2832,6 +2835,22 @@ function blockedInfoFor(activity, events) {
 function farFuture(iso) {
   if (!iso) return false;
   return new Date(iso).getTime() - Date.now() > 365 * 24 * 3600 * 1000;
+}
+
+// scheduleReason gives a short "why is this parked" hint + wake countdown for a
+// row that's delayed / retry-backing-off / durably waiting — derived from the
+// snapshot alone (no per-row fetch). Null for rows that aren't parked. The
+// detail view's Blocked-on banner distinguishes sleep/signal/await within a wait.
+function scheduleReason(a) {
+  if (!a) return null;
+  const st = a.status;
+  if (st !== 'Scheduled' && st !== 'Retrying' && st !== 'Waiting') return null;
+  const label = st === 'Scheduled' ? 'delayed'
+    : st === 'Retrying' ? ('retry' + (a.retry_count ? ' #' + a.retry_count : ''))
+    : 'waiting';
+  let when = '';
+  if (a.scheduled_at) when = (st === 'Waiting' && farFuture(a.scheduled_at)) ? 'no timeout' : fmtUntil(a.scheduled_at);
+  return { label: label, when: when };
 }
 
 // fmtUntil renders a coarse "in 2h 14m" relative to now.
