@@ -452,3 +452,37 @@ func TestYieldEventCarriesWaitReason(t *testing.T) {
 		t.Fatalf("no Yielded event carrying kind=sleep step=cool-off")
 	}
 }
+
+// A ctx.Step child carries the Step name in its idempotency key — the data the
+// Graph parses parent→child edge labels from. (E: edge labels.)
+func TestStepChildCarriesStepNameInKey(t *testing.T) {
+	child := &funcHandler{fn: func(_ ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		return json.RawMessage(`{"child":true}`), nil
+	}}
+	parent := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		fut, err := ctx.ActivityExecutor.Activity("child").Step("worker").Payload(json.RawMessage(`{}`)).Execute(ctx.Ctx)
+		if err != nil {
+			return nil, err
+		}
+		return fut.GetResult(ctx.Ctx)
+	}}
+	rig := newStepsRig(t, func(e *WorkerEngine) {
+		e.RegisterActivity("parent", parent)
+		e.RegisterActivity("child", child)
+	})
+
+	fut, err := rig.engine.GetActivityExecutor().Activity("parent").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	rig.await(t, fut.activityID, 20*time.Second)
+
+	kids, err := rig.backend.GetChildren(context.Background(), fut.activityID, 0, 10)
+	if err != nil || len(kids) != 1 {
+		t.Fatalf("children = %v (err %v), want 1", kids, err)
+	}
+	key := kids[0].IdempotencyKey
+	if key == nil || !strings.HasPrefix(*key, "rq:step:") || !strings.HasSuffix(*key, ":worker") {
+		t.Fatalf("child idempotency key = %v, want rq:step:...:worker", key)
+	}
+}

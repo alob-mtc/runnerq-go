@@ -2698,12 +2698,22 @@ function Gantt({ tree, startMs, totalMs, selectedAct, onSelect }) {
   );
 }
 
+// stepEdgeLabel extracts the ctx.Step name a child was spawned under, from its
+// idempotency key "rq:step:<root>:<parent>:<name>". "" for non-Step children.
+function stepEdgeLabel(key) {
+  if (!key || key.indexOf('rq:step:') !== 0) return '';
+  const parts = key.slice('rq:step:'.length).split(':'); // [root, parent, ...name]
+  return parts.length >= 3 ? parts.slice(2).join(':') : '';
+}
+
 function DAG({ tree, selectedAct, onSelect }) {
   const NODE_W = 220;
   const NODE_H = 86;
   const COL_GAP = 80;
   const ROW_GAP = 24;
   const PAD = 24;
+  const byId = {};
+  tree.forEach(a => { byId[a.id] = a; });
 
   const byDepth = {};
   tree.forEach(a => {
@@ -2766,7 +2776,18 @@ function DAG({ tree, selectedAct, onSelect }) {
               const p2 = { x: b.x, y: b.y + NODE_H / 2 };
               const mid = (p1.x + p2.x) / 2;
               const d = 'M' + p1.x + ',' + p1.y + ' C' + mid + ',' + p1.y + ' ' + mid + ',' + p2.y + ' ' + p2.x + ',' + p2.y;
-              return <path key={i} d={d} fill="none" stroke="rgba(124,92,255,0.5)" strokeWidth="1.5" strokeDasharray="4 4" markerEnd="url(#arrow)" />;
+              const label = byId[to] ? stepEdgeLabel(byId[to].idempotency_key) : '';
+              return (
+                <g key={i}>
+                  <path d={d} fill="none" stroke="rgba(124,92,255,0.5)" strokeWidth="1.5" strokeDasharray="4 4" markerEnd="url(#arrow)" />
+                  {label && (
+                    <text x={mid} y={(p1.y + p2.y) / 2 - 5} textAnchor="middle"
+                          fill="var(--fg-3)" fontSize="10" fontFamily="var(--font-mono)">
+                      {'step: ' + label}
+                    </text>
+                  )}
+                </g>
+              );
             })}
           </svg>
 
