@@ -1810,21 +1810,54 @@ function useRowHoverPreview(delayMs = 2000, dismissGraceMs = 200) {
     overRowRef.current = true;
     cancelDismiss();
     cursorRef.current = { x: evt.clientX, y: evt.clientY };
-    // If the popup is already showing for some other row, swap to the
-    // new row immediately (no extra 2s wait — the user already chose to
-    // engage with the preview UI).
-    setPreview(prev => {
-      if (prev && prev.row.id !== row.id) {
-        const cached = cacheRef.current.get(row.id);
-        // Cache miss kicks off the fetch and shows "loading" via a quick
-        // re-render below; cache hit shows the new row instantly.
-        if (cached !== undefined) {
-          return { row, pos: computePos(cursorRef.current), result: cached };
-        }
+
+    // Same row already showing → keep popup as-is, just cancel any
+    // pending dismiss/show. Don't restart the 2s timer.
+    if (preview && preview.row.id === row.id) {
+      if (showTimerRef.current) {
+        clearTimeout(showTimerRef.current);
+        showTimerRef.current = null;
       }
-      return prev;
-    });
-    // If popup not yet shown, schedule the standard 2s show timer.
+      return;
+    }
+
+    // Different row, popup already up → swap to the new row immediately
+    // (the user already chose to engage with the preview UI; making them
+    // wait another 2s for the new content feels broken). Show the new
+    // row's row data straight away with whatever result is cached; if
+    // uncached, render with result=null and fetch in the background,
+    // patching the result in when it lands.
+    if (preview) {
+      if (showTimerRef.current) {
+        clearTimeout(showTimerRef.current);
+        showTimerRef.current = null;
+      }
+      const cached = cacheRef.current.get(row.id);
+      const seq = ++seqRef.current;
+      setPreview({
+        row,
+        pos: computePos(cursorRef.current),
+        result: cached !== undefined ? cached : null,
+      });
+      if (cached === undefined) {
+        (async () => {
+          let result;
+          try {
+            result = await api('/activities/' + row.id + '/result');
+          } catch (_) {
+            result = null;
+          }
+          cacheRef.current.set(row.id, result);
+          if (seq !== seqRef.current) return;
+          setPreview(prev =>
+            prev && prev.row.id === row.id ? { ...prev, result } : prev,
+          );
+        })();
+      }
+      return;
+    }
+
+    // Cold path: no popup yet → schedule the standard 2s show timer.
     if (showTimerRef.current) clearTimeout(showTimerRef.current);
     const seq = ++seqRef.current;
     showTimerRef.current = setTimeout(async () => {
@@ -1841,7 +1874,7 @@ function useRowHoverPreview(delayMs = 2000, dismissGraceMs = 200) {
       if (seq !== seqRef.current) return;
       setPreview({ row, pos: computePos(cursorRef.current), result });
     }, delayMs);
-  }, [delayMs]);
+  }, [delayMs, preview]);
 
   // Update the cursor ref while the user is still moving over the row
   // pre-show — when the 2s timer fires, the popup anchors at the
