@@ -153,4 +153,18 @@ CREATE TABLE IF NOT EXISTS runnerq_worker_pools (
 );
 CREATE INDEX IF NOT EXISTS idx_runnerq_worker_pools_queue_alive
     ON runnerq_worker_pools(queue_name, last_seen_at);
+
+-- Durable references survive handler replay and are removed with consumer trees.
+CREATE TABLE IF NOT EXISTS runnerq_dependencies (
+ queue_name TEXT NOT NULL,
+ waiter_activity_id UUID NOT NULL,
+ result_id UUID NOT NULL,
+ producer_activity_id UUID,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ PRIMARY KEY (queue_name, waiter_activity_id, result_id)
+);
+CREATE INDEX IF NOT EXISTS idx_runnerq_dependencies_result
+ ON runnerq_dependencies(queue_name, result_id);
+CREATE INDEX IF NOT EXISTS idx_runnerq_dependencies_producer
+ ON runnerq_dependencies(queue_name, producer_activity_id);
 `

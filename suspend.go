@@ -15,3 +15,6 @@ func withHandlerScope(ctx context.Context) context.Context {
 func inHandlerScope(ctx context.Context) bool {
 	return ctx.Value(handlerScopeKey{}) != nil
 }
+
+// Carries execution identity to rehydrated futures awaited inside handlers.
+type attemptQueueKey struct{}

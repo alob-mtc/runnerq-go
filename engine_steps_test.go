@@ -42,6 +42,10 @@ func newStepsRig(t *testing.T, register func(e *WorkerEngine)) *stepsTestRig {
 		t.Fatalf("build engine: %v", err)
 	}
 	register(engine)
+	// Some signal tests need only the engine's client methods, not workers.
+	if len(engine.handlers) == 0 {
+		return &stepsTestRig{backend: backend, engine: engine}
+	}
 
 	startDone := make(chan error, 1)
 	go func() { startDone <- engine.Start(context.Background()) }()

@@ -18,6 +18,10 @@ const (
 	ErrTimeout
 	ErrDuplicateActivity
 	ErrIdempotencyConflict
+	// ErrClaimLost means the execution no longer owns the activity.
+	ErrClaimLost
+	// ErrCheckpointConflict means an immutable checkpoint has a different outcome.
+	ErrCheckpointConflict
 )
 
 // StorageError represents a backend-agnostic error from storage operations.
@@ -48,6 +52,10 @@ func (e *StorageError) Error() string {
 		prefix = "duplicate activity"
 	case ErrIdempotencyConflict:
 		prefix = "idempotency conflict"
+	case ErrClaimLost:
+		prefix = "claim lost"
+	case ErrCheckpointConflict:
+		prefix = "checkpoint conflict"
 	}
 	return fmt.Sprintf("%s: %s", prefix, e.Message)
 }

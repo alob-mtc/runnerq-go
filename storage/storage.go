@@ -275,8 +275,13 @@ type QueueStorage interface {
 	// Implementations MUST store the result atomically with the status change
 	// and MUST write a result record even when result is nil, so callers
 	// awaiting the result can always resolve once the activity completes.
+	// workerID is a unique execution token, not a reusable worker-slot label.
+	// Retrying an identical committed acknowledgement with the same token must
+	// succeed; a stale/conflicting acknowledgement must not change the row.
 	AckSuccess(ctx context.Context, activityID uuid.UUID, result json.RawMessage, workerID string) error
-	// AckFailure marks an activity as failed. Returns true if moved to dead letter queue.
+	// AckFailure records a failure once per execution token. Retrying the same
+	// committed failure returns its original dead-letter decision without
+	// consuming another execution attempt. Returns true for dead-lettering.
 	AckFailure(ctx context.Context, activityID uuid.UUID, failure FailureKind, workerID string) (bool, error)
 	ProcessScheduled(ctx context.Context) (uint64, error)
 	RequeueExpired(ctx context.Context, batchSize int) (uint64, error)
