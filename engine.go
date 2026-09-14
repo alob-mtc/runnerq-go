@@ -154,8 +154,8 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		e.mu.Unlock()
 		return &WorkerError{Kind: ErrConfiguration, Message: "retention values must be non-negative"}
 	}
-	if q, ok := e.queue.(*backendQueueAdapter); ok {
-		q.activityTypes = types
+	if q, ok := e.queue.(activityTypeFilter); ok {
+		q.setActivityTypes(types)
 	}
 	e.active = true
 	e.running.Store(true)
@@ -220,15 +220,21 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		})
 	}
 
-	// Fixed-goroutine worker pool: one worker per slot. Long waits inside
-	// handlers (child awaits, sleeps, signal waits) yield-park the activity
-	// rather than holding the worker, so no separate dispatcher model is
-	// needed for fan-out workloads.
-	for i := 0; i < e.config.MaxConcurrentActivities; i++ {
-		workerID := i
+	// Intake. A backend that can claim in bulk gets one dispatcher that
+	// claims exactly as many activities as the engine has idle slots; every
+	// other backend gets the fixed pool of one blocking-claim loop per slot.
+	// Long waits inside handlers (child awaits, sleeps, signal waits)
+	// yield-park the activity rather than holding the slot in either mode.
+	if batchQueue, ok := e.queue.(batchActivityQueue); ok {
 		wg.Go(func() {
-			e.runWorkerLoop(intakeCtx, engineCtx, workerID)
+			e.runBatchDispatcher(intakeCtx, engineCtx, batchQueue)
 		})
+	} else {
+		for i := range e.config.MaxConcurrentActivities {
+			wg.Go(func() {
+				e.runWorkerLoop(intakeCtx, engineCtx, i)
+			})
+		}
 	}
 
 	// Wait for shutdown signal or context cancellation
@@ -393,9 +399,7 @@ func (e *WorkerEngine) runWorkerLoop(ctx, handlerCtx context.Context, workerID i
 				return
 			}
 			slog.Error("Failed to dequeue activity", "worker_id", workerID, "error", err)
-			select {
-			case <-time.After(time.Second):
-			case <-ctx.Done():
+			if !pauseAfterDequeueError(ctx) {
 				return
 			}
 			continue
@@ -409,6 +413,94 @@ func (e *WorkerEngine) runWorkerLoop(ctx, handlerCtx context.Context, workerID i
 	}
 
 	slog.Debug("Worker loop stopped", "worker_id", workerID)
+}
+
+// runBatchDispatcher is the intake loop for batch-capable backends. One
+// goroutine owns the engine's concurrency budget: idle slots are tokens in a
+// channel, the dispatcher gathers every slot idle right now, claims that many
+// activities in one round trip, and hands each claim to its own goroutine,
+// which returns the slot when the activity completes, parks, or fails.
+//
+// Claiming only what is idle means a lease is never held by an activity
+// waiting behind an in-memory backlog, and a busy engine issues one claim per
+// wave of freed slots instead of one per slot. Like runWorkerLoop it claims on
+// ctx (intake) and executes on handlerCtx (engine), and it does not return
+// until every activity it dispatched has finished, so Start's drain sees the
+// same thing it would from the fixed pool.
+func (e *WorkerEngine) runBatchDispatcher(ctx, handlerCtx context.Context, queue batchActivityQueue) {
+	n := e.config.MaxConcurrentActivities
+	slog.Debug("Starting batch dispatcher", "max_concurrent_activities", n)
+
+	// Slot numbers double as the worker_id in logs, matching the fixed pool.
+	idle := make(chan int, n)
+	for slot := range n {
+		idle <- slot
+	}
+	var inFlight sync.WaitGroup
+	defer inFlight.Wait()
+
+	var held []int // slots taken from idle and not yet assigned to a claim
+	for e.running.Load() {
+		if len(held) == 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case slot := <-idle:
+				held = append(held, slot)
+			}
+		}
+		held = takeIdle(idle, held)
+
+		// A fresh prefix per call: the backend appends each activity's id, so
+		// a token is unique per (call, activity), as the fixed pool's
+		// per-claim uuid is unique per claim.
+		prefix := fmt.Sprintf("%s:batch:%s", e.instanceID, uuid.New())
+		claims, err := queue.DequeueBatch(ctx, len(held), workerDequeueBlock, prefix)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Error("Failed to batch dequeue activities", "error", err, "limit", len(held))
+			if !pauseAfterDequeueError(ctx) {
+				return
+			}
+			continue
+		}
+		for _, claim := range claims {
+			slot := held[len(held)-1]
+			held = held[:len(held)-1]
+			inFlight.Go(func() {
+				defer func() { idle <- slot }()
+				e.processActivity(handlerCtx, claim.activity, claim.leaseID, slot)
+			})
+		}
+	}
+
+	slog.Debug("Batch dispatcher stopped")
+}
+
+// takeIdle appends every slot that is idle right now to held, without waiting.
+func takeIdle(idle <-chan int, held []int) []int {
+	for {
+		select {
+		case slot := <-idle:
+			held = append(held, slot)
+		default:
+			return held
+		}
+	}
+}
+
+// pauseAfterDequeueError holds an intake loop back for a second after a
+// failed claim so a struggling backend is not hammered. False means ctx ended
+// during the pause and the loop should exit.
+func pauseAfterDequeueError(ctx context.Context) bool {
+	select {
+	case <-time.After(time.Second):
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, workerLabel string, workerID int) {

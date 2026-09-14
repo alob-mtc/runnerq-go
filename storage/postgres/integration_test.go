@@ -12,8 +12,10 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -124,6 +126,231 @@ func TestAckSuccessAlwaysStoresResult(t *testing.T) {
 	}
 	if status, _ := activityStatus(t, b, a.ID); status != "completed" {
 		t.Fatalf("status = %q, want completed", status)
+	}
+}
+
+// storage.BatchQueueStorage: one round trip claims up to limit rows in the
+// order Dequeue would have taken them, each with its own fenced token.
+func TestDequeueBatchClaimsInDequeueOrderWithFencedTokens(t *testing.T) {
+	b := testBackend(t)
+	ctx := context.Background()
+
+	for _, p := range []storage.ActivityPriority{storage.PriorityLow, storage.PriorityCritical, storage.PriorityNormal, storage.PriorityHigh, storage.PriorityLow} {
+		a := testActivity(3)
+		a.Priority = p
+		if err := b.Enqueue(ctx, a); err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+	}
+
+	claims, err := b.DequeueBatch(ctx, "engine:batch:1", 3, 0, nil)
+	if err != nil {
+		t.Fatalf("batch dequeue: %v", err)
+	}
+	wantOrder := []storage.ActivityPriority{storage.PriorityCritical, storage.PriorityHigh, storage.PriorityNormal}
+	if len(claims) != len(wantOrder) {
+		t.Fatalf("claimed %d activities, want %d", len(claims), len(wantOrder))
+	}
+	for i, c := range claims {
+		if c.Activity.Priority != wantOrder[i] {
+			t.Fatalf("claim %d priority = %d, want %d (dequeue order)", i, c.Activity.Priority, wantOrder[i])
+		}
+		if want := "engine:batch:1:" + c.Activity.ID.String(); c.LeaseID != want {
+			t.Fatalf("lease token = %q, want %q", c.LeaseID, want)
+		}
+		if c.Attempt != 1 || !c.LeaseDeadline.After(time.Now()) {
+			t.Fatalf("claim %d attempt=%d deadline=%v, want attempt 1 and a future deadline", i, c.Attempt, c.LeaseDeadline)
+		}
+		if status, _ := activityStatus(t, b, c.Activity.ID); status != "processing" {
+			t.Fatalf("status = %q, want processing", status)
+		}
+		if !hasEvent(t, b, c.Activity.ID, storage.EventDequeued) {
+			t.Fatalf("activity %s has no dequeue event", c.Activity.ID)
+		}
+	}
+
+	// Rows claimed together are still fenced apart: a sibling's token is
+	// rejected, the row's own token is accepted.
+	if err := b.AckSuccess(ctx, claims[0].Activity.ID, nil, claims[1].LeaseID); err == nil {
+		t.Fatal("ack with a sibling claim's token succeeded; tokens must be per activity")
+	}
+	if err := b.AckSuccess(ctx, claims[0].Activity.ID, nil, claims[0].LeaseID); err != nil {
+		t.Fatalf("ack with own token: %v", err)
+	}
+
+	rest, err := b.DequeueBatch(ctx, "engine:batch:2", 10, 0, nil)
+	if err != nil || len(rest) != 2 {
+		t.Fatalf("remaining claim: n=%d err=%v, want the 2 low-priority rows", len(rest), err)
+	}
+	for _, c := range rest {
+		if c.Activity.Priority != storage.PriorityLow {
+			t.Fatalf("remaining row priority = %d, want low", c.Activity.Priority)
+		}
+	}
+	if none, err := b.DequeueBatch(ctx, "engine:batch:3", 10, 0, nil); err != nil || len(none) != 0 {
+		t.Fatalf("empty queue claim: n=%d err=%v, want none", len(none), err)
+	}
+	if none, err := b.DequeueBatch(ctx, "engine:batch:4", 0, time.Second, nil); err != nil || len(none) != 0 {
+		t.Fatalf("limit 0 claim: n=%d err=%v, want an immediate empty result", len(none), err)
+	}
+}
+
+// The three static type-filter forms (none / one / many) and the limit.
+func TestDequeueBatchTypeFilterForms(t *testing.T) {
+	b := testBackend(t)
+	ctx := context.Background()
+
+	for _, typ := range []string{"a", "a", "b", "b", "c", "c"} {
+		a := testActivity(3)
+		a.ActivityType = typ
+		if err := b.Enqueue(ctx, a); err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+	}
+	claimTypes := func(prefix string, limit int, filter []string) []string {
+		t.Helper()
+		claims, err := b.DequeueBatch(ctx, prefix, limit, 0, filter)
+		if err != nil {
+			t.Fatalf("batch dequeue %v: %v", filter, err)
+		}
+		types := make([]string, 0, len(claims))
+		for _, c := range claims {
+			types = append(types, c.Activity.ActivityType)
+		}
+		return types
+	}
+
+	if got := claimTypes("one", 10, []string{"a"}); len(got) != 2 || got[0] != "a" || got[1] != "a" {
+		t.Fatalf("one-type filter claimed %v, want [a a]", got)
+	}
+	got := claimTypes("many", 3, []string{"b", "c"})
+	if len(got) != 3 {
+		t.Fatalf("many-type filter with limit 3 claimed %v", got)
+	}
+	for _, typ := range got {
+		if typ == "a" {
+			t.Fatalf("many-type filter [b c] claimed type a: %v", got)
+		}
+	}
+	if got := claimTypes("all", 10, nil); len(got) != 1 || got[0] == "a" {
+		t.Fatalf("unfiltered claim got %v, want the single remaining b/c row", got)
+	}
+}
+
+// Two processes claiming in bulk from one queue never receive the same row.
+func TestDequeueBatchConcurrentClaimersNeverOverlap(t *testing.T) {
+	queueName := "t_" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+	b1, b2 := testBackendNamed(t, queueName), testBackendNamed(t, queueName)
+	ctx := context.Background()
+
+	const total = 40
+	for range total {
+		if err := b1.Enqueue(ctx, testActivity(3)); err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+	}
+
+	var mu sync.Mutex
+	seen := make(map[uuid.UUID]string, total)
+	var wg sync.WaitGroup
+	for i, b := range []*PostgresBackend{b1, b2} {
+		wg.Go(func() {
+			for round := 0; ; round++ {
+				claims, err := b.DequeueBatch(ctx, fmt.Sprintf("claimer-%d-%d", i, round), 7, 0, nil)
+				if err != nil {
+					t.Errorf("claimer %d: %v", i, err)
+					return
+				}
+				if len(claims) == 0 {
+					return
+				}
+				mu.Lock()
+				for _, c := range claims {
+					if prev, dup := seen[c.Activity.ID]; dup {
+						t.Errorf("activity %s claimed twice: %s and %s", c.Activity.ID, prev, c.LeaseID)
+					}
+					seen[c.Activity.ID] = c.LeaseID
+				}
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	if len(seen) != total {
+		t.Fatalf("claimed %d distinct activities, want %d", len(seen), total)
+	}
+}
+
+// A blocking batch claim parks on the work signal and wakes when a row lands.
+func TestDequeueBatchBlocksUntilWorkIsSignalled(t *testing.T) {
+	b := testBackend(t)
+	ctx := context.Background()
+
+	type outcome struct {
+		claims []storage.DequeuedActivity
+		err    error
+		took   time.Duration
+	}
+	done := make(chan outcome, 1)
+	start := time.Now()
+	go func() {
+		claims, err := b.DequeueBatch(ctx, "blocker", 5, 10*time.Second, nil)
+		done <- outcome{claims: claims, err: err, took: time.Since(start)}
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+	a := testActivity(3)
+	if err := b.Enqueue(ctx, a); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	select {
+	case o := <-done:
+		if o.err != nil || len(o.claims) != 1 || o.claims[0].Activity.ID != a.ID {
+			t.Fatalf("blocking claim returned n=%d err=%v", len(o.claims), o.err)
+		}
+		if o.took > 5*time.Second {
+			t.Fatalf("blocking claim took %v; it should wake on the enqueue signal, not the deadline", o.took)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("blocking claim did not return after work was enqueued")
+	}
+}
+
+// A batch token is fenced exactly like a single-claim token: once the lease
+// expires and the row is reclaimed, the old token can no longer ack.
+func TestStaleBatchTokenCannotAck(t *testing.T) {
+	b := testBackend(t)
+	ctx := context.Background()
+
+	a := testActivity(5)
+	if err := b.Enqueue(ctx, a); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	stale, err := b.DequeueBatch(ctx, "stale", 1, 0, nil)
+	if err != nil || len(stale) != 1 {
+		t.Fatalf("first claim: n=%d err=%v", len(stale), err)
+	}
+
+	expireLease(t, b, a.ID)
+	if n, err := b.RequeueExpired(ctx, 10); err != nil || n != 1 {
+		t.Fatalf("requeue expired: n=%d err=%v", n, err)
+	}
+	fresh, err := b.DequeueBatch(ctx, "fresh", 1, 0, nil)
+	if err != nil || len(fresh) != 1 || fresh[0].Activity.ID != a.ID {
+		t.Fatalf("second claim: n=%d err=%v", len(fresh), err)
+	}
+	if fresh[0].LeaseID == stale[0].LeaseID || fresh[0].Attempt != 2 {
+		t.Fatalf("reclaim token=%q attempt=%d; want a new token and attempt 2", fresh[0].LeaseID, fresh[0].Attempt)
+	}
+
+	if err := b.AckSuccess(ctx, a.ID, json.RawMessage(`"stale"`), stale[0].LeaseID); err == nil {
+		t.Fatal("stale batch token ack succeeded; it must be fenced out")
+	}
+	if status, _ := activityStatus(t, b, a.ID); status != "processing" {
+		t.Fatalf("status after stale ack = %q, want processing", status)
+	}
+	if err := b.AckSuccess(ctx, a.ID, json.RawMessage(`"fresh"`), fresh[0].LeaseID); err != nil {
+		t.Fatalf("owning token ack failed: %v", err)
 	}
 }
 

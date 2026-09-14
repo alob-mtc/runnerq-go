@@ -72,10 +72,32 @@ type IdempotencyResult struct {
 
 // DequeuedActivity is an activity claimed by a worker.
 type DequeuedActivity struct {
-	Activity      QueuedActivity
+	Activity QueuedActivity
+	// LeaseID is the execution token recorded as the claim's worker ID. Every
+	// fenced acknowledgement (AckSuccess, AckFailure, Yield, ...) presents it.
+	// Batch claims return a distinct token per activity.
 	LeaseID       string
 	Attempt       uint32
 	LeaseDeadline time.Time
+}
+
+// BatchQueueStorage is an optional capability: a backend that can claim
+// several runnable activities in one round trip. The engine detects it with a
+// type assertion and, when present, replaces its per-slot Dequeue loops with
+// one dispatcher that claims exactly as many activities as it has idle slots.
+// Backends without it keep working through QueueStorage.Dequeue.
+//
+// DequeueBatch claims at most limit activities, selected and ordered by the
+// same eligibility rules as Dequeue, and returns each with its own unique
+// LeaseID. The engine passes a fresh workerIDPrefix on every call and
+// implementations derive each LeaseID from it (for example
+// "<prefix>:<activity id>"), so a token can never collide with a claim made by
+// another call. timeout has Dequeue's meaning: zero is a single non-blocking
+// probe; a positive value blocks until at least one activity is claimable or
+// the timeout elapses. An empty result with a nil error means nothing became
+// claimable in time.
+type BatchQueueStorage interface {
+	DequeueBatch(ctx context.Context, workerIDPrefix string, limit int, timeout time.Duration, activityTypes []string) ([]DequeuedActivity, error)
 }
 
 // ActivityResult holds result data from a completed activity.

@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -294,6 +295,30 @@ func (b *PostgresBackend) recordEvent(ctx context.Context, tx pgx.Tx, activityID
 	return nil
 }
 
+// recordDequeueEvents is recordEvent for a batch claim: one Dequeued row per
+// claimed activity, written with a single multi-row INSERT (unnest over
+// parallel arrays) so the hot path stays at one statement whatever the batch
+// size. Same no-NOTIFY rule as recordEvent; the caller signals after commit.
+func (b *PostgresBackend) recordDequeueEvents(ctx context.Context, tx pgx.Tx, claims []storage.DequeuedActivity) error {
+	ids := make([]uuid.UUID, len(claims))
+	leaseIDs := make([]string, len(claims))
+	details := make([]string, len(claims))
+	for i, c := range claims {
+		ids[i] = c.Activity.ID
+		leaseIDs[i] = c.LeaseID
+		details[i] = string(toDetail(map[string]any{"lease_deadline_ms": c.LeaseDeadline.UnixMilli()}))
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO runnerq_events (activity_id, queue_name, event_type, worker_id, detail, created_at)
+		SELECT c.activity_id, $1, $2, c.worker_id, c.detail::jsonb, $3
+		FROM unnest($4::uuid[], $5::text[], $6::text[]) AS c(activity_id, worker_id, detail)`,
+		b.queueName, storage.EventDequeued, time.Now().UTC(), ids, leaseIDs, details)
+	if err != nil {
+		return databaseError(err, fmt.Sprintf("Failed to record dequeue events: %v", err))
+	}
+	return nil
+}
+
 // storeResultTx persists a result row. owner is the activity whose workflow
 // tree governs this row's lifetime (equals activityID for normal results;
 // the handler's activity for Run/Sleep checkpoints) — the retention sweeper
@@ -426,8 +451,12 @@ func (b *PostgresBackend) enqueueInTx(ctx context.Context, tx pgx.Tx, a *storage
 	return b.recordEvent(ctx, tx, a.ID, eventType, nil, detail)
 }
 
-// Dequeue claim SQL comes in three static forms so the planner can pick the
-// right index for each instead of compromising on one plan for an
+// Claim SQL. The single-row and batch claims share one eligibility predicate,
+// one ordering, and one RETURNING list; they differ only in how many rows the
+// SKIP LOCKED walk takes and in how the execution token is formed.
+//
+// Each comes in three static forms so the planner can pick the right index
+// for each instead of compromising on one plan for an
 // `($x IS NULL OR activity_type = ANY($x))` OR-pattern:
 //
 //   - no type filter  → idx_runnerq_dequeue_order (key order == ORDER BY)
@@ -435,8 +464,8 @@ func (b *PostgresBackend) enqueueInTx(ctx context.Context, tx pgx.Tx, a *storage
 //     remaining key order == ORDER BY)
 //   - multiple types  → idx_runnerq_dequeue_order with an in-scan type filter
 //
-// In all three cases the claim is an ordered index walk that stops at the
-// first unlocked qualifying row — never a sort over the whole backlog.
+// In all forms the claim is an ordered index walk that stops after the first
+// unlocked qualifying row(s) — never a sort over the whole backlog.
 //
 // Lease arithmetic uses the DATABASE clock (NOW()), never the caller's: the
 // deadline set here is compared against NOW() in RequeueExpired, so with app
@@ -456,46 +485,103 @@ const (
 	// forcing a top-1 sort over the whole eligible backlog on every claim
 	// (verified with EXPLAIN ANALYZE on a 200k-row backlog: external merge
 	// sort vs a 0.2ms index walk).
+	claimEligibleSQL = `
+			WHERE queue_name = $3
+			  AND status IN ('pending', 'scheduled', 'retrying', 'waiting')
+			  AND (status = 'pending' OR scheduled_at <= NOW())`
+	claimOrderSQL = `
+			ORDER BY
+				priority DESC,
+				retry_count DESC,
+				COALESCE(scheduled_at, created_at) ASC`
+	claimLeaseSQL = `(EXTRACT(EPOCH FROM NOW()) * 1000)::bigint + GREATEST($2::bigint, (timeout_seconds + 10) * 1000)`
+	// claimColumnsSQL is the RETURNING list of every claim statement, in the
+	// order scanClaim reads it.
+	claimColumnsSQL = `id, activity_type, payload, priority, retry_count, max_retries,
+			timeout_seconds, retry_delay_seconds, max_retry_delay_seconds,
+			scheduled_at, metadata, idempotency_key, created_at,
+			parent_activity_id, root_activity_id, depth, current_worker_id, lease_deadline_ms`
+
+	// Single claim: $1 worker token, $2 default lease ms, $3 queue, $4 type filter.
 	dequeueSQLHead = `
 		UPDATE runnerq_activities
 		SET status = 'processing',
 			current_worker_id = $1,
 			started_at = NOW(),
-			lease_deadline_ms = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint + GREATEST($2::bigint, (timeout_seconds + 10) * 1000)
+			lease_deadline_ms = ` + claimLeaseSQL + `
 		WHERE id = (
-			SELECT id FROM runnerq_activities
-			WHERE queue_name = $3
-			  AND status IN ('pending', 'scheduled', 'retrying', 'waiting')
-			  AND (status = 'pending' OR scheduled_at <= NOW())`
-	dequeueSQLTail = `
-			ORDER BY
-				priority DESC,
-				retry_count DESC,
-				COALESCE(scheduled_at, created_at) ASC
+			SELECT id FROM runnerq_activities` + claimEligibleSQL
+	dequeueSQLTail = claimOrderSQL + `
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id, activity_type, payload, priority, retry_count, max_retries,
-			timeout_seconds, retry_delay_seconds, max_retry_delay_seconds,
-			scheduled_at, metadata, idempotency_key, created_at,
-			parent_activity_id, root_activity_id, depth, lease_deadline_ms`
+		RETURNING ` + claimColumnsSQL
 
 	dequeueSQLAllTypes  = dequeueSQLHead + dequeueSQLTail
 	dequeueSQLOneType   = dequeueSQLHead + ` AND activity_type = $4` + dequeueSQLTail
 	dequeueSQLManyTypes = dequeueSQLHead + ` AND activity_type = ANY($4)` + dequeueSQLTail
+
+	// Batch claim: $1 token prefix, $2 default lease ms, $3 queue, $4 limit,
+	// $5 type filter. The same ordered SKIP LOCKED walk takes the first $4
+	// unlocked rows and a single UPDATE claims them all. Each row's token is
+	// the caller's prefix plus its own id, so the rows of one batch are fenced
+	// independently of each other and of every other claim. The subquery
+	// aliases its id so the unqualified column references in SET and
+	// RETURNING stay unambiguous.
+	dequeueBatchSQLHead = `
+		UPDATE runnerq_activities AS a
+		SET status = 'processing',
+			current_worker_id = $1 || ':' || a.id::text,
+			started_at = NOW(),
+			lease_deadline_ms = ` + claimLeaseSQL + `
+		FROM (
+			SELECT id AS claim_id FROM runnerq_activities` + claimEligibleSQL
+	dequeueBatchSQLTail = claimOrderSQL + `
+			LIMIT $4
+			FOR UPDATE SKIP LOCKED
+		) AS c
+		WHERE a.id = c.claim_id
+		RETURNING ` + claimColumnsSQL
+
+	dequeueBatchSQLAllTypes  = dequeueBatchSQLHead + dequeueBatchSQLTail
+	dequeueBatchSQLOneType   = dequeueBatchSQLHead + ` AND activity_type = $5` + dequeueBatchSQLTail
+	dequeueBatchSQLManyTypes = dequeueBatchSQLHead + ` AND activity_type = ANY($5)` + dequeueBatchSQLTail
 )
 
-// Dequeue claims the next runnable activity. When the queue is empty and
-// maxBlock > 0, it parks until new work is signalled (LISTEN/NOTIFY via the
-// shared watcher), re-probing every workWaitProbe as a fallback for lost
-// signals and for scheduled/retrying rows coming due, up to maxBlock. Returns
-// (nil, nil) when nothing became claimable in time.
-func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, maxBlock time.Duration, activityTypes []string) (*storage.QueuedActivity, error) {
+// scanClaim reads one claimColumnsSQL row.
+func scanClaim(row pgx.Row) (storage.DequeuedActivity, error) {
+	var ar activityRow
+	var leaseID string
+	var leaseDeadlineMS int64
+	if err := row.Scan(
+		&ar.id, &ar.activityType, &ar.payload, &ar.priority,
+		&ar.retryCount, &ar.maxRetries, &ar.timeoutSeconds,
+		&ar.retryDelaySeconds, &ar.maxRetryDelaySeconds,
+		&ar.scheduledAt, &ar.metadata,
+		&ar.idempotencyKey, &ar.createdAt,
+		&ar.parentActivityID, &ar.rootActivityID, &ar.depth,
+		&leaseID, &leaseDeadlineMS); err != nil {
+		return storage.DequeuedActivity{}, err
+	}
+	return storage.DequeuedActivity{
+		Activity:      *ar.toQueuedActivity(),
+		LeaseID:       leaseID,
+		Attempt:       uint32(ar.retryCount) + 1,
+		LeaseDeadline: time.UnixMilli(leaseDeadlineMS).UTC(),
+	}, nil
+}
+
+// waitForClaim runs probe once and, while it claims nothing and maxBlock is
+// still open, parks on the shared work signal (LISTEN/NOTIFY via the watcher)
+// and re-probes — at least every workWaitProbe as a fallback for lost signals
+// and for scheduled/retrying rows coming due. It returns as soon as probe
+// claims something or fails, and with a nil error when the window expires.
+func (b *PostgresBackend) waitForClaim(ctx context.Context, maxBlock time.Duration, probe func() (claimed bool, err error)) error {
 	deadline := time.Now().Add(maxBlock)
 
-	a, err := b.dequeueOnce(ctx, workerID, activityTypes)
-	if a != nil || err != nil || maxBlock <= 0 {
-		return a, err
+	claimed, err := probe()
+	if claimed || err != nil || maxBlock <= 0 {
+		return err
 	}
 
 	w := b.getWatcher()
@@ -505,21 +591,37 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, maxBlock
 	for {
 		// Re-probe after registering so a signal emitted between the previous
 		// probe and registration can't be missed.
-		a, err := b.dequeueOnce(ctx, workerID, activityTypes)
-		if a != nil || err != nil {
-			return a, err
+		if claimed, err := probe(); claimed || err != nil {
+			return err
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return nil, nil
+			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		case <-ch:
 		case <-time.After(min(remaining, workWaitProbe)):
 		}
 	}
+}
+
+// Dequeue claims the next runnable activity. When the queue is empty and
+// maxBlock > 0, it parks until new work is signalled, re-probing up to
+// maxBlock (see waitForClaim). Returns (nil, nil) when nothing became
+// claimable in time.
+func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, maxBlock time.Duration, activityTypes []string) (*storage.QueuedActivity, error) {
+	var claimed *storage.QueuedActivity
+	err := b.waitForClaim(ctx, maxBlock, func() (bool, error) {
+		var err error
+		claimed, err = b.dequeueOnce(ctx, workerID, activityTypes)
+		return claimed != nil, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return claimed, nil
 }
 
 func (b *PostgresBackend) dequeueOnce(ctx context.Context, workerID string, activityTypes []string) (*storage.QueuedActivity, error) {
@@ -539,26 +641,16 @@ func (b *PostgresBackend) dequeueOnce(ctx context.Context, workerID string, acti
 		row = tx.QueryRow(ctx, dequeueSQLManyTypes, workerID, b.defaultLeaseMS.Load(), b.queueName, activityTypes)
 	}
 
-	var ar activityRow
-	var leaseDeadlineMS int64
-	err = row.Scan(
-		&ar.id, &ar.activityType, &ar.payload, &ar.priority,
-		&ar.retryCount, &ar.maxRetries, &ar.timeoutSeconds,
-		&ar.retryDelaySeconds, &ar.maxRetryDelaySeconds,
-		&ar.scheduledAt, &ar.metadata,
-		&ar.idempotencyKey, &ar.createdAt,
-		&ar.parentActivityID, &ar.rootActivityID, &ar.depth,
-		&leaseDeadlineMS)
+	claim, err := scanClaim(row)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, databaseError(err, fmt.Sprintf("Failed to dequeue: %v", err))
 	}
+	a := &claim.Activity
 
-	a := ar.toQueuedActivity()
-
-	detail := toDetail(map[string]any{"lease_deadline_ms": leaseDeadlineMS})
+	detail := toDetail(map[string]any{"lease_deadline_ms": claim.LeaseDeadline.UnixMilli()})
 	if err := b.recordEvent(ctx, tx, a.ID, storage.EventDequeued, &workerID, detail); err != nil {
 		return nil, err
 	}
@@ -575,6 +667,69 @@ func (b *PostgresBackend) dequeueOnce(ctx context.Context, workerID string, acti
 		"priority", a.Priority)
 
 	return a, nil
+}
+
+// DequeueBatch implements storage.BatchQueueStorage: up to limit runnable
+// activities claimed by one UPDATE, each with the token
+// "<workerIDPrefix>:<activity id>". Blocking follows Dequeue exactly (see
+// waitForClaim). Returns (nil, nil) when nothing became claimable in time.
+func (b *PostgresBackend) DequeueBatch(ctx context.Context, workerIDPrefix string, limit int, maxBlock time.Duration, activityTypes []string) ([]storage.DequeuedActivity, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	var claims []storage.DequeuedActivity
+	err := b.waitForClaim(ctx, maxBlock, func() (bool, error) {
+		var err error
+		claims, err = b.dequeueBatchOnce(ctx, workerIDPrefix, limit, activityTypes)
+		return len(claims) > 0, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return claims, nil
+}
+
+func (b *PostgresBackend) dequeueBatchOnce(ctx context.Context, workerIDPrefix string, limit int, activityTypes []string) ([]storage.DequeuedActivity, error) {
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return nil, databaseError(err, fmt.Sprintf("Failed to begin batch dequeue transaction: %v", err))
+	}
+	defer tx.Rollback(ctx)
+
+	var rows pgx.Rows
+	switch len(activityTypes) {
+	case 0:
+		rows, err = tx.Query(ctx, dequeueBatchSQLAllTypes, workerIDPrefix, b.defaultLeaseMS.Load(), b.queueName, limit)
+	case 1:
+		rows, err = tx.Query(ctx, dequeueBatchSQLOneType, workerIDPrefix, b.defaultLeaseMS.Load(), b.queueName, limit, activityTypes[0])
+	default:
+		rows, err = tx.Query(ctx, dequeueBatchSQLManyTypes, workerIDPrefix, b.defaultLeaseMS.Load(), b.queueName, limit, activityTypes)
+	}
+	if err != nil {
+		return nil, databaseError(err, fmt.Sprintf("Failed to batch dequeue: %v", err))
+	}
+	claims, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (storage.DequeuedActivity, error) {
+		return scanClaim(row)
+	})
+	if err != nil {
+		return nil, databaseError(err, fmt.Sprintf("Failed to read batch dequeue rows: %v", err))
+	}
+	if len(claims) == 0 {
+		return nil, nil
+	}
+
+	if err := b.recordDequeueEvents(ctx, tx, claims); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, databaseError(err, fmt.Sprintf("Failed to commit batch dequeue: %v", err))
+	}
+
+	b.signalEvent()
+
+	slog.Debug("Activities claimed", "count", len(claims), "limit", limit)
+
+	return claims, nil
 }
 
 func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, result json.RawMessage, workerID string) error {

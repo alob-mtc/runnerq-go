@@ -3,6 +3,7 @@ package runnerq
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -65,6 +66,31 @@ type activityQueue interface {
 	SchedulesNatively() bool
 }
 
+// batchActivityQueue is the engine-side counterpart of
+// storage.BatchQueueStorage. Only a queue whose backend can claim in bulk
+// implements it, so the engine picks its intake strategy with one type
+// assertion.
+type batchActivityQueue interface {
+	activityQueue
+	// DequeueBatch claims up to limit activities, blocking up to timeout for
+	// the first one, and returns each with the execution token its claim was
+	// fenced with. workerIDPrefix must be fresh per call; tokens derive from it.
+	DequeueBatch(ctx context.Context, limit int, timeout time.Duration, workerIDPrefix string) ([]claimedActivity, error)
+}
+
+// claimedActivity pairs an activity with the execution token of its claim;
+// every acknowledgement for the activity must present that token.
+type claimedActivity struct {
+	activity *activity
+	leaseID  string
+}
+
+// activityTypeFilter is implemented by queues whose dequeue filter the engine
+// finalizes at Start, once the registered handlers are known.
+type activityTypeFilter interface {
+	setActivityTypes(types []string)
+}
+
 // ---------------------------------------------------------------------------
 // Backend adapter (bridges storage.Storage → activityQueue)
 // ---------------------------------------------------------------------------
@@ -75,11 +101,26 @@ type backendQueueAdapter struct {
 	activityTypes []string
 }
 
-func newBackendQueueAdapter(backend storage.Storage, activityTypes []string) *backendQueueAdapter {
-	return &backendQueueAdapter{
-		backend:       backend,
-		activityTypes: activityTypes,
+// batchBackendQueueAdapter is the adapter for a backend that also implements
+// storage.BatchQueueStorage: the shared adapter plus DequeueBatch.
+type batchBackendQueueAdapter struct {
+	*backendQueueAdapter
+	batch storage.BatchQueueStorage
+}
+
+// newBackendQueueAdapter returns a batch-capable adapter when the backend can
+// claim in bulk, so the capability is visible as a type assertion on
+// batchActivityQueue rather than as a flag callers must remember to check.
+func newBackendQueueAdapter(backend storage.Storage, activityTypes []string) activityQueue {
+	base := &backendQueueAdapter{backend: backend, activityTypes: activityTypes}
+	if batch, ok := backend.(storage.BatchQueueStorage); ok {
+		return &batchBackendQueueAdapter{backendQueueAdapter: base, batch: batch}
 	}
+	return base
+}
+
+func (a *backendQueueAdapter) setActivityTypes(types []string) {
+	a.activityTypes = types
 }
 
 func activityToQueued(a *activity) storage.QueuedActivity {
@@ -191,6 +232,29 @@ func (a *backendQueueAdapter) Dequeue(ctx context.Context, timeout time.Duration
 		return nil, nil
 	}
 	return queuedToActivity(q), nil
+}
+
+func (a *batchBackendQueueAdapter) DequeueBatch(ctx context.Context, limit int, timeout time.Duration, workerIDPrefix string) ([]claimedActivity, error) {
+	claims, err := a.batch.DequeueBatch(ctx, workerIDPrefix, limit, timeout, a.activityTypes)
+	if err != nil {
+		return nil, err
+	}
+	// The contract checks below guard custom backends. A violation is
+	// reported instead of patched over: an activity run under an invented
+	// token or beyond the concurrency budget is worse than one left for lease
+	// recovery.
+	if len(claims) > limit {
+		return nil, storage.NewInternalError(fmt.Sprintf("batch dequeue returned %d activities for a limit of %d", len(claims), limit))
+	}
+	out := make([]claimedActivity, 0, len(claims))
+	for i := range claims {
+		c := &claims[i]
+		if c.LeaseID == "" {
+			return nil, storage.NewInternalError(fmt.Sprintf("batch dequeue returned activity %s without a lease token", c.Activity.ID))
+		}
+		out = append(out, claimedActivity{activity: queuedToActivity(&c.Activity), leaseID: c.LeaseID})
+	}
+	return out, nil
 }
 
 func (a *backendQueueAdapter) MarkCompleted(ctx context.Context, act *activity, result json.RawMessage, workerID string) error {
