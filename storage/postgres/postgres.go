@@ -319,14 +319,18 @@ func (b *PostgresBackend) recordDequeueEvents(ctx context.Context, tx pgx.Tx, cl
 	return nil
 }
 
-// storeResultTx persists a result row. owner is the activity whose workflow
-// tree governs this row's lifetime (equals activityID for normal results;
-// the handler's activity for Run/Sleep checkpoints) — the retention sweeper
-// deletes result rows by owner alongside the tree.
+// storeResultTx persists a result row and wakes consumers parked on it.
+// owner is the activity whose workflow tree governs this row's lifetime
+// (equals activityID for normal results; the handler's activity for Run/Sleep
+// checkpoints) — the retention sweeper deletes result rows by owner alongside
+// the tree.
+//
+// Precondition: tx already holds an exclusive row lock (UPDATE, FOR UPDATE or
+// FOR NO KEY UPDATE) on owner's runnerq_activities row. That lock is what
+// orders this publication against a consumer parking on the result — see the
+// note at the top of dependencies.go. Callers that do not naturally update
+// the owner row must lock it explicitly first.
 func (b *PostgresBackend) storeResultTx(ctx context.Context, tx pgx.Tx, activityID, owner uuid.UUID, result *storage.ActivityResult, now time.Time, step string) error {
-	if err := b.lockResultTx(ctx, tx, activityID); err != nil {
-		return err
-	}
 	stateStr := "Ok"
 	if result.State == storage.ResultErr {
 		stateStr = "Err"
@@ -1245,15 +1249,18 @@ func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UU
 
 	// Reject signals for activities that don't exist: their result rows
 	// could never be retention-collected (no tree to die with), so a typo'd
-	// ID would leak rows forever.
-	var exists bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM runnerq_activities WHERE id = $1 AND queue_name = $2)`,
-		activityID, b.queueName).Scan(&exists); err != nil {
-		return databaseError(err, fmt.Sprintf("Failed to look up signal target: %v", err))
-	}
-	if !exists {
+	// ID would leak rows forever. The lookup doubles as the owner row lock
+	// storeResultTx requires: a target mid-park holds its row FOR UPDATE, so
+	// this waits for the park to commit and the wake below then sees it.
+	var found int
+	err = tx.QueryRow(ctx, `
+		SELECT 1 FROM runnerq_activities WHERE id = $1 AND queue_name = $2 FOR NO KEY UPDATE`,
+		activityID, b.queueName).Scan(&found)
+	if err == pgx.ErrNoRows {
 		return storage.NewNotFoundError(fmt.Sprintf("Activity %s not found for signal delivery", activityID))
+	}
+	if err != nil {
+		return databaseError(err, fmt.Sprintf("Failed to look up signal target: %v", err))
 	}
 
 	signalStep := ""
@@ -1600,6 +1607,16 @@ func (b *PostgresBackend) StoreResult(ctx context.Context, activityID uuid.UUID,
 	}
 	defer tx.Rollback(ctx)
 
+	// This path has no claim UPDATE of its own, so take the owner row lock
+	// storeResultTx relies on explicitly. A missing owner (legacy rows with no
+	// tree) has nothing parked on it that could be missed.
+	var found int
+	err = tx.QueryRow(ctx, `
+		SELECT 1 FROM runnerq_activities WHERE id = $1 AND queue_name = $2 FOR NO KEY UPDATE`,
+		ownerActivityID, b.queueName).Scan(&found)
+	if err != nil && err != pgx.ErrNoRows {
+		return databaseError(err, fmt.Sprintf("Failed to lock result owner: %v", err))
+	}
 	if err := b.storeResultTx(ctx, tx, activityID, ownerActivityID, &result, now, step); err != nil {
 		return err
 	}

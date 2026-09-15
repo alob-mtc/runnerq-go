@@ -34,11 +34,11 @@ func (b *PostgresBackend) StoreCheckpoint(ctx context.Context, id, owner uuid.UU
 		return databaseError(err, "failed to begin checkpoint transaction")
 	}
 	defer tx.Rollback(ctx)
-	if err := b.lockResultTx(ctx, tx, id); err != nil {
-		return err
-	}
 	// Serialize with the reaper and acknowledgements. A stale execution cannot
 	// publish checkpoints even though its user function may still be running.
+	// This FOR UPDATE on the owner is also what orders the checkpoint against
+	// a consumer parking on it (see dependencies.go), so it must stay ahead of
+	// the insert and the wake below.
 	var claimed int
 	err = tx.QueryRow(ctx, `SELECT 1 FROM runnerq_activities
 		WHERE id = $1 AND queue_name = $2 AND status = 'processing' AND current_worker_id = $3

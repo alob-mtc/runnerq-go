@@ -10,23 +10,29 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Result publication and durable parking take turns for one logical result.
-// The lock is transaction-scoped and never accumulated across a workflow.
-const dependencyResultLockClass = int32(1381913430)
+// Result publication and durable parking must take turns for one logical
+// result, or a consumer can park just as the result lands and nobody wakes it
+// (write skew under READ COMMITTED: each side reads what the other has not
+// committed yet). They coordinate on the row lock of the result's OWNER
+// activity — the child for an await, the target for a signal, the handler's
+// activity for a checkpoint — which every producer path already holds
+// exclusively when it publishes (its own status UPDATE or claim FOR UPDATE).
+// The parking consumer takes the same row FOR SHARE before it registers its
+// dependency and checks readiness. Whichever transaction is ordered second
+// sees the first one's committed write, so no advisory lock, no extra
+// statement, and no shared-lock-table entry per result is needed. Sharers do
+// not block each other, so fan-in consumers park concurrently.
+//
+// Invariant for producers: lock the owner row BEFORE storeResultTx / the wake
+// UPDATE, never after.
 
-func (b *PostgresBackend) lockResultTx(ctx context.Context, tx pgx.Tx, id uuid.UUID) error {
-	// Hash collisions serialize unrelated results; they cannot merge identities.
-	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1::int4, hashtext($2))`, dependencyResultLockClass, b.queueName+":"+id.String())
-	if err != nil {
-		return databaseError(err, "failed to serialize result publication")
-	}
-	return nil
-}
-
-// lockProducerRootTx serializes dependency registration with retention for
-// one workflow tree. The root row is the single coordination point for every
-// result in that tree; it is held only until this transaction commits. This
-// avoids a queue-wide advisory lock and avoids retaining a lock per result.
+// lockProducerRootTx orders this transaction against two others for one
+// producer: retention for the producer's workflow tree (root FOR KEY SHARE —
+// the root row is the single coordination point for every result in the
+// tree, held only until this transaction commits) and result publication for
+// the producer itself (producer FOR SHARE — conflicts with the publisher's
+// status UPDATE but not with other sharers). Returns false when the producer
+// no longer exists in this queue.
 func (b *PostgresBackend) lockProducerRootTx(ctx context.Context, tx pgx.Tx, producer uuid.UUID) (bool, error) {
 	var root uuid.UUID
 	err := tx.QueryRow(ctx, `
@@ -36,12 +42,13 @@ func (b *PostgresBackend) lockProducerRootTx(ctx context.Context, tx pgx.Tx, pro
 		  ON root.id = COALESCE(producer.root_activity_id, producer.id)
 		 AND root.queue_name = producer.queue_name
 		WHERE producer.id = $1 AND producer.queue_name = $2
+		FOR SHARE OF producer
 		FOR KEY SHARE OF root`, producer, b.queueName).Scan(&root)
 	if err == pgx.ErrNoRows {
 		return false, nil
 	}
 	if err != nil {
-		return false, databaseError(err, "failed to lock dependency producer root")
+		return false, databaseError(err, "failed to lock dependency producer")
 	}
 	return true, nil
 }
@@ -118,9 +125,10 @@ func (b *PostgresBackend) YieldForResult(ctx context.Context, waiter, result uui
 		return databaseError(err, "failed to begin durable park")
 	}
 	defer tx.Rollback(ctx)
-	if err := b.lockResultTx(ctx, tx, result); err != nil {
-		return err
-	}
+	// Lock order: the waiter's own row (claim check), then the result owner's
+	// row via lockProducerRootTx for an await. For a signal the owner IS the
+	// waiter, so the claim check's FOR UPDATE already orders us against
+	// SignalActivity's FOR NO KEY UPDATE on the target.
 	if err := b.verifyClaimTx(ctx, tx, waiter, worker); err != nil {
 		// A lost reply can be reconciled even if an early wake or next claim has
 		// occurred. The durable event identifies this exact execution's park.

@@ -12,6 +12,7 @@ import (
 
 	"github.com/alob-mtc/runnerq-go/storage"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -401,4 +402,190 @@ func TestAttemptBudgetBoundariesMatchFailureAndReaper(t *testing.T) {
 			})
 		}
 	}
+}
+
+// pinnedTx opens a transaction the test drives by hand to stand in for one
+// side of the park/publish ordering. All of its statements are issued before
+// the other side is started, and it then only commits, so it never requests a
+// new lock while another session (a concurrent test package running schema
+// DDL on the shared tables) may be queued behind it.
+func pinnedTx(t *testing.T, b *PostgresBackend) (tx pgx.Tx, commit func()) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback(ctx) })
+	return tx, func() {
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// retryConflict runs op the way the engine's persistence retry does: a
+// storage conflict (deadlock / serialization failure) is transient and is
+// simply re-attempted. Concurrent test packages run schema DDL on the shared
+// tables whenever they construct a backend, and a call queued behind that
+// DDL can be picked as the deadlock victim.
+func retryConflict(op func() error) error {
+	var err error
+	for range 5 {
+		if err = op(); err == nil {
+			return nil
+		}
+		if se, ok := storage.IsStorageError(err); !ok || se.Kind != storage.ErrConflict {
+			return err
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return err
+}
+
+// mustStayBlocked starts op and fails the test if it returns before the
+// pinned side commits; it then commits and returns op's result.
+func mustStayBlocked(t *testing.T, commit func(), op func() error) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- op() }()
+	select {
+	case err := <-done:
+		t.Fatalf("returned while the owner row was still held by the other side: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	commit()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(10 * time.Second):
+		t.Fatal("still blocked after the other side committed")
+		return nil
+	}
+}
+
+// The park/publish ordering rests on the owner's row lock, not on timing.
+// Each subtest pins one side mid-transaction by hand, proves the other side
+// waits on the row, and checks that once the pinned side commits the waiting
+// side observes it: the waiter always ends up runnable.
+func TestParkAndPublishOrderOnOwnerRowLock(t *testing.T) {
+	ctx := context.Background()
+	newPair := func(t *testing.T) (*PostgresBackend, storage.QueuedActivity, storage.QueuedActivity) {
+		b := testBackend(t)
+		producer := testActivity(1)
+		producer.ActivityType = "producer"
+		claimTestActivity(t, b, producer, "p")
+		waiter := testActivity(3)
+		waiter.ActivityType = "waiter"
+		claimTestActivity(t, b, waiter, "w")
+		return b, producer, waiter
+	}
+
+	t.Run("consumer commits first, publisher waits", func(t *testing.T) {
+		b, producer, waiter := newPair(t)
+		// Hand-driven park: owner FOR SHARE, dependency, status 'waiting'.
+		tx, commit := pinnedTx(t, b)
+		var one int
+		if err := tx.QueryRow(ctx, `SELECT 1 FROM runnerq_activities WHERE id = $1 AND queue_name = $2 FOR SHARE`, producer.ID, b.queueName).Scan(&one); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO runnerq_dependencies (queue_name, waiter_activity_id, result_id, producer_activity_id) VALUES ($1, $2, $3, $3)`, b.queueName, waiter.ID, producer.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE runnerq_activities SET status = 'waiting', current_worker_id = NULL, lease_deadline_ms = NULL WHERE id = $1 AND queue_name = $2`, waiter.ID, b.queueName); err != nil {
+			t.Fatal(err)
+		}
+		err := mustStayBlocked(t, commit, func() error {
+			return retryConflict(func() error { return b.AckSuccess(ctx, producer.ID, nil, "p") })
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status, _ := activityStatus(t, b, waiter.ID); status != "pending" {
+			t.Fatalf("waiter status=%s, want pending (publisher must see the committed dependency)", status)
+		}
+	})
+
+	t.Run("publisher commits first, consumer waits", func(t *testing.T) {
+		b, producer, waiter := newPair(t)
+		// Hand-driven publication: owner exclusively locked, result stored.
+		tx, commit := pinnedTx(t, b)
+		var one int
+		if err := tx.QueryRow(ctx, `SELECT 1 FROM runnerq_activities WHERE id = $1 AND queue_name = $2 FOR NO KEY UPDATE`, producer.ID, b.queueName).Scan(&one); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO runnerq_results (activity_id, queue_name, state, created_at, owner_activity_id) VALUES ($1, $2, 'Ok', NOW(), $1)`, producer.ID, b.queueName); err != nil {
+			t.Fatal(err)
+		}
+		err := mustStayBlocked(t, commit, func() error {
+			return retryConflict(func() error {
+				return b.YieldForResult(ctx, waiter.ID, producer.ID, &producer.ID, time.Now().Add(time.Hour), "w", "await", "child")
+			})
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status, _ := activityStatus(t, b, waiter.ID); status != "pending" {
+			t.Fatalf("waiter status=%s, want pending (park must see the committed result)", status)
+		}
+	})
+}
+
+// A signal's owner is its target, so SignalActivity and a target parking for
+// that signal order on the target's own row.
+func TestSignalAndParkOrderOnTargetRow(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("park commits first, signal waits", func(t *testing.T) {
+		b := testBackend(t)
+		sigID := uuid.New()
+		target := testActivity(3)
+		claimTestActivity(t, b, target, "w")
+		tx, commit := pinnedTx(t, b)
+		var one int
+		if err := tx.QueryRow(ctx, `SELECT 1 FROM runnerq_activities WHERE id = $1 AND queue_name = $2 FOR UPDATE`, target.ID, b.queueName).Scan(&one); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO runnerq_dependencies (queue_name, waiter_activity_id, result_id) VALUES ($1, $2, $3)`, b.queueName, target.ID, sigID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE runnerq_activities SET status = 'waiting', current_worker_id = NULL, lease_deadline_ms = NULL WHERE id = $1 AND queue_name = $2`, target.ID, b.queueName); err != nil {
+			t.Fatal(err)
+		}
+		err := mustStayBlocked(t, commit, func() error {
+			return retryConflict(func() error { return b.SignalActivity(ctx, target.ID, sigID, "approve", json.RawMessage(`true`)) })
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status, _ := activityStatus(t, b, target.ID); status != "pending" {
+			t.Fatalf("target status=%s, want pending (signal must see the committed park)", status)
+		}
+	})
+
+	t.Run("signal commits first, park waits", func(t *testing.T) {
+		b := testBackend(t)
+		sigID := uuid.New()
+		target := testActivity(3)
+		claimTestActivity(t, b, target, "w")
+		tx, commit := pinnedTx(t, b)
+		var one int
+		if err := tx.QueryRow(ctx, `SELECT 1 FROM runnerq_activities WHERE id = $1 AND queue_name = $2 FOR NO KEY UPDATE`, target.ID, b.queueName).Scan(&one); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO runnerq_results (activity_id, queue_name, state, created_at, owner_activity_id, step) VALUES ($1, $2, 'Ok', NOW(), $3, 'signal:approve')`, sigID, b.queueName, target.ID); err != nil {
+			t.Fatal(err)
+		}
+		err := mustStayBlocked(t, commit, func() error {
+			return retryConflict(func() error {
+				return b.YieldForResult(ctx, target.ID, sigID, nil, time.Now().Add(time.Hour), "w", "signal", "approve")
+			})
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status, _ := activityStatus(t, b, target.ID); status != "pending" {
+			t.Fatalf("target status=%s, want pending (park must see the committed signal)", status)
+		}
+	})
 }
