@@ -589,3 +589,126 @@ func TestSignalAndParkOrderOnTargetRow(t *testing.T) {
 		}
 	})
 }
+
+// Key reuse (ReturnExisting) registers a dependency on an existing child that
+// may be a retention candidate at that very moment. The child's idempotency
+// row is the ordering point: cleanup locks it before its dependency check,
+// reuse holds it while linking. Either order leaves no future pointing at a
+// deleted activity.
+func TestCleanupAndKeyReuseOrderOnIdempotencyRow(t *testing.T) {
+	ctx := context.Background()
+	policy := storage.RetentionPolicy{Completed: time.Hour}
+
+	// An expired, completed child owning a ReturnExisting key, plus a live
+	// parent that will reuse it. Returns the stored (encoded) key string.
+	plant := func(t *testing.T) (b *PostgresBackend, parent, child storage.QueuedActivity, storedKey string) {
+		b = testBackend(t)
+		parent = testActivity(3)
+		parent.ActivityType = "parent"
+		claimTestActivity(t, b, parent, "parent")
+		child = testActivity(3)
+		child.ActivityType = "child"
+		child.IdempotencyKey = &storage.IdempotencyKeyConfig{Key: "shared", Behavior: storage.BehaviorReturnExisting}
+		if got, err := b.EnqueueIdempotent(ctx, &child); err != nil || got != nil {
+			t.Fatalf("first claim: %v %v", got, err)
+		}
+		if c, err := b.Dequeue(ctx, "c", 0, []string{"child"}); err != nil || c == nil {
+			t.Fatalf("claim child: %v %v", c, err)
+		}
+		if err := b.AckSuccess(ctx, child.ID, json.RawMessage(`42`), "c"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.pool.Exec(ctx, `UPDATE runnerq_activities SET completed_at = NOW() - INTERVAL '2 hours' WHERE id = $1`, child.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.pool.QueryRow(ctx, `SELECT idempotency_key FROM runnerq_idempotency WHERE queue_name = $1 AND activity_id = $2`, b.queueName, child.ID).Scan(&storedKey); err != nil {
+			t.Fatal(err)
+		}
+		return b, parent, child, storedKey
+	}
+	childExists := func(t *testing.T, b *PostgresBackend, id uuid.UUID) bool {
+		t.Helper()
+		var n int
+		if err := b.pool.QueryRow(ctx, `SELECT count(*) FROM runnerq_activities WHERE id = $1`, id).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n > 0
+	}
+
+	t.Run("reuse commits first, cleanup waits and keeps the tree", func(t *testing.T) {
+		b, parent, child, storedKey := plant(t)
+		// Hand-driven reuse mid-flight: key row held, dependency written.
+		tx, commit := pinnedTx(t, b)
+		var one int
+		if err := tx.QueryRow(ctx, `SELECT 1 FROM runnerq_idempotency WHERE queue_name = $1 AND idempotency_key = $2 FOR UPDATE`, b.queueName, storedKey).Scan(&one); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO runnerq_dependencies (queue_name, waiter_activity_id, result_id, producer_activity_id) VALUES ($1, $2, $3, $3)`, b.queueName, parent.ID, child.ID); err != nil {
+			t.Fatal(err)
+		}
+		var swept uint64
+		err := mustStayBlocked(t, commit, func() error {
+			return retryConflict(func() error {
+				var err error
+				swept, err = b.CleanupExpired(ctx, policy, 100)
+				return err
+			})
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if swept != 0 || !childExists(t, b, child.ID) {
+			t.Fatalf("cleanup swept %d trees and child present=%v; a tree the reuse just pinned must survive", swept, childExists(t, b, child.ID))
+		}
+		if res, err := b.GetResult(ctx, child.ID); err != nil || res == nil {
+			t.Fatalf("reused child's result must still resolve: %v %v", res, err)
+		}
+	})
+
+	t.Run("cleanup commits first, reuse waits and claims fresh", func(t *testing.T) {
+		b, parent, child, storedKey := plant(t)
+		// Hand-driven cleanup mid-flight: root and key row held, tree deleted.
+		tx, commit := pinnedTx(t, b)
+		var one int
+		if err := tx.QueryRow(ctx, `SELECT 1 FROM runnerq_activities WHERE id = $1 AND queue_name = $2 FOR UPDATE`, child.ID, b.queueName).Scan(&one); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.QueryRow(ctx, `SELECT 1 FROM runnerq_idempotency WHERE queue_name = $1 AND idempotency_key = $2 FOR UPDATE`, b.queueName, storedKey).Scan(&one); err != nil {
+			t.Fatal(err)
+		}
+		for _, stmt := range []string{
+			`DELETE FROM runnerq_results WHERE activity_id = $1`,
+			`DELETE FROM runnerq_idempotency WHERE activity_id = $1`,
+			`DELETE FROM runnerq_activities WHERE id = $1`,
+		} {
+			if _, err := tx.Exec(ctx, stmt, child.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		other := testActivity(3)
+		other.ActivityType = "child"
+		other.ParentActivityID = &parent.ID
+		other.IdempotencyKey = child.IdempotencyKey
+		var got *storage.IdempotencyResult
+		err := mustStayBlocked(t, commit, func() error {
+			return retryConflict(func() error {
+				var err error
+				got, err = b.EnqueueIdempotent(ctx, &other)
+				return err
+			})
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != nil {
+			t.Fatalf("reuse returned existing %s after cleanup deleted it; it must claim the key fresh", got.ExistingID)
+		}
+		var owner uuid.UUID
+		if err := b.pool.QueryRow(ctx, `SELECT activity_id FROM runnerq_idempotency WHERE queue_name = $1 AND idempotency_key = $2`, b.queueName, storedKey).Scan(&owner); err != nil || owner != other.ID {
+			t.Fatalf("key owner = %s (%v), want the fresh activity %s", owner, err, other.ID)
+		}
+		if !childExists(t, b, other.ID) {
+			t.Fatal("fresh activity was not enqueued")
+		}
+	})
+}

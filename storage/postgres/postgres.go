@@ -1453,6 +1453,24 @@ func (b *PostgresBackend) CleanupExpired(ctx context.Context, policy storage.Ret
 			return 0, databaseError(err, "failed to select expired workflow root")
 		}
 
+		// Key reuse (BehaviorReturnExisting) registers a dependency on an
+		// existing child while holding that child's idempotency row FOR
+		// UPDATE, and never takes the root. The key rows this delete removes
+		// are therefore the ordering point with it: take them before the
+		// dependency check so a reuse in flight either commits first, and its
+		// dependency pins the tree below, or waits until this delete commits
+		// and then finds the key gone and claims it fresh. Ordering is
+		// root → keys here and key only there, so no cycle is possible.
+		if _, err := tx.Exec(ctx, `
+			SELECT 1 FROM runnerq_idempotency
+			WHERE queue_name = $1
+			  AND activity_id IN (
+				SELECT id FROM runnerq_activities
+				WHERE queue_name = $1 AND (id = $2 OR root_activity_id = $2))
+			FOR UPDATE`, b.queueName, rootID); err != nil {
+			return 0, databaseError(err, "failed to lock expired tree idempotency keys")
+		}
+
 		var pinned bool
 		if err := tx.QueryRow(ctx, `
 			SELECT EXISTS (
