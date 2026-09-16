@@ -101,3 +101,41 @@ func TestSchemaInitMigratesWhenObjectMissing(t *testing.T) {
 		t.Fatalf("schema not restored by a fresh init: %v, %v", current, err)
 	}
 }
+
+// Index names are unique per schema only. A same-named valid index in another
+// schema must not satisfy the dequeue-index inspection, or init would skip
+// the build and the fast path would never report the schema current.
+func TestSchemaInitIgnoresSameNamedIndexInOtherSchema(t *testing.T) {
+	b := testBackend(t)
+	ctx := context.Background()
+	const decoy = "rq_decoy_schema"
+	for _, stmt := range []string{
+		`CREATE SCHEMA IF NOT EXISTS ` + decoy,
+		`CREATE TABLE IF NOT EXISTS ` + decoy + `.t (x INT)`,
+		`CREATE INDEX IF NOT EXISTS idx_runnerq_dequeue_order_v2 ON ` + decoy + `.t (x)`,
+		`DROP INDEX IF EXISTS public.idx_runnerq_dequeue_order_v2`,
+	} {
+		if _, err := b.pool.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { _, _ = b.pool.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+decoy+` CASCADE`) })
+
+	testBackendNamed(t, "t_decoy").Close()
+
+	conn, err := b.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if current, err := schemaCurrent(ctx, conn); err != nil || !current {
+		t.Fatalf("dequeue index not rebuilt in the active schema behind a same-named decoy: current=%v err=%v", current, err)
+	}
+	var decoyStillThere bool
+	if err := conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = $1 AND indexname = 'idx_runnerq_dequeue_order_v2')`, decoy).Scan(&decoyStillThere); err != nil {
+		t.Fatal(err)
+	}
+	if !decoyStillThere {
+		t.Fatal("init dropped an index that belongs to another schema")
+	}
+}

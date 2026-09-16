@@ -250,25 +250,39 @@ var dequeueIndexes = []dequeueIndex{
 // dropped, and rebuilt. The old index is dropped only after its replacement
 // is valid, so the claim path is never left unindexed.
 func (b *PostgresBackend) ensureDequeueIndexes(ctx context.Context, conn *pgxpool.Conn) error {
+	// Everything here is scoped to the schema unqualified DDL resolves to.
+	// Index names are only unique per schema, so an unscoped lookup could
+	// see a same-named index elsewhere, skip the build, and leave
+	// schemaCurrent false on every later start; an unqualified DROP would
+	// likewise follow search_path to another schema's index.
+	var schema string
+	if err := conn.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		return databaseError(err, fmt.Sprintf("Failed to resolve current schema: %v", err))
+	}
 	for _, idx := range dequeueIndexes {
 		// Re-running the whole step after a deadlock is what makes it safe:
 		// a CONCURRENTLY build killed mid-way leaves an INVALID index that
 		// the inspection below drops before rebuilding.
-		if err := retryDeadlock(ctx, idx.name, func() error { return b.ensureDequeueIndex(ctx, conn, idx) }); err != nil {
+		if err := retryDeadlock(ctx, idx.name, func() error { return b.ensureDequeueIndex(ctx, conn, schema, idx) }); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (b *PostgresBackend) ensureDequeueIndex(ctx context.Context, conn *pgxpool.Conn, idx dequeueIndex) error {
+func (b *PostgresBackend) ensureDequeueIndex(ctx context.Context, conn *pgxpool.Conn, schema string, idx dequeueIndex) error {
+	dropIndex := func(name string) error {
+		_, err := conn.Exec(ctx, "DROP INDEX IF EXISTS "+pgx.Identifier{schema, name}.Sanitize())
+		return err
+	}
 	{
 		var valid *bool
 		err := conn.QueryRow(ctx, `
 			SELECT i.indisvalid
 			FROM pg_index i
 			JOIN pg_class c ON c.oid = i.indexrelid
-			WHERE c.relname = $1`, idx.name).Scan(&valid)
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = $1 AND c.relname = $2`, schema, idx.name).Scan(&valid)
 		switch {
 		case err == pgx.ErrNoRows:
 			// Doesn't exist yet — build below.
@@ -276,12 +290,12 @@ func (b *PostgresBackend) ensureDequeueIndex(ctx context.Context, conn *pgxpool.
 			return databaseError(err, fmt.Sprintf("Failed to inspect index %s: %v", idx.name, err))
 		case valid != nil && !*valid:
 			// Leftover of an interrupted concurrent build — drop and rebuild.
-			if _, err := conn.Exec(ctx, "DROP INDEX IF EXISTS "+pgx.Identifier{idx.name}.Sanitize()); err != nil {
+			if err := dropIndex(idx.name); err != nil {
 				return databaseError(err, fmt.Sprintf("Failed to drop invalid index %s: %v", idx.name, err))
 			}
 		default:
 			// Exists and valid: just make sure the predecessor is gone.
-			if _, err := conn.Exec(ctx, "DROP INDEX IF EXISTS "+pgx.Identifier{idx.dropAfter}.Sanitize()); err != nil {
+			if err := dropIndex(idx.dropAfter); err != nil {
 				return databaseError(err, fmt.Sprintf("Failed to drop superseded index %s: %v", idx.dropAfter, err))
 			}
 			return nil
@@ -290,7 +304,7 @@ func (b *PostgresBackend) ensureDequeueIndex(ctx context.Context, conn *pgxpool.
 		if _, err := conn.Exec(ctx, idx.ddl); err != nil {
 			return databaseError(err, fmt.Sprintf("Failed to build index %s: %v", idx.name, err))
 		}
-		if _, err := conn.Exec(ctx, "DROP INDEX IF EXISTS "+pgx.Identifier{idx.dropAfter}.Sanitize()); err != nil {
+		if err := dropIndex(idx.dropAfter); err != nil {
 			return databaseError(err, fmt.Sprintf("Failed to drop superseded index %s: %v", idx.dropAfter, err))
 		}
 	}
