@@ -87,8 +87,22 @@ const awaitParkGrace = 2 * time.Second
 // Called from outside a handler (a server process holding a future), it
 // blocks until the result exists or ctx is done.
 func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error) {
+	queue := f.queue
+	if scoped, ok := ctx.Value(attemptQueueKey{}).(*attemptQueue); ok {
+		if err := scoped.registerFuture(ctx, f.activityID); err != nil {
+			return nil, err
+		}
+		// Rehydrated futures also need the executing activity's retry/lease
+		// policy, even though their original handle had no execution scope.
+		copy := *scoped
+		copy.activityQueue = f.queue
+		if original, ok := f.queue.(*attemptQueue); ok {
+			copy.activityQueue = original.activityQueue
+		}
+		queue = &copy
+	}
 	if !inHandlerScope(ctx) {
-		result, err := f.queue.WaitForResult(ctx, f.activityID)
+		result, err := queue.WaitForResult(ctx, f.activityID)
 		if err != nil {
 			return nil, err
 		}
@@ -106,7 +120,7 @@ func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error)
 	}
 	if bound.After(time.Now()) {
 		wctx, cancel := context.WithDeadline(ctx, bound)
-		result, err := f.queue.WaitForResult(wctx, f.activityID)
+		result, err := queue.WaitForResult(wctx, f.activityID)
 		cancel()
 		if err == nil {
 			return translateResult(result)
@@ -166,7 +180,8 @@ func (b *ActivityBuilder) Priority(p ActivityPriority) *ActivityBuilder {
 	return b
 }
 
-// MaxRetries sets the maximum number of retry attempts (0 for unlimited).
+// MaxRetries sets the maximum total execution attempts, including the first.
+// The legacy name is retained for compatibility: 1 means no retries, 0 unlimited.
 func (b *ActivityBuilder) MaxRetries(retries uint32) *ActivityBuilder {
 	b.maxRetries = &retries
 	return b
@@ -202,7 +217,7 @@ func (b *ActivityBuilder) Delay(d time.Duration) *ActivityBuilder {
 // composite to address a workflow by its business key — keep the two in lockstep
 // by routing both through this single function.
 func idempotencyStorageKey(userKey, activityType string) string {
-	return fmt.Sprintf("%s-%s", userKey, activityType)
+	return storage.BusinessIdempotencyKey(userKey, activityType)
 }
 
 // IdempotencyKeyOption sets the idempotency key and behavior for duplicate detection.

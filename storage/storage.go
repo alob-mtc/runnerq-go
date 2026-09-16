@@ -72,10 +72,32 @@ type IdempotencyResult struct {
 
 // DequeuedActivity is an activity claimed by a worker.
 type DequeuedActivity struct {
-	Activity      QueuedActivity
+	Activity QueuedActivity
+	// LeaseID is the execution token recorded as the claim's worker ID. Every
+	// fenced acknowledgement (AckSuccess, AckFailure, Yield, ...) presents it.
+	// Batch claims return a distinct token per activity.
 	LeaseID       string
 	Attempt       uint32
 	LeaseDeadline time.Time
+}
+
+// BatchQueueStorage is an optional capability: a backend that can claim
+// several runnable activities in one round trip. The engine detects it with a
+// type assertion and, when present, replaces its per-slot Dequeue loops with
+// one dispatcher that claims exactly as many activities as it has idle slots.
+// Backends without it keep working through QueueStorage.Dequeue.
+//
+// DequeueBatch claims at most limit activities, selected and ordered by the
+// same eligibility rules as Dequeue, and returns each with its own unique
+// LeaseID. The engine passes a fresh workerIDPrefix on every call and
+// implementations derive each LeaseID from it (for example
+// "<prefix>:<activity id>"), so a token can never collide with a claim made by
+// another call. timeout has Dequeue's meaning: zero is a single non-blocking
+// probe; a positive value blocks until at least one activity is claimable or
+// the timeout elapses. An empty result with a nil error means nothing became
+// claimable in time.
+type BatchQueueStorage interface {
+	DequeueBatch(ctx context.Context, workerIDPrefix string, limit int, timeout time.Duration, activityTypes []string) ([]DequeuedActivity, error)
 }
 
 // ActivityResult holds result data from a completed activity.
@@ -275,8 +297,13 @@ type QueueStorage interface {
 	// Implementations MUST store the result atomically with the status change
 	// and MUST write a result record even when result is nil, so callers
 	// awaiting the result can always resolve once the activity completes.
+	// workerID is a unique execution token, not a reusable worker-slot label.
+	// Retrying an identical committed acknowledgement with the same token must
+	// succeed; a stale/conflicting acknowledgement must not change the row.
 	AckSuccess(ctx context.Context, activityID uuid.UUID, result json.RawMessage, workerID string) error
-	// AckFailure marks an activity as failed. Returns true if moved to dead letter queue.
+	// AckFailure records a failure once per execution token. Retrying the same
+	// committed failure returns its original dead-letter decision without
+	// consuming another execution attempt. Returns true for dead-lettering.
 	AckFailure(ctx context.Context, activityID uuid.UUID, failure FailureKind, workerID string) (bool, error)
 	ProcessScheduled(ctx context.Context) (uint64, error)
 	RequeueExpired(ctx context.Context, batchSize int) (uint64, error)

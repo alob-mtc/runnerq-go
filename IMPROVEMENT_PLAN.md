@@ -189,10 +189,12 @@ already exist (idempotency table, permanent results table, lineage columns):
    server process and the producing worker only share the database; verified by integration
    tests with two separate backend instances: ~100-200ms wakes). Custom backends without the
    capability fall back to the legacy 100ms poll.
-4. **No batching.** Enqueue is one transaction per child (postgres.go:218-286 — a fanout-100
-   handler does 100 sequential round-trips); dequeue claims one row per round-trip → O(workers²)
-   skip-locked scanning; no batch ack. ~20 statements / 4 transactions per successful activity
-   today. Add batch claim, batch enqueue, batch ack.
+4. ◐ **PARTIALLY DONE — no batching.** Batch claim shipped: the optional
+   `storage.BatchQueueStorage` capability (Postgres: one `UPDATE … FROM (SELECT … LIMIT n FOR
+   UPDATE SKIP LOCKED)` plus one multi-row event insert, per-row `<prefix>:<id>` tokens) and an
+   engine dispatcher that claims exactly the idle slots per round trip instead of one row per
+   worker loop. Still open: enqueue is one transaction per child (a fanout-100 handler does 100
+   sequential round-trips) and there is no batch ack.
 5. ◐ **PARTIALLY DONE — unbounded table growth.** Retention sweeper shipped: opt-in
    `RetentionConfig{Completed, Failed TTLs}` on the engine; the backend's `CleanupExpired`
    deletes whole terminal workflow trees (activities + events + results — including Run/Sleep

@@ -105,7 +105,7 @@ func (c ActivityContext) Run(name string, fn func() (json.RawMessage, error)) (j
 
 	out, fnErr := fn()
 	if fnErr != nil {
-		if re, ok := fnErr.(RetryableError); ok && !re.IsRetryable() {
+		if !retryableError(fnErr) {
 			// Permanent failure: checkpoint it so retries of the PARENT (for
 			// unrelated reasons) don't re-run a step that failed for good.
 			failureJSON, _ := json.Marshal(map[string]string{"error": fnErr.Error()})
@@ -117,10 +117,9 @@ func (c ActivityContext) Run(name string, fn func() (json.RawMessage, error)) (j
 	}
 
 	if err := c.queue.StoreResult(c.Ctx, checkID, c.ActivityID, activityResult{Data: out, State: ResultOk}, "run:"+name); err != nil {
-		// The side effect happened but the checkpoint didn't commit; surface
-		// a retryable error so the attempt retries — fn will run again, which
-		// is the documented at-least-once edge.
-		return nil, NewRetryError(fmt.Sprintf("step %q ran but checkpoint failed: %v", name, err))
+		// Scoped storage retries transient writes without rerunning fn. Keep
+		// the remaining error's ownership/permanent/cancellation classification.
+		return nil, fmt.Errorf("step %q ran but checkpoint failed: %w", name, err)
 	}
 	return out, nil
 }

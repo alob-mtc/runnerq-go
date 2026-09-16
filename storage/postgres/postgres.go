@@ -3,11 +3,13 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -34,7 +36,7 @@ const workerPoolLivenessWindow = 60 * time.Second
 type PostgresBackend struct {
 	pool           *pgxpool.Pool
 	queueName      string
-	defaultLeaseMS int64
+	defaultLeaseMS atomic.Int64
 
 	// sig batches post-commit wake-up signals; watch is the lazily-started
 	// shared listener that turns them into in-process wake-ups. See signals.go.
@@ -61,6 +63,12 @@ func WithConfig(ctx context.Context, databaseURL, queueName string, defaultLease
 		return nil, err
 	}
 
+	if poolSize < 2 {
+		return nil, storage.NewConfigurationError("PostgreSQL pool requires at least 2 connections: one listener and one query connection")
+	}
+	if defaultLeaseMS <= 0 {
+		return nil, storage.NewConfigurationError("default lease must be positive")
+	}
 	config, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, storage.NewUnavailableError(fmt.Sprintf("Failed to parse PostgreSQL URL: %v", err))
@@ -73,11 +81,11 @@ func WithConfig(ctx context.Context, databaseURL, queueName string, defaultLease
 	}
 
 	backend := &PostgresBackend{
-		pool:           pool,
-		queueName:      queueName,
-		defaultLeaseMS: defaultLeaseMS,
+		pool:      pool,
+		queueName: queueName,
 	}
 
+	backend.defaultLeaseMS.Store(defaultLeaseMS)
 	if err := backend.initSchema(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -105,7 +113,7 @@ func (b *PostgresBackend) Close() {
 
 // SetLeaseMS updates the default lease duration. Implements storage.LeaseConfigurer.
 func (b *PostgresBackend) SetLeaseMS(leaseMS int64) {
-	b.defaultLeaseMS = leaseMS
+	b.defaultLeaseMS.Store(leaseMS)
 }
 
 func validateQueueName(name string) error {
@@ -134,6 +142,20 @@ func validateQueueName(name string) error {
 const schemaAdvisoryLockKey int64 = 0x52554E4E45525121 // "RUNNERQ!"
 
 func (b *PostgresBackend) initSchema(ctx context.Context) error {
+	conn, err := b.pool.Acquire(ctx)
+	if err != nil {
+		return databaseError(err, fmt.Sprintf("Failed to acquire connection for schema init: %v", err))
+	}
+	defer conn.Release()
+
+	// Fast path: nothing to create means no DDL, no advisory lock, and no
+	// table locks taken against live traffic (see schema_check.go).
+	if current, err := schemaCurrent(ctx, conn); err != nil {
+		return err
+	} else if current {
+		return nil
+	}
+
 	// Schema init must be serialized: ALTER TABLE takes ACCESS EXCLUSIVE
 	// before evaluating IF NOT EXISTS, so two backends initializing
 	// concurrently (multiple engine processes booting, parallel tests) take
@@ -141,14 +163,8 @@ func (b *PostgresBackend) initSchema(ctx context.Context) error {
 	// "deadlock detected" (SQLSTATE 40P01). A session-level advisory lock on
 	// a dedicated connection makes inits run one at a time; the lock
 	// auto-releases if the session dies.
-	conn, err := b.pool.Acquire(ctx)
-	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to acquire connection for schema init: %v", err))
-	}
-	defer conn.Release()
-
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, schemaAdvisoryLockKey); err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to acquire schema lock: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to acquire schema lock: %v", err))
 	}
 	defer func() {
 		// Unlock on a cancellation-proof context: the session-level lock
@@ -160,25 +176,38 @@ func (b *PostgresBackend) initSchema(ctx context.Context) error {
 		}
 	}()
 
-	if _, err := conn.Exec(ctx, schemaSql); err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to initialize schema: %v", err))
+	// Another process may have finished the migration while we waited for
+	// the lock; the DDL is idempotent, but skipping it avoids its locks.
+	if current, err := schemaCurrent(ctx, conn); err != nil {
+		return err
+	} else if current {
+		return nil
 	}
 
-	if err := b.ensureDequeueIndexes(ctx, conn); err != nil {
+	// The DDL runs against whatever traffic other processes are serving and
+	// can be chosen as a deadlock victim; it is idempotent, so retry.
+	err = retryDeadlock(ctx, "schema", func() error {
+		_, err := conn.Exec(ctx, schemaSql)
 		return err
+	})
+	if err != nil {
+		return databaseError(err, fmt.Sprintf("Failed to initialize schema: %v", err))
 	}
-	return nil
+
+	return b.ensureDequeueIndexes(ctx, conn)
 }
 
 // dequeueIndexes are the hot claim-path indexes, built CONCURRENTLY (outside
 // schemaSql) so their creation never takes the SHARE lock that would block
 // every write on runnerq_activities during the build. dropAfter names the
 // previous version, removed only once the replacement is valid.
-var dequeueIndexes = []struct {
+type dequeueIndex struct {
 	name      string
 	ddl       string
 	dropAfter string
-}{
+}
+
+var dequeueIndexes = []dequeueIndex{
 	{
 		// Serves the single-type dequeue form: with activity_type pinned by
 		// equality, the remaining key columns match the dequeue ORDER BY
@@ -221,36 +250,62 @@ var dequeueIndexes = []struct {
 // dropped, and rebuilt. The old index is dropped only after its replacement
 // is valid, so the claim path is never left unindexed.
 func (b *PostgresBackend) ensureDequeueIndexes(ctx context.Context, conn *pgxpool.Conn) error {
+	// Everything here is scoped to the schema unqualified DDL resolves to.
+	// Index names are only unique per schema, so an unscoped lookup could
+	// see a same-named index elsewhere, skip the build, and leave
+	// schemaCurrent false on every later start; an unqualified DROP would
+	// likewise follow search_path to another schema's index.
+	var schema string
+	if err := conn.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		return databaseError(err, fmt.Sprintf("Failed to resolve current schema: %v", err))
+	}
 	for _, idx := range dequeueIndexes {
+		// Re-running the whole step after a deadlock is what makes it safe:
+		// a CONCURRENTLY build killed mid-way leaves an INVALID index that
+		// the inspection below drops before rebuilding.
+		if err := retryDeadlock(ctx, idx.name, func() error { return b.ensureDequeueIndex(ctx, conn, schema, idx) }); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *PostgresBackend) ensureDequeueIndex(ctx context.Context, conn *pgxpool.Conn, schema string, idx dequeueIndex) error {
+	dropIndex := func(name string) error {
+		_, err := conn.Exec(ctx, "DROP INDEX IF EXISTS "+pgx.Identifier{schema, name}.Sanitize())
+		return err
+	}
+	{
 		var valid *bool
 		err := conn.QueryRow(ctx, `
 			SELECT i.indisvalid
 			FROM pg_index i
 			JOIN pg_class c ON c.oid = i.indexrelid
-			WHERE c.relname = $1`, idx.name).Scan(&valid)
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = $1 AND c.relname = $2`, schema, idx.name).Scan(&valid)
 		switch {
 		case err == pgx.ErrNoRows:
 			// Doesn't exist yet — build below.
 		case err != nil:
-			return storage.NewInternalError(fmt.Sprintf("Failed to inspect index %s: %v", idx.name, err))
+			return databaseError(err, fmt.Sprintf("Failed to inspect index %s: %v", idx.name, err))
 		case valid != nil && !*valid:
 			// Leftover of an interrupted concurrent build — drop and rebuild.
-			if _, err := conn.Exec(ctx, "DROP INDEX IF EXISTS "+pgx.Identifier{idx.name}.Sanitize()); err != nil {
-				return storage.NewInternalError(fmt.Sprintf("Failed to drop invalid index %s: %v", idx.name, err))
+			if err := dropIndex(idx.name); err != nil {
+				return databaseError(err, fmt.Sprintf("Failed to drop invalid index %s: %v", idx.name, err))
 			}
 		default:
 			// Exists and valid: just make sure the predecessor is gone.
-			if _, err := conn.Exec(ctx, "DROP INDEX IF EXISTS "+pgx.Identifier{idx.dropAfter}.Sanitize()); err != nil {
-				return storage.NewInternalError(fmt.Sprintf("Failed to drop superseded index %s: %v", idx.dropAfter, err))
+			if err := dropIndex(idx.dropAfter); err != nil {
+				return databaseError(err, fmt.Sprintf("Failed to drop superseded index %s: %v", idx.dropAfter, err))
 			}
-			continue
+			return nil
 		}
 
 		if _, err := conn.Exec(ctx, idx.ddl); err != nil {
-			return storage.NewInternalError(fmt.Sprintf("Failed to build index %s: %v", idx.name, err))
+			return databaseError(err, fmt.Sprintf("Failed to build index %s: %v", idx.name, err))
 		}
-		if _, err := conn.Exec(ctx, "DROP INDEX IF EXISTS "+pgx.Identifier{idx.dropAfter}.Sanitize()); err != nil {
-			return storage.NewInternalError(fmt.Sprintf("Failed to drop superseded index %s: %v", idx.dropAfter, err))
+		if err := dropIndex(idx.dropAfter); err != nil {
+			return databaseError(err, fmt.Sprintf("Failed to drop superseded index %s: %v", idx.dropAfter, err))
 		}
 	}
 	return nil
@@ -282,15 +337,46 @@ func (b *PostgresBackend) recordEvent(ctx context.Context, tx pgx.Tx, activityID
 		VALUES ($1, $2, $3, $4, $5, $6)`,
 		activityID, b.queueName, eventType, workerID, detail, time.Now().UTC())
 	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to record event: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to record event: %v", err))
 	}
 	return nil
 }
 
-// storeResultTx persists a result row. owner is the activity whose workflow
-// tree governs this row's lifetime (equals activityID for normal results;
-// the handler's activity for Run/Sleep checkpoints) — the retention sweeper
-// deletes result rows by owner alongside the tree.
+// recordDequeueEvents is recordEvent for a batch claim: one Dequeued row per
+// claimed activity, written with a single multi-row INSERT (unnest over
+// parallel arrays) so the hot path stays at one statement whatever the batch
+// size. Same no-NOTIFY rule as recordEvent; the caller signals after commit.
+func (b *PostgresBackend) recordDequeueEvents(ctx context.Context, tx pgx.Tx, claims []storage.DequeuedActivity) error {
+	ids := make([]uuid.UUID, len(claims))
+	leaseIDs := make([]string, len(claims))
+	details := make([]string, len(claims))
+	for i, c := range claims {
+		ids[i] = c.Activity.ID
+		leaseIDs[i] = c.LeaseID
+		details[i] = string(toDetail(map[string]any{"lease_deadline_ms": c.LeaseDeadline.UnixMilli()}))
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO runnerq_events (activity_id, queue_name, event_type, worker_id, detail, created_at)
+		SELECT c.activity_id, $1, $2, c.worker_id, c.detail::jsonb, $3
+		FROM unnest($4::uuid[], $5::text[], $6::text[]) AS c(activity_id, worker_id, detail)`,
+		b.queueName, storage.EventDequeued, time.Now().UTC(), ids, leaseIDs, details)
+	if err != nil {
+		return databaseError(err, fmt.Sprintf("Failed to record dequeue events: %v", err))
+	}
+	return nil
+}
+
+// storeResultTx persists a result row and wakes consumers parked on it.
+// owner is the activity whose workflow tree governs this row's lifetime
+// (equals activityID for normal results; the handler's activity for Run/Sleep
+// checkpoints) — the retention sweeper deletes result rows by owner alongside
+// the tree.
+//
+// Precondition: tx already holds an exclusive row lock (UPDATE, FOR UPDATE or
+// FOR NO KEY UPDATE) on owner's runnerq_activities row. That lock is what
+// orders this publication against a consumer parking on the result — see the
+// note at the top of dependencies.go. Callers that do not naturally update
+// the owner row must lock it explicitly first.
 func (b *PostgresBackend) storeResultTx(ctx context.Context, tx pgx.Tx, activityID, owner uuid.UUID, result *storage.ActivityResult, now time.Time, step string) error {
 	stateStr := "Ok"
 	if result.State == storage.ResultErr {
@@ -308,9 +394,9 @@ func (b *PostgresBackend) storeResultTx(ctx context.Context, tx pgx.Tx, activity
 		SET state = $3, data = $4, created_at = $5, owner_activity_id = $6, step = $7`,
 		activityID, b.queueName, stateStr, result.Data, now, owner, stepArg)
 	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to store result: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to store result: %v", err))
 	}
-	return nil
+	return b.wakeResultWaitersTx(ctx, tx, activityID)
 }
 
 func toDetail(kv map[string]any) json.RawMessage {
@@ -327,7 +413,7 @@ func strPtr(s string) *string { return &s }
 func (b *PostgresBackend) Enqueue(ctx context.Context, a storage.QueuedActivity) error {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to begin transaction: %v", err))
 	}
 	defer tx.Rollback(ctx)
 
@@ -336,7 +422,7 @@ func (b *PostgresBackend) Enqueue(ctx context.Context, a storage.QueuedActivity)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to commit enqueue: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to commit enqueue: %v", err))
 	}
 
 	b.signalEnqueued(&a)
@@ -394,7 +480,7 @@ func (b *PostgresBackend) enqueueInTx(ctx context.Context, tx pgx.Tx, a *storage
 		metadataJSON, idempotencyKey,
 		a.ParentActivityID, rootID, int16(a.Depth))
 	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to enqueue activity: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to enqueue activity: %v", err))
 	}
 
 	var eventType string
@@ -410,11 +496,18 @@ func (b *PostgresBackend) enqueueInTx(ctx context.Context, tx pgx.Tx, a *storage
 		})
 	}
 
+	if err := b.linkChildTx(ctx, tx, a.ParentActivityID, a.ID); err != nil {
+		return err
+	}
 	return b.recordEvent(ctx, tx, a.ID, eventType, nil, detail)
 }
 
-// Dequeue claim SQL comes in three static forms so the planner can pick the
-// right index for each instead of compromising on one plan for an
+// Claim SQL. The single-row and batch claims share one eligibility predicate,
+// one ordering, and one RETURNING list; they differ only in how many rows the
+// SKIP LOCKED walk takes and in how the execution token is formed.
+//
+// Each comes in three static forms so the planner can pick the right index
+// for each instead of compromising on one plan for an
 // `($x IS NULL OR activity_type = ANY($x))` OR-pattern:
 //
 //   - no type filter  → idx_runnerq_dequeue_order (key order == ORDER BY)
@@ -422,8 +515,8 @@ func (b *PostgresBackend) enqueueInTx(ctx context.Context, tx pgx.Tx, a *storage
 //     remaining key order == ORDER BY)
 //   - multiple types  → idx_runnerq_dequeue_order with an in-scan type filter
 //
-// In all three cases the claim is an ordered index walk that stops at the
-// first unlocked qualifying row — never a sort over the whole backlog.
+// In all forms the claim is an ordered index walk that stops after the first
+// unlocked qualifying row(s) — never a sort over the whole backlog.
 //
 // Lease arithmetic uses the DATABASE clock (NOW()), never the caller's: the
 // deadline set here is compared against NOW() in RequeueExpired, so with app
@@ -443,46 +536,103 @@ const (
 	// forcing a top-1 sort over the whole eligible backlog on every claim
 	// (verified with EXPLAIN ANALYZE on a 200k-row backlog: external merge
 	// sort vs a 0.2ms index walk).
+	claimEligibleSQL = `
+			WHERE queue_name = $3
+			  AND status IN ('pending', 'scheduled', 'retrying', 'waiting')
+			  AND (status = 'pending' OR scheduled_at <= NOW())`
+	claimOrderSQL = `
+			ORDER BY
+				priority DESC,
+				retry_count DESC,
+				COALESCE(scheduled_at, created_at) ASC`
+	claimLeaseSQL = `(EXTRACT(EPOCH FROM NOW()) * 1000)::bigint + GREATEST($2::bigint, (timeout_seconds + 10) * 1000)`
+	// claimColumnsSQL is the RETURNING list of every claim statement, in the
+	// order scanClaim reads it.
+	claimColumnsSQL = `id, activity_type, payload, priority, retry_count, max_retries,
+			timeout_seconds, retry_delay_seconds, max_retry_delay_seconds,
+			scheduled_at, metadata, idempotency_key, created_at,
+			parent_activity_id, root_activity_id, depth, current_worker_id, lease_deadline_ms`
+
+	// Single claim: $1 worker token, $2 default lease ms, $3 queue, $4 type filter.
 	dequeueSQLHead = `
 		UPDATE runnerq_activities
 		SET status = 'processing',
 			current_worker_id = $1,
 			started_at = NOW(),
-			lease_deadline_ms = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint + GREATEST($2::bigint, (timeout_seconds + 10) * 1000)
+			lease_deadline_ms = ` + claimLeaseSQL + `
 		WHERE id = (
-			SELECT id FROM runnerq_activities
-			WHERE queue_name = $3
-			  AND status IN ('pending', 'scheduled', 'retrying', 'waiting')
-			  AND (status = 'pending' OR scheduled_at <= NOW())`
-	dequeueSQLTail = `
-			ORDER BY
-				priority DESC,
-				retry_count DESC,
-				COALESCE(scheduled_at, created_at) ASC
+			SELECT id FROM runnerq_activities` + claimEligibleSQL
+	dequeueSQLTail = claimOrderSQL + `
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id, activity_type, payload, priority, retry_count, max_retries,
-			timeout_seconds, retry_delay_seconds, max_retry_delay_seconds,
-			scheduled_at, metadata, idempotency_key, created_at,
-			parent_activity_id, root_activity_id, depth, lease_deadline_ms`
+		RETURNING ` + claimColumnsSQL
 
 	dequeueSQLAllTypes  = dequeueSQLHead + dequeueSQLTail
 	dequeueSQLOneType   = dequeueSQLHead + ` AND activity_type = $4` + dequeueSQLTail
 	dequeueSQLManyTypes = dequeueSQLHead + ` AND activity_type = ANY($4)` + dequeueSQLTail
+
+	// Batch claim: $1 token prefix, $2 default lease ms, $3 queue, $4 limit,
+	// $5 type filter. The same ordered SKIP LOCKED walk takes the first $4
+	// unlocked rows and a single UPDATE claims them all. Each row's token is
+	// the caller's prefix plus its own id, so the rows of one batch are fenced
+	// independently of each other and of every other claim. The subquery
+	// aliases its id so the unqualified column references in SET and
+	// RETURNING stay unambiguous.
+	dequeueBatchSQLHead = `
+		UPDATE runnerq_activities AS a
+		SET status = 'processing',
+			current_worker_id = $1 || ':' || a.id::text,
+			started_at = NOW(),
+			lease_deadline_ms = ` + claimLeaseSQL + `
+		FROM (
+			SELECT id AS claim_id FROM runnerq_activities` + claimEligibleSQL
+	dequeueBatchSQLTail = claimOrderSQL + `
+			LIMIT $4
+			FOR UPDATE SKIP LOCKED
+		) AS c
+		WHERE a.id = c.claim_id
+		RETURNING ` + claimColumnsSQL
+
+	dequeueBatchSQLAllTypes  = dequeueBatchSQLHead + dequeueBatchSQLTail
+	dequeueBatchSQLOneType   = dequeueBatchSQLHead + ` AND activity_type = $5` + dequeueBatchSQLTail
+	dequeueBatchSQLManyTypes = dequeueBatchSQLHead + ` AND activity_type = ANY($5)` + dequeueBatchSQLTail
 )
 
-// Dequeue claims the next runnable activity. When the queue is empty and
-// maxBlock > 0, it parks until new work is signalled (LISTEN/NOTIFY via the
-// shared watcher), re-probing every workWaitProbe as a fallback for lost
-// signals and for scheduled/retrying rows coming due, up to maxBlock. Returns
-// (nil, nil) when nothing became claimable in time.
-func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, maxBlock time.Duration, activityTypes []string) (*storage.QueuedActivity, error) {
+// scanClaim reads one claimColumnsSQL row.
+func scanClaim(row pgx.Row) (storage.DequeuedActivity, error) {
+	var ar activityRow
+	var leaseID string
+	var leaseDeadlineMS int64
+	if err := row.Scan(
+		&ar.id, &ar.activityType, &ar.payload, &ar.priority,
+		&ar.retryCount, &ar.maxRetries, &ar.timeoutSeconds,
+		&ar.retryDelaySeconds, &ar.maxRetryDelaySeconds,
+		&ar.scheduledAt, &ar.metadata,
+		&ar.idempotencyKey, &ar.createdAt,
+		&ar.parentActivityID, &ar.rootActivityID, &ar.depth,
+		&leaseID, &leaseDeadlineMS); err != nil {
+		return storage.DequeuedActivity{}, err
+	}
+	return storage.DequeuedActivity{
+		Activity:      *ar.toQueuedActivity(),
+		LeaseID:       leaseID,
+		Attempt:       uint32(ar.retryCount) + 1,
+		LeaseDeadline: time.UnixMilli(leaseDeadlineMS).UTC(),
+	}, nil
+}
+
+// waitForClaim runs probe once and, while it claims nothing and maxBlock is
+// still open, parks on the shared work signal (LISTEN/NOTIFY via the watcher)
+// and re-probes — at least every workWaitProbe as a fallback for lost signals
+// and for scheduled/retrying rows coming due. It returns as soon as probe
+// claims something or fails, and with a nil error when the window expires.
+func (b *PostgresBackend) waitForClaim(ctx context.Context, maxBlock time.Duration, probe func() (claimed bool, err error)) error {
 	deadline := time.Now().Add(maxBlock)
 
-	a, err := b.dequeueOnce(ctx, workerID, activityTypes)
-	if a != nil || err != nil || maxBlock <= 0 {
-		return a, err
+	claimed, err := probe()
+	if claimed || err != nil || maxBlock <= 0 {
+		return err
 	}
 
 	w := b.getWatcher()
@@ -492,66 +642,72 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, maxBlock
 	for {
 		// Re-probe after registering so a signal emitted between the previous
 		// probe and registration can't be missed.
-		a, err := b.dequeueOnce(ctx, workerID, activityTypes)
-		if a != nil || err != nil {
-			return a, err
+		if claimed, err := probe(); claimed || err != nil {
+			return err
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return nil, nil
+			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		case <-ch:
 		case <-time.After(min(remaining, workWaitProbe)):
 		}
 	}
 }
 
+// Dequeue claims the next runnable activity. When the queue is empty and
+// maxBlock > 0, it parks until new work is signalled, re-probing up to
+// maxBlock (see waitForClaim). Returns (nil, nil) when nothing became
+// claimable in time.
+func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, maxBlock time.Duration, activityTypes []string) (*storage.QueuedActivity, error) {
+	var claimed *storage.QueuedActivity
+	err := b.waitForClaim(ctx, maxBlock, func() (bool, error) {
+		var err error
+		claimed, err = b.dequeueOnce(ctx, workerID, activityTypes)
+		return claimed != nil, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return claimed, nil
+}
+
 func (b *PostgresBackend) dequeueOnce(ctx context.Context, workerID string, activityTypes []string) (*storage.QueuedActivity, error) {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to begin transaction: %v", err))
 	}
 	defer tx.Rollback(ctx)
 
 	var row pgx.Row
 	switch len(activityTypes) {
 	case 0:
-		row = tx.QueryRow(ctx, dequeueSQLAllTypes, workerID, b.defaultLeaseMS, b.queueName)
+		row = tx.QueryRow(ctx, dequeueSQLAllTypes, workerID, b.defaultLeaseMS.Load(), b.queueName)
 	case 1:
-		row = tx.QueryRow(ctx, dequeueSQLOneType, workerID, b.defaultLeaseMS, b.queueName, activityTypes[0])
+		row = tx.QueryRow(ctx, dequeueSQLOneType, workerID, b.defaultLeaseMS.Load(), b.queueName, activityTypes[0])
 	default:
-		row = tx.QueryRow(ctx, dequeueSQLManyTypes, workerID, b.defaultLeaseMS, b.queueName, activityTypes)
+		row = tx.QueryRow(ctx, dequeueSQLManyTypes, workerID, b.defaultLeaseMS.Load(), b.queueName, activityTypes)
 	}
 
-	var ar activityRow
-	var leaseDeadlineMS int64
-	err = row.Scan(
-		&ar.id, &ar.activityType, &ar.payload, &ar.priority,
-		&ar.retryCount, &ar.maxRetries, &ar.timeoutSeconds,
-		&ar.retryDelaySeconds, &ar.maxRetryDelaySeconds,
-		&ar.scheduledAt, &ar.metadata,
-		&ar.idempotencyKey, &ar.createdAt,
-		&ar.parentActivityID, &ar.rootActivityID, &ar.depth,
-		&leaseDeadlineMS)
+	claim, err := scanClaim(row)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to dequeue: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to dequeue: %v", err))
 	}
+	a := &claim.Activity
 
-	a := ar.toQueuedActivity()
-
-	detail := toDetail(map[string]any{"lease_deadline_ms": leaseDeadlineMS})
+	detail := toDetail(map[string]any{"lease_deadline_ms": claim.LeaseDeadline.UnixMilli()})
 	if err := b.recordEvent(ctx, tx, a.ID, storage.EventDequeued, &workerID, detail); err != nil {
 		return nil, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to commit dequeue: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to commit dequeue: %v", err))
 	}
 
 	b.signalEvent()
@@ -564,12 +720,75 @@ func (b *PostgresBackend) dequeueOnce(ctx context.Context, workerID string, acti
 	return a, nil
 }
 
+// DequeueBatch implements storage.BatchQueueStorage: up to limit runnable
+// activities claimed by one UPDATE, each with the token
+// "<workerIDPrefix>:<activity id>". Blocking follows Dequeue exactly (see
+// waitForClaim). Returns (nil, nil) when nothing became claimable in time.
+func (b *PostgresBackend) DequeueBatch(ctx context.Context, workerIDPrefix string, limit int, maxBlock time.Duration, activityTypes []string) ([]storage.DequeuedActivity, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	var claims []storage.DequeuedActivity
+	err := b.waitForClaim(ctx, maxBlock, func() (bool, error) {
+		var err error
+		claims, err = b.dequeueBatchOnce(ctx, workerIDPrefix, limit, activityTypes)
+		return len(claims) > 0, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return claims, nil
+}
+
+func (b *PostgresBackend) dequeueBatchOnce(ctx context.Context, workerIDPrefix string, limit int, activityTypes []string) ([]storage.DequeuedActivity, error) {
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return nil, databaseError(err, fmt.Sprintf("Failed to begin batch dequeue transaction: %v", err))
+	}
+	defer tx.Rollback(ctx)
+
+	var rows pgx.Rows
+	switch len(activityTypes) {
+	case 0:
+		rows, err = tx.Query(ctx, dequeueBatchSQLAllTypes, workerIDPrefix, b.defaultLeaseMS.Load(), b.queueName, limit)
+	case 1:
+		rows, err = tx.Query(ctx, dequeueBatchSQLOneType, workerIDPrefix, b.defaultLeaseMS.Load(), b.queueName, limit, activityTypes[0])
+	default:
+		rows, err = tx.Query(ctx, dequeueBatchSQLManyTypes, workerIDPrefix, b.defaultLeaseMS.Load(), b.queueName, limit, activityTypes)
+	}
+	if err != nil {
+		return nil, databaseError(err, fmt.Sprintf("Failed to batch dequeue: %v", err))
+	}
+	claims, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (storage.DequeuedActivity, error) {
+		return scanClaim(row)
+	})
+	if err != nil {
+		return nil, databaseError(err, fmt.Sprintf("Failed to read batch dequeue rows: %v", err))
+	}
+	if len(claims) == 0 {
+		return nil, nil
+	}
+
+	if err := b.recordDequeueEvents(ctx, tx, claims); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, databaseError(err, fmt.Sprintf("Failed to commit batch dequeue: %v", err))
+	}
+
+	b.signalEvent()
+
+	slog.Debug("Activities claimed", "count", len(claims), "limit", limit)
+
+	return claims, nil
+}
+
 func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, result json.RawMessage, workerID string) error {
 	now := time.Now().UTC()
 
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to begin transaction: %v", err))
 	}
 	defer tx.Rollback(ctx)
 
@@ -589,9 +808,29 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 		now, workerID, activityID, b.queueName).Scan(&actType, &parentID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return storage.NewNotFoundError(fmt.Sprintf("Activity %s is not in a claimable state for ack_success", activityID))
+			// The previous transaction may have committed but lost its reply.
+			var same bool
+			readErr := tx.QueryRow(ctx, `SELECT EXISTS (
+                SELECT 1 FROM runnerq_activities a JOIN runnerq_results r ON r.activity_id = a.id
+                WHERE a.id = $1 AND a.queue_name = $2 AND a.status = 'completed'
+                  AND a.last_worker_id = $3 AND r.queue_name = $2 AND r.state = 'Ok'
+                  AND r.data IS NOT DISTINCT FROM $4::jsonb)`, activityID, b.queueName, workerID, result).Scan(&same)
+			if readErr != nil {
+				return databaseError(readErr, "failed to reconcile completion")
+			}
+			if same {
+				return nil
+			}
+			var ownCompletion bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM runnerq_activities WHERE id=$1 AND queue_name=$2 AND status='completed' AND last_worker_id=$3)`, activityID, b.queueName, workerID).Scan(&ownCompletion); err != nil {
+				return databaseError(err, "failed to classify completion conflict")
+			}
+			if ownCompletion {
+				return &storage.StorageError{Kind: storage.ErrCheckpointConflict, Message: "execution already completed with a different result"}
+			}
+			return claimLost(activityID)
 		}
-		return storage.NewInternalError(fmt.Sprintf("Failed to ack success: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to ack success: %v", err))
 	}
 
 	// Always persist a result row, even when result is nil: awaiting parents
@@ -614,20 +853,18 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 		return err
 	}
 
-	wokeParent, err := b.wakeWaitingParentTx(ctx, tx, parentID)
+	_, err = b.wakeWaitingParentTx(ctx, tx, parentID)
 	if err != nil {
 		return err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to commit ack: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to commit ack: %v", err))
 	}
 
 	b.signalEvent()
 	b.signalResult(activityID)
-	if wokeParent {
-		b.signalWork()
-	}
+	b.signalWork()
 	return nil
 }
 
@@ -647,7 +884,7 @@ func (b *PostgresBackend) wakeWaitingParentTx(ctx context.Context, tx pgx.Tx, pa
 		WHERE id = $1 AND queue_name = $2 AND status = 'waiting'`,
 		*parentID, b.queueName)
 	if err != nil {
-		return false, storage.NewInternalError(fmt.Sprintf("Failed to wake waiting parent: %v", err))
+		return false, databaseError(err, fmt.Sprintf("Failed to wake waiting parent: %v", err))
 	}
 	return tag.RowsAffected() > 0, nil
 }
@@ -657,7 +894,7 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
-		return false, storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+		return false, databaseError(err, fmt.Sprintf("Failed to begin transaction: %v", err))
 	}
 	defer tx.Rollback(ctx)
 
@@ -673,9 +910,20 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		&ar.id, &ar.retryCount, &ar.maxRetries, &ar.retryDelaySeconds, &ar.maxRetryDelaySeconds, &parentID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return false, storage.NewNotFoundError(fmt.Sprintf("Activity %s not found or not claimed by this worker", activityID))
+			var event string
+			readErr := tx.QueryRow(ctx, `SELECT event_type FROM runnerq_events
+                WHERE queue_name=$1 AND activity_id=$2 AND worker_id=$3 AND detail->>'error'=$4
+                  AND ((NOT $5 AND event_type='Failed') OR ($5 AND event_type IN ('Retrying','DeadLetter')))
+                ORDER BY id DESC LIMIT 1`, b.queueName, activityID, workerID, failure.Reason, failure.Retryable).Scan(&event)
+			if readErr == nil {
+				return event == storage.EventDeadLetter, nil
+			}
+			if readErr != pgx.ErrNoRows {
+				return false, databaseError(readErr, "failed to reconcile failure acknowledgement")
+			}
+			return false, claimLost(activityID)
 		}
-		return false, storage.NewInternalError(fmt.Sprintf("Failed to lock activity: %v", err))
+		return false, databaseError(err, fmt.Sprintf("Failed to lock activity: %v", err))
 	}
 
 	errorMessage := failure.Reason
@@ -694,7 +942,7 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 			WHERE id = $5 AND queue_name = $6 AND status = 'processing' AND current_worker_id = $4`,
 			now, errorMessage, now, workerID, activityID, b.queueName)
 		if err != nil {
-			return false, storage.NewInternalError(fmt.Sprintf("Failed to mark as failed: %v", err))
+			return false, databaseError(err, fmt.Sprintf("Failed to mark as failed: %v", err))
 		}
 
 		res := &storage.ActivityResult{Data: toDetail(map[string]any{
@@ -710,19 +958,17 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 			return false, err
 		}
 
-		wokeParent, err := b.wakeWaitingParentTx(ctx, tx, parentID)
+		_, err = b.wakeWaitingParentTx(ctx, tx, parentID)
 		if err != nil {
 			return false, err
 		}
 
 		if err := tx.Commit(ctx); err != nil {
-			return false, storage.NewInternalError(fmt.Sprintf("Failed to commit ack_failure: %v", err))
+			return false, databaseError(err, fmt.Sprintf("Failed to commit ack_failure: %v", err))
 		}
 		b.signalEvent()
 		b.signalResult(activityID)
-		if wokeParent {
-			b.signalWork()
-		}
+		b.signalWork()
 		return false, nil
 	}
 
@@ -774,7 +1020,7 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 			WHERE id = $5 AND queue_name = $6 AND status = 'processing' AND current_worker_id = $4`,
 			retryDelay, errorMessage, now, workerID, activityID, b.queueName)
 		if err != nil {
-			return false, storage.NewInternalError(fmt.Sprintf("Failed to schedule retry: %v", err))
+			return false, databaseError(err, fmt.Sprintf("Failed to schedule retry: %v", err))
 		}
 
 		if err := b.recordEvent(ctx, tx, activityID, storage.EventRetrying, &workerID,
@@ -787,7 +1033,7 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		}
 
 		if err := tx.Commit(ctx); err != nil {
-			return false, storage.NewInternalError(fmt.Sprintf("Failed to commit ack_failure retry: %v", err))
+			return false, databaseError(err, fmt.Sprintf("Failed to commit ack_failure retry: %v", err))
 		}
 		b.signalEvent()
 		if retryDelay == 0 {
@@ -811,7 +1057,7 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		WHERE id = $5 AND queue_name = $6 AND status = 'processing' AND current_worker_id = $4`,
 		now, errorMessage, now, workerID, activityID, b.queueName)
 	if err != nil {
-		return false, storage.NewInternalError(fmt.Sprintf("Failed to move to DLQ: %v", err))
+		return false, databaseError(err, fmt.Sprintf("Failed to move to DLQ: %v", err))
 	}
 
 	res := &storage.ActivityResult{Data: toDetail(map[string]any{
@@ -827,20 +1073,18 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		return false, err
 	}
 
-	wokeParent, err := b.wakeWaitingParentTx(ctx, tx, parentID)
+	_, err = b.wakeWaitingParentTx(ctx, tx, parentID)
 	if err != nil {
 		return false, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return false, storage.NewInternalError(fmt.Sprintf("Failed to commit ack_failure DLQ: %v", err))
+		return false, databaseError(err, fmt.Sprintf("Failed to commit ack_failure DLQ: %v", err))
 	}
 
 	b.signalEvent()
 	b.signalResult(activityID)
-	if wokeParent {
-		b.signalWork()
-	}
+	b.signalWork()
 	return true, nil
 }
 
@@ -858,7 +1102,7 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
-		return 0, storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+		return 0, databaseError(err, fmt.Sprintf("Failed to begin transaction: %v", err))
 	}
 	defer tx.Rollback(ctx)
 
@@ -896,7 +1140,7 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 		RETURNING id, status, retry_count, parent_activity_id`,
 		b.queueName, batchSize, now, leaseExpiredError)
 	if err != nil {
-		return 0, storage.NewInternalError(fmt.Sprintf("Failed to requeue expired: %v", err))
+		return 0, databaseError(err, fmt.Sprintf("Failed to requeue expired: %v", err))
 	}
 
 	type reapedRow struct {
@@ -911,14 +1155,14 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 		var status string
 		if err := rows.Scan(&r.id, &status, &r.retryCount, &r.parentID); err != nil {
 			rows.Close()
-			return 0, storage.NewInternalError(fmt.Sprintf("Failed to scan requeued row: %v", err))
+			return 0, databaseError(err, fmt.Sprintf("Failed to scan requeued row: %v", err))
 		}
 		r.deadLetter = status == "dead_letter"
 		reaped = append(reaped, r)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return 0, storage.NewInternalError(fmt.Sprintf("Failed to read requeued rows: %v", err))
+		return 0, databaseError(err, fmt.Sprintf("Failed to read requeued rows: %v", err))
 	}
 	if len(reaped) == 0 {
 		return 0, nil
@@ -956,7 +1200,7 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return 0, storage.NewInternalError(fmt.Sprintf("Failed to commit requeue expired: %v", err))
+		return 0, databaseError(err, fmt.Sprintf("Failed to commit requeue expired: %v", err))
 	}
 
 	b.signalEvent()
@@ -978,7 +1222,7 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 func (b *PostgresBackend) Yield(ctx context.Context, activityID uuid.UUID, wakeAt time.Time, workerID, kind, step string) error {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to begin transaction: %v", err))
 	}
 	defer tx.Rollback(ctx)
 
@@ -995,10 +1239,17 @@ func (b *PostgresBackend) Yield(ctx context.Context, activityID uuid.UUID, wakeA
 		  AND current_worker_id = $2`,
 		wakeAt, workerID, activityID, b.queueName)
 	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to yield activity: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to yield activity: %v", err))
 	}
 	if tag.RowsAffected() == 0 {
-		return storage.NewNotFoundError(fmt.Sprintf("Activity %s is not in a claimable state for yield", activityID))
+		var recorded bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM runnerq_events WHERE queue_name=$1 AND activity_id=$2 AND worker_id=$3 AND event_type='Yielded' AND COALESCE(detail->>'kind','')=$4 AND COALESCE(detail->>'step','')=$5 AND detail->>'wake_at'=$6)`, b.queueName, activityID, workerID, kind, step, wakeAt.Format(time.RFC3339)).Scan(&recorded); err != nil {
+			return databaseError(err, "failed to reconcile park")
+		}
+		if recorded {
+			return nil
+		}
+		return claimLost(activityID)
 	}
 
 	// kind/step describe the wait (sleep/signal/await + the step or signal
@@ -1017,7 +1268,7 @@ func (b *PostgresBackend) Yield(ctx context.Context, activityID uuid.UUID, wakeA
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to commit yield: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to commit yield: %v", err))
 	}
 
 	b.signalEvent()
@@ -1039,21 +1290,24 @@ func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UU
 
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to begin transaction: %v", err))
 	}
 	defer tx.Rollback(ctx)
 
 	// Reject signals for activities that don't exist: their result rows
 	// could never be retention-collected (no tree to die with), so a typo'd
-	// ID would leak rows forever.
-	var exists bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM runnerq_activities WHERE id = $1 AND queue_name = $2)`,
-		activityID, b.queueName).Scan(&exists); err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to look up signal target: %v", err))
-	}
-	if !exists {
+	// ID would leak rows forever. The lookup doubles as the owner row lock
+	// storeResultTx requires: a target mid-park holds its row FOR UPDATE, so
+	// this waits for the park to commit and the wake below then sees it.
+	var found int
+	err = tx.QueryRow(ctx, `
+		SELECT 1 FROM runnerq_activities WHERE id = $1 AND queue_name = $2 FOR NO KEY UPDATE`,
+		activityID, b.queueName).Scan(&found)
+	if err == pgx.ErrNoRows {
 		return storage.NewNotFoundError(fmt.Sprintf("Activity %s not found for signal delivery", activityID))
+	}
+	if err != nil {
+		return databaseError(err, fmt.Sprintf("Failed to look up signal target: %v", err))
 	}
 
 	signalStep := ""
@@ -1076,7 +1330,7 @@ func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UU
 		WHERE id = $1 AND queue_name = $2 AND status = 'waiting'`,
 		activityID, b.queueName)
 	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to wake signaled activity: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to wake signaled activity: %v", err))
 	}
 	woke := tag.RowsAffected() > 0
 
@@ -1090,7 +1344,7 @@ func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UU
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to commit signal: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to commit signal: %v", err))
 	}
 
 	b.signalEvent()
@@ -1115,7 +1369,7 @@ func (b *PostgresBackend) WakeWaiting(ctx context.Context, activityID uuid.UUID)
 		WHERE id = $1 AND queue_name = $2 AND status = 'waiting'`,
 		activityID, b.queueName)
 	if err != nil {
-		return false, storage.NewInternalError(fmt.Sprintf("Failed to wake waiting activity: %v", err))
+		return false, databaseError(err, fmt.Sprintf("Failed to wake waiting activity: %v", err))
 	}
 	if tag.RowsAffected() == 0 {
 		return false, nil
@@ -1128,6 +1382,21 @@ func (b *PostgresBackend) WakeWaiting(ctx context.Context, activityID uuid.UUID)
 // that currently owns it. The (queue_name, idempotency_key) primary key makes
 // this a single-row point lookup; a miss returns a not-found error.
 func (b *PostgresBackend) LookupIdempotencyActivityID(ctx context.Context, idempotencyKey string) (uuid.UUID, error) {
+	if legacy, activityType, encoded := storage.LegacyBusinessIdempotencyKey(idempotencyKey); encoded {
+		var id uuid.UUID
+		err := b.pool.QueryRow(ctx, `SELECT i.activity_id FROM runnerq_idempotency i
+   JOIN runnerq_activities a ON a.id=i.activity_id AND a.queue_name=i.queue_name
+   WHERE i.queue_name=$1 AND i.idempotency_key IN ($2,$3) AND a.activity_type=$4
+   ORDER BY (i.idempotency_key=$2) DESC LIMIT 1`, b.queueName, idempotencyKey, legacy, activityType).Scan(&id)
+		if err == pgx.ErrNoRows {
+			return uuid.Nil, storage.NewNotFoundError("no activity owns this business key and type")
+		}
+		if err != nil {
+			return uuid.Nil, databaseError(err, "failed to look up business key")
+		}
+		return id, nil
+	}
+
 	var id uuid.UUID
 	err := b.pool.QueryRow(ctx, `
 		SELECT activity_id FROM runnerq_idempotency
@@ -1137,7 +1406,7 @@ func (b *PostgresBackend) LookupIdempotencyActivityID(ctx context.Context, idemp
 		if err == pgx.ErrNoRows {
 			return uuid.Nil, storage.NewNotFoundError(fmt.Sprintf("no activity owns idempotency key %q", idempotencyKey))
 		}
-		return uuid.Nil, storage.NewInternalError(fmt.Sprintf("Failed to look up idempotency key: %v", err))
+		return uuid.Nil, databaseError(err, fmt.Sprintf("Failed to look up idempotency key: %v", err))
 	}
 	return id, nil
 }
@@ -1170,26 +1439,38 @@ func (b *PostgresBackend) CleanupExpired(ctx context.Context, policy storage.Ret
 
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
-		return 0, storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+		return 0, databaseError(err, fmt.Sprintf("Failed to begin transaction: %v", err))
 	}
 	defer tx.Rollback(ctx)
 
 	var leader bool
 	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1::int4, hashtext($2))`,
 		cleanupLockClass, b.queueName).Scan(&leader); err != nil {
-		return 0, storage.NewInternalError(fmt.Sprintf("Failed to acquire cleanup lock: %v", err))
+		return 0, databaseError(err, fmt.Sprintf("Failed to acquire cleanup lock: %v", err))
 	}
 	if !leader {
 		return 0, nil
 	}
 
+	// Retention coordinates through one root row at a time. Dependency writers
+	// hold that same row with FOR KEY SHARE, so a registration either commits
+	// before this lock or observes the producer as gone after the delete. The
+	// savepoint releases a pinned root immediately; only successfully deleted
+	// roots remain locked until the bounded batch commits.
 	var deletedRoots int64
-	err = tx.QueryRow(ctx, `
-		WITH roots AS (
+	skippedRoots := make([]uuid.UUID, 0)
+	for deletedRoots < int64(batchSize) {
+		if _, err := tx.Exec(ctx, "SAVEPOINT cleanup_candidate"); err != nil {
+			return 0, databaseError(err, "failed to start cleanup candidate")
+		}
+
+		var rootID uuid.UUID
+		err := tx.QueryRow(ctx, `
 			SELECT r.id
 			FROM runnerq_activities r
 			WHERE r.queue_name = $1
 			  AND r.parent_activity_id IS NULL
+			  AND r.id <> ALL($4::uuid[])
 			  AND (
 				(r.status = 'completed' AND $2::bigint > 0
 					AND r.completed_at < NOW() - make_interval(secs => $2))
@@ -1203,62 +1484,123 @@ func (b *PostgresBackend) CleanupExpired(ctx context.Context, policy storage.Ret
 				  AND c.status NOT IN ('completed', 'failed', 'dead_letter')
 			  )
 			ORDER BY r.completed_at ASC
-			LIMIT $4
-			FOR UPDATE SKIP LOCKED
-		),
-		tree AS (
-			-- Roots are included by their own id as well as by lineage:
-			-- legacy rows from before lineage columns existed can have a
-			-- NULL root_activity_id, and matching only on lineage would
-			-- count such a root as swept without deleting it — the sweeper
-			-- would then re-select it on every pass, forever.
-			SELECT a.id FROM runnerq_activities a
-			WHERE a.queue_name = $1
-			  AND (a.id IN (SELECT id FROM roots)
-				OR a.root_activity_id IN (SELECT id FROM roots))
-		),
-		del_results AS (
-			DELETE FROM runnerq_results
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED`,
+			b.queueName,
+			int64(policy.Completed/time.Second),
+			int64(policy.Failed/time.Second),
+			skippedRoots).Scan(&rootID)
+		if err == pgx.ErrNoRows {
+			if _, releaseErr := tx.Exec(ctx, "RELEASE SAVEPOINT cleanup_candidate"); releaseErr != nil {
+				return 0, databaseError(releaseErr, "failed to release empty cleanup candidate")
+			}
+			break
+		}
+		if err != nil {
+			return 0, databaseError(err, "failed to select expired workflow root")
+		}
+
+		// Key reuse (BehaviorReturnExisting) registers a dependency on an
+		// existing child while holding that child's idempotency row FOR
+		// UPDATE, and never takes the root. The key rows this delete removes
+		// are therefore the ordering point with it: take them before the
+		// dependency check so a reuse in flight either commits first, and its
+		// dependency pins the tree below, or waits until this delete commits
+		// and then finds the key gone and claims it fresh. Ordering is
+		// root → keys here and key only there, so no cycle is possible.
+		if _, err := tx.Exec(ctx, `
+			SELECT 1 FROM runnerq_idempotency
 			WHERE queue_name = $1
-			  AND (activity_id IN (SELECT id FROM tree)
-				OR owner_activity_id IN (SELECT id FROM tree))
-			RETURNING activity_id
-		),
-		del_events AS (
-			DELETE FROM runnerq_events
-			WHERE queue_name = $1
-			  AND (activity_id IN (SELECT id FROM tree)
-				OR activity_id IN (SELECT activity_id FROM del_results))
-		),
-		del_idem AS (
-			DELETE FROM runnerq_idempotency
-			WHERE queue_name = $1
-			  AND activity_id IN (SELECT id FROM tree)
-		),
-		del_act AS (
-			DELETE FROM runnerq_activities
-			WHERE queue_name = $1
-			  AND id IN (SELECT id FROM tree)
-		)
-		SELECT count(*) FROM roots`,
-		b.queueName,
-		int64(policy.Completed/time.Second),
-		int64(policy.Failed/time.Second),
-		batchSize).Scan(&deletedRoots)
-	if err != nil {
-		return 0, storage.NewInternalError(fmt.Sprintf("Failed to clean up expired trees: %v", err))
+			  AND activity_id IN (
+				SELECT id FROM runnerq_activities
+				WHERE queue_name = $1 AND (id = $2 OR root_activity_id = $2))
+			FOR UPDATE`, b.queueName, rootID); err != nil {
+			return 0, databaseError(err, "failed to lock expired tree idempotency keys")
+		}
+
+		var pinned bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM runnerq_dependencies d
+				JOIN runnerq_activities producer ON producer.id = d.producer_activity_id AND producer.queue_name = $1
+				JOIN runnerq_activities waiter ON waiter.id = d.waiter_activity_id AND waiter.queue_name = $1
+				WHERE d.queue_name = $1
+				  AND COALESCE(producer.root_activity_id, producer.id) = $2
+				  AND COALESCE(waiter.root_activity_id, waiter.id) <> $2
+				  AND EXISTS (
+					SELECT 1 FROM runnerq_activities live
+					WHERE live.queue_name = $1
+					  AND COALESCE(live.root_activity_id, live.id) = COALESCE(waiter.root_activity_id, waiter.id)
+					  AND live.status NOT IN ('completed', 'failed', 'dead_letter'))
+			)`, b.queueName, rootID).Scan(&pinned); err != nil {
+			return 0, databaseError(err, "failed to recheck workflow retention dependency")
+		}
+		if pinned {
+			skippedRoots = append(skippedRoots, rootID)
+			if _, err := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT cleanup_candidate"); err != nil {
+				return 0, databaseError(err, "failed to release pinned cleanup candidate")
+			}
+			if _, err := tx.Exec(ctx, "RELEASE SAVEPOINT cleanup_candidate"); err != nil {
+				return 0, databaseError(err, "failed to finish pinned cleanup candidate")
+			}
+			continue
+		}
+
+		var deleted int64
+		err = tx.QueryRow(ctx, `
+			WITH tree AS (
+				SELECT a.id FROM runnerq_activities a
+				WHERE a.queue_name = $1
+				  AND (a.id = $2 OR a.root_activity_id = $2)
+			),
+			del_dependencies AS (
+				DELETE FROM runnerq_dependencies WHERE queue_name = $1
+				  AND (waiter_activity_id IN (SELECT id FROM tree) OR producer_activity_id IN (SELECT id FROM tree))
+			),
+			del_results AS (
+				DELETE FROM runnerq_results
+				WHERE queue_name = $1
+				  AND (activity_id IN (SELECT id FROM tree) OR owner_activity_id IN (SELECT id FROM tree))
+				RETURNING activity_id
+			),
+			del_events AS (
+				DELETE FROM runnerq_events
+				WHERE queue_name = $1
+				  AND (activity_id IN (SELECT id FROM tree) OR activity_id IN (SELECT activity_id FROM del_results))
+			),
+			del_idem AS (
+				DELETE FROM runnerq_idempotency WHERE queue_name = $1 AND activity_id IN (SELECT id FROM tree)
+			),
+			del_act AS (
+				DELETE FROM runnerq_activities WHERE queue_name = $1 AND id IN (SELECT id FROM tree)
+				RETURNING id
+			)
+			SELECT count(*) FROM del_act`, b.queueName, rootID).Scan(&deleted)
+		if err != nil {
+			return 0, databaseError(err, "failed to clean up expired workflow tree")
+		}
+		if _, err := tx.Exec(ctx, "RELEASE SAVEPOINT cleanup_candidate"); err != nil {
+			return 0, databaseError(err, "failed to finish cleanup candidate")
+		}
+		if deleted > 0 {
+			deletedRoots++
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return 0, storage.NewInternalError(fmt.Sprintf("Failed to commit cleanup: %v", err))
+		return 0, databaseError(err, fmt.Sprintf("Failed to commit cleanup: %v", err))
 	}
 	return uint64(deletedRoots), nil
 }
 
 func (b *PostgresBackend) ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error) {
+	if extendBy <= 0 {
+		return false, storage.NewConfigurationError("lease extension must be positive")
+	}
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
-		return false, storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+		return false, databaseError(err, fmt.Sprintf("Failed to begin transaction: %v", err))
 	}
 	defer tx.Rollback(ctx)
 
@@ -1267,7 +1609,7 @@ func (b *PostgresBackend) ExtendLease(ctx context.Context, activityID uuid.UUID,
 	var newDeadlineMS int64
 	err = tx.QueryRow(ctx, `
 		UPDATE runnerq_activities
-		SET lease_deadline_ms = (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint + $1
+		SET lease_deadline_ms = GREATEST(lease_deadline_ms, (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint + $1)
 		WHERE id = $2 AND queue_name = $3 AND status = 'processing'
 		RETURNING lease_deadline_ms`,
 		extendBy.Milliseconds(), activityID, b.queueName).Scan(&newDeadlineMS)
@@ -1275,7 +1617,7 @@ func (b *PostgresBackend) ExtendLease(ctx context.Context, activityID uuid.UUID,
 		if err == pgx.ErrNoRows {
 			return false, nil
 		}
-		return false, storage.NewInternalError(fmt.Sprintf("Failed to extend lease: %v", err))
+		return false, databaseError(err, fmt.Sprintf("Failed to extend lease: %v", err))
 	}
 
 	if err := b.recordEvent(ctx, tx, activityID, storage.EventLeaseExtended, nil,
@@ -1286,7 +1628,7 @@ func (b *PostgresBackend) ExtendLease(ctx context.Context, activityID uuid.UUID,
 		return false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return false, storage.NewInternalError(fmt.Sprintf("Failed to commit extend_lease: %v", err))
+		return false, databaseError(err, fmt.Sprintf("Failed to commit extend_lease: %v", err))
 	}
 	b.signalEvent()
 	return true, nil
@@ -1295,7 +1637,7 @@ func (b *PostgresBackend) ExtendLease(ctx context.Context, activityID uuid.UUID,
 func (b *PostgresBackend) RecordSpawnLinked(ctx context.Context, childID, parentID uuid.UUID) error {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to begin transaction: %v", err))
 	}
 	defer tx.Rollback(ctx)
 
@@ -1305,7 +1647,7 @@ func (b *PostgresBackend) RecordSpawnLinked(ctx context.Context, childID, parent
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to commit spawn_linked: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to commit spawn_linked: %v", err))
 	}
 	b.signalEvent()
 	return nil
@@ -1326,10 +1668,20 @@ func (b *PostgresBackend) StoreResult(ctx context.Context, activityID uuid.UUID,
 	now := time.Now().UTC()
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to begin transaction: %v", err))
 	}
 	defer tx.Rollback(ctx)
 
+	// This path has no claim UPDATE of its own, so take the owner row lock
+	// storeResultTx relies on explicitly. A missing owner (legacy rows with no
+	// tree) has nothing parked on it that could be missed.
+	var found int
+	err = tx.QueryRow(ctx, `
+		SELECT 1 FROM runnerq_activities WHERE id = $1 AND queue_name = $2 FOR NO KEY UPDATE`,
+		ownerActivityID, b.queueName).Scan(&found)
+	if err != nil && err != pgx.ErrNoRows {
+		return databaseError(err, fmt.Sprintf("Failed to lock result owner: %v", err))
+	}
 	if err := b.storeResultTx(ctx, tx, activityID, ownerActivityID, &result, now, step); err != nil {
 		return err
 	}
@@ -1339,11 +1691,12 @@ func (b *PostgresBackend) StoreResult(ctx context.Context, activityID uuid.UUID,
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to commit store_result: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to commit store_result: %v", err))
 	}
 
 	b.signalEvent()
 	b.signalResult(activityID)
+	b.signalWork()
 
 	slog.Debug("Activity result stored", "activity_id", activityID)
 	return nil
@@ -1353,12 +1706,12 @@ func (b *PostgresBackend) GetResult(ctx context.Context, activityID uuid.UUID) (
 	var stateStr string
 	var data json.RawMessage
 
-	err := b.pool.QueryRow(ctx, `SELECT state, data FROM runnerq_results WHERE activity_id = $1`, activityID).Scan(&stateStr, &data)
+	err := b.pool.QueryRow(ctx, `SELECT state, data FROM runnerq_results WHERE activity_id = $1 AND queue_name = $2`, activityID, b.queueName).Scan(&stateStr, &data)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, nil
 		}
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to get result: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to get result: %v", err))
 	}
 
 	state := storage.ResultOk
@@ -1399,9 +1752,20 @@ func (b *PostgresBackend) EnqueueIdempotent(ctx context.Context, a *storage.Queu
 func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.QueuedActivity, key string, behavior storage.IdempotencyBehavior) (*storage.IdempotencyResult, bool, error) {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
-		return nil, false, storage.NewInternalError(fmt.Sprintf("Failed to begin transaction: %v", err))
+		return nil, false, databaseError(err, fmt.Sprintf("Failed to begin transaction: %v", err))
 	}
 	defer tx.Rollback(ctx)
+
+	resolvedKey, err := b.resolveBusinessKeyTx(ctx, tx, key, a.ActivityType)
+	if err != nil {
+		return nil, false, err
+	}
+	key = resolvedKey
+	copied := *a
+	copiedKey := *a.IdempotencyKey
+	copiedKey.Key = key
+	copied.IdempotencyKey = &copiedKey
+	a = &copied
 
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO runnerq_idempotency (queue_name, idempotency_key, activity_id, created_at, updated_at)
@@ -1409,7 +1773,7 @@ func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.Q
 		ON CONFLICT (queue_name, idempotency_key) DO NOTHING`,
 		b.queueName, key, a.ID)
 	if err != nil {
-		return nil, false, storage.NewInternalError(fmt.Sprintf("Failed to claim idempotency key: %v", err))
+		return nil, false, databaseError(err, fmt.Sprintf("Failed to claim idempotency key: %v", err))
 	}
 
 	if tag.RowsAffected() > 0 {
@@ -1418,7 +1782,7 @@ func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.Q
 			return nil, false, err
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return nil, false, storage.NewInternalError(fmt.Sprintf("Failed to commit idempotent enqueue: %v", err))
+			return nil, false, databaseError(err, fmt.Sprintf("Failed to commit idempotent enqueue: %v", err))
 		}
 		b.signalEnqueued(a)
 		return nil, true, nil
@@ -1441,7 +1805,7 @@ func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.Q
 		if err == pgx.ErrNoRows {
 			return nil, false, nil
 		}
-		return nil, false, storage.NewInternalError(fmt.Sprintf("Failed to get existing key: %v", err))
+		return nil, false, databaseError(err, fmt.Sprintf("Failed to get existing key: %v", err))
 	}
 
 	// Repoint the key at our new activity and enqueue it, atomically. Used by
@@ -1452,13 +1816,13 @@ func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.Q
 			SET activity_id = $1, updated_at = NOW()
 			WHERE queue_name = $2 AND idempotency_key = $3`,
 			a.ID, b.queueName, key); err != nil {
-			return nil, false, storage.NewInternalError(fmt.Sprintf("Failed to update key: %v", err))
+			return nil, false, databaseError(err, fmt.Sprintf("Failed to update key: %v", err))
 		}
 		if err := b.enqueueInTx(ctx, tx, a); err != nil {
 			return nil, false, err
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return nil, false, storage.NewInternalError(fmt.Sprintf("Failed to commit idempotent enqueue: %v", err))
+			return nil, false, databaseError(err, fmt.Sprintf("Failed to commit idempotent enqueue: %v", err))
 		}
 		b.signalEnqueued(a)
 		return nil, true, nil
@@ -1475,6 +1839,12 @@ func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.Q
 
 	switch behavior {
 	case storage.BehaviorReturnExisting:
+		if err := b.linkChildTx(ctx, tx, a.ParentActivityID, existingID); err != nil {
+			return nil, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, false, databaseError(err, "failed to commit reused dependency")
+		}
 		return &storage.IdempotencyResult{ExistingID: existingID, ExistingParentID: existingParentID}, true, nil
 
 	case storage.BehaviorAllowReuse:
@@ -1549,7 +1919,7 @@ func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error
 		&stats.Roots.DeadLetter,
 	)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to compute queue stats: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to compute queue stats: %v", err))
 	}
 
 	// Priority breakdown for pending activities — hits the dequeue partial index.
@@ -1559,7 +1929,7 @@ func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error
 		WHERE queue_name = $1 AND status = 'pending'
 		GROUP BY priority`, b.queueName)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to get priority stats: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to get priority stats: %v", err))
 	}
 	defer pRows.Close()
 
@@ -1567,7 +1937,7 @@ func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error
 		var priority int32
 		var count int64
 		if err := pRows.Scan(&priority, &count); err != nil {
-			return nil, storage.NewInternalError(fmt.Sprintf("Failed to scan priority stats: %v", err))
+			return nil, databaseError(err, fmt.Sprintf("Failed to scan priority stats: %v", err))
 		}
 		switch storage.ActivityPriority(priority) {
 		case storage.PriorityCritical:
@@ -1591,7 +1961,7 @@ func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error
 		WHERE queue_name = $1
 		  AND last_seen_at > NOW() - make_interval(secs => $2)`,
 		b.queueName, int(workerPoolLivenessWindow.Seconds())).Scan(&totalMax); err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to compute cluster worker capacity: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to compute cluster worker capacity: %v", err))
 	}
 	if totalMax > 0 {
 		stats.MaxWorkers = &totalMax
@@ -1619,7 +1989,7 @@ func (b *PostgresBackend) listByStatus(ctx context.Context, status string, offse
 		LIMIT $3 OFFSET $4`,
 		b.queueName, status, limit, offset)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list %s: %v", status, err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to list %s: %v", status, err))
 	}
 	defer rows.Close()
 
@@ -1648,7 +2018,7 @@ func (b *PostgresBackend) ListScheduled(ctx context.Context, offset, limit int) 
 		LIMIT $2 OFFSET $3`,
 		b.queueName, limit, offset)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list scheduled: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to list scheduled: %v", err))
 	}
 	defer rows.Close()
 
@@ -1674,7 +2044,7 @@ func (b *PostgresBackend) ListCompletedNonCron(ctx context.Context, offset, limi
 		LIMIT $2 OFFSET $3`,
 		b.queueName, limit, offset)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list completed non-cron: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to list completed non-cron: %v", err))
 	}
 	defer rows.Close()
 
@@ -1696,7 +2066,7 @@ func (b *PostgresBackend) ListCompletedCron(ctx context.Context, offset, limit i
 		LIMIT $2 OFFSET $3`,
 		b.queueName, limit, offset)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list completed cron: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to list completed cron: %v", err))
 	}
 	defer rows.Close()
 
@@ -1717,7 +2087,7 @@ func (b *PostgresBackend) ListDeadLetter(ctx context.Context, offset, limit int)
 		LIMIT $2 OFFSET $3`,
 		b.queueName, limit, offset)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list dead letter: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to list dead letter: %v", err))
 	}
 	defer rows.Close()
 
@@ -1758,7 +2128,7 @@ func (b *PostgresBackend) GetActivity(ctx context.Context, activityID uuid.UUID)
 		WHERE id = $1 AND queue_name = $2`,
 		activityID, b.queueName)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to get activity: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to get activity: %v", err))
 	}
 	defer rows.Close()
 
@@ -1781,7 +2151,7 @@ func (b *PostgresBackend) GetActivityEvents(ctx context.Context, activityID uuid
 		LIMIT $2`,
 		activityID, limit)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to get events: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to get events: %v", err))
 	}
 	defer rows.Close()
 
@@ -1791,7 +2161,7 @@ func (b *PostgresBackend) GetActivityEvents(ctx context.Context, activityID uuid
 		var eventTypeRaw string
 		err := rows.Scan(&e.ActivityID, &eventTypeRaw, &e.WorkerID, &e.Detail, &e.Timestamp)
 		if err != nil {
-			return nil, storage.NewInternalError(fmt.Sprintf("Failed to scan event: %v", err))
+			return nil, databaseError(err, fmt.Sprintf("Failed to scan event: %v", err))
 		}
 		// Handle both legacy JSON-encoded strings ("\"Enqueued\"") and plain strings ("Enqueued")
 		var et string
@@ -1819,7 +2189,7 @@ func (b *PostgresBackend) GetChildren(ctx context.Context, parentID uuid.UUID, o
 		LIMIT $3 OFFSET $4`,
 		b.queueName, parentID, limit, offset)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list children: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to list children: %v", err))
 	}
 	defer rows.Close()
 
@@ -1874,7 +2244,7 @@ func (b *PostgresBackend) ListRecentRoots(ctx context.Context, status string, of
 		LIMIT $3 OFFSET $4`,
 		b.queueName, status, limit, offset)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list recent roots: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to list recent roots: %v", err))
 	}
 	defer rows.Close()
 
@@ -1899,7 +2269,7 @@ func (b *PostgresBackend) ListRecentActivities(ctx context.Context, status strin
 		LIMIT $3 OFFSET $4`,
 		b.queueName, status, limit, offset)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list recent activities: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to list recent activities: %v", err))
 	}
 	defer rows.Close()
 
@@ -1920,7 +2290,7 @@ func (b *PostgresBackend) ListCronActivities(ctx context.Context, offset, limit 
 		LIMIT $2 OFFSET $3`,
 		b.queueName, limit, offset)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to list cron activities: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to list cron activities: %v", err))
 	}
 	defer rows.Close()
 
@@ -1938,7 +2308,7 @@ func (b *PostgresBackend) GetActivitySteps(ctx context.Context, ownerActivityID 
 		ORDER BY created_at ASC`,
 		b.queueName, ownerActivityID)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to get activity steps: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to get activity steps: %v", err))
 	}
 	defer rows.Close()
 
@@ -1948,7 +2318,7 @@ func (b *PostgresBackend) GetActivitySteps(ctx context.Context, ownerActivityID 
 		var data json.RawMessage
 		var createdAt time.Time
 		if err := rows.Scan(&step, &stateStr, &data, &createdAt); err != nil {
-			return nil, storage.NewInternalError(fmt.Sprintf("Failed to scan step: %v", err))
+			return nil, databaseError(err, fmt.Sprintf("Failed to scan step: %v", err))
 		}
 		kind, name := step, ""
 		if i := strings.IndexByte(step, ':'); i >= 0 {
@@ -1978,7 +2348,7 @@ func (b *PostgresBackend) GetSubtree(ctx context.Context, rootID uuid.UUID) ([]s
 		ORDER BY depth ASC, created_at ASC`,
 		b.queueName, rootID)
 	if err != nil {
-		return nil, storage.NewInternalError(fmt.Sprintf("Failed to get subtree: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to get subtree: %v", err))
 	}
 	defer rows.Close()
 
@@ -2151,7 +2521,7 @@ func (b *PostgresBackend) RegisterWorkerPool(ctx context.Context, pool storage.W
 		    last_seen_at   = NOW()`,
 		pool.PoolID, pool.QueueName, pool.MaxWorkers, types)
 	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to register worker pool: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to register worker pool: %v", err))
 	}
 	return nil
 }
@@ -2166,7 +2536,7 @@ func (b *PostgresBackend) HeartbeatWorkerPool(ctx context.Context, poolID uuid.U
 		UPDATE runnerq_worker_pools SET last_seen_at = NOW() WHERE pool_id = $1`,
 		poolID)
 	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to heartbeat worker pool: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to heartbeat worker pool: %v", err))
 	}
 	return nil
 }
@@ -2177,7 +2547,7 @@ func (b *PostgresBackend) HeartbeatWorkerPool(ctx context.Context, poolID uuid.U
 func (b *PostgresBackend) DeregisterWorkerPool(ctx context.Context, poolID uuid.UUID) error {
 	_, err := b.pool.Exec(ctx, `DELETE FROM runnerq_worker_pools WHERE pool_id = $1`, poolID)
 	if err != nil {
-		return storage.NewInternalError(fmt.Sprintf("Failed to deregister worker pool: %v", err))
+		return databaseError(err, fmt.Sprintf("Failed to deregister worker pool: %v", err))
 	}
 	return nil
 }
@@ -2194,7 +2564,7 @@ func (b *PostgresBackend) scanSnapshots(rows pgx.Rows) ([]storage.ActivitySnapsh
 			&r.metadata, &r.idempotencyKey, &r.leaseDeadlineMS,
 			&r.parentActivityID, &r.rootActivityID, &r.depth)
 		if err != nil {
-			return nil, storage.NewInternalError(fmt.Sprintf("Failed to scan row: %v", err))
+			return nil, databaseError(err, fmt.Sprintf("Failed to scan row: %v", err))
 		}
 		snapshots = append(snapshots, r.toSnapshot())
 	}

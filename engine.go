@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -40,6 +41,7 @@ type WorkerEngine struct {
 	// access is a data race; the mutex also makes closing shutdownCh
 	// idempotent under concurrent Stop calls.
 	mu           sync.Mutex
+	active       bool               // true through startup and until the last drain finishes
 	cancelFunc   context.CancelFunc // cancels the engine context (handlers, acks) — phase 3
 	intakeCancel context.CancelFunc // cancels only the dequeue/poll loops — phase 1
 	shutdownCh   chan struct{}
@@ -56,6 +58,7 @@ type WorkerEngine struct {
 
 // NewWorkerEngineWithBackend creates a WorkerEngine from a custom backend.
 func NewWorkerEngineWithBackend(backend storage.Storage, config WorkerConfig) *WorkerEngine {
+	config = cloneWorkerConfig(config)
 	// Propagate lease config to backends that support it.
 	if lc, ok := backend.(storage.LeaseConfigurer); ok && config.LeaseMS != nil {
 		leaseMS := min(*config.LeaseMS, math.MaxInt64)
@@ -71,12 +74,20 @@ func NewWorkerEngineWithBackend(backend storage.Storage, config WorkerConfig) *W
 		config:     config,
 		shutdownCh: shutdownCh,
 		metrics:    NoopMetrics{},
-		instanceID: uuid.New().String()[:8],
+		instanceID: uuid.New().String(),
 	}
 }
 
 // SetMetrics sets the metrics sink.
 func (e *WorkerEngine) SetMetrics(sink MetricsSink) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.active {
+		panic("cannot change metrics while engine is active")
+	}
+	if sink == nil {
+		sink = NoopMetrics{}
+	}
 	e.metrics = sink
 }
 
@@ -94,6 +105,14 @@ func (e *WorkerEngine) MaxConcurrentActivities() int {
 
 // RegisterActivity registers an activity handler for a given activity type.
 func (e *WorkerEngine) RegisterActivity(activityType string, handler ActivityHandler) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.active {
+		panic("cannot register activities while engine is active")
+	}
+	if activityType == "" || handler == nil {
+		panic("activity type and handler must be non-empty")
+	}
 	e.handlers[activityType] = handler
 }
 
@@ -105,49 +124,52 @@ func (e *WorkerEngine) GetActivityExecutor() ActivityExecutor {
 
 // Start starts the worker engine and blocks until shutdown or error.
 func (e *WorkerEngine) Start(ctx context.Context) error {
-	if len(e.config.ActivityTypes) > 0 {
-		var missing []string
-		for _, t := range e.config.ActivityTypes {
-			if _, ok := e.handlers[t]; !ok {
-				missing = append(missing, t)
-			}
-		}
-		if len(missing) > 0 {
-			panic(fmt.Sprintf("activity_types filter contains types with no registered handler: %v", missing))
-		}
-	}
-
-	// Retention config sanity: a negative TTL would silently behave like
-	// "keep forever" (the backend treats <= 0 as disabled), which is the
-	// opposite of what a misconfigured caller intended. Fail fast instead.
-	if r := e.config.Retention; r != nil {
-		if r.Completed < 0 || r.Failed < 0 || r.Interval < 0 || r.BatchSize < 0 {
-			return &WorkerError{
-				Kind:    ErrConfiguration,
-				Message: "Retention TTLs, Interval, and BatchSize must be >= 0 (zero = keep forever / use default)",
-			}
-		}
-	}
-
-	if !e.running.CompareAndSwap(false, true) {
+	e.mu.Lock()
+	if e.active {
+		e.mu.Unlock()
 		return &WorkerError{Kind: ErrAlreadyRunning}
 	}
-
-	slog.Info("Starting worker engine", "max_concurrent_activities", e.config.MaxConcurrentActivities)
-
-	// Two nested contexts implement two-phase shutdown: intakeCtx is cancelled
-	// first (stops dequeue/poll loops), engineCtx stays live through the drain
-	// so in-flight handlers can complete and ack, and is cancelled last.
-	engineCtx, engineCancel := context.WithCancel(ctx)
-	defer engineCancel()
+	if err := ctx.Err(); err != nil {
+		e.mu.Unlock()
+		return err
+	}
+	if e.config.MaxConcurrentActivities <= 0 || len(e.handlers) == 0 {
+		e.mu.Unlock()
+		return &WorkerError{Kind: ErrConfiguration, Message: "at least one worker and registered handler are required"}
+	}
+	types := slices.Clone(e.config.ActivityTypes)
+	if len(types) == 0 {
+		for t := range e.handlers {
+			types = append(types, t)
+		}
+		slices.Sort(types)
+	}
+	for _, t := range types {
+		if _, ok := e.handlers[t]; !ok {
+			e.mu.Unlock()
+			return &WorkerError{Kind: ErrConfiguration, Message: fmt.Sprintf("no handler registered for activity type %q", t)}
+		}
+	}
+	if r := e.config.Retention; r != nil && (r.Completed < 0 || r.Failed < 0 || r.Interval < 0 || r.BatchSize < 0) {
+		e.mu.Unlock()
+		return &WorkerError{Kind: ErrConfiguration, Message: "retention values must be non-negative"}
+	}
+	if q, ok := e.queue.(activityTypeFilter); ok {
+		q.setActivityTypes(types)
+	}
+	e.active = true
+	e.running.Store(true)
+	// Parent cancellation stops intake below. Handler and persistence lifetime
+	// ends after the drain, including when the caller uses a signal context.
+	engineCtx, engineCancel := context.WithCancel(context.WithoutCancel(ctx))
 	intakeCtx, intakeCancel := context.WithCancel(engineCtx)
-
-	e.mu.Lock()
 	e.cancelFunc = engineCancel
 	e.intakeCancel = intakeCancel
 	e.shutdownCh = make(chan struct{})
 	shutdownCh := e.shutdownCh
 	e.mu.Unlock()
+	defer engineCancel()
+	slog.Info("Starting worker engine", "max_concurrent_activities", e.config.MaxConcurrentActivities)
 
 	// Register this pool so cluster-wide capacity reporting stays accurate.
 	// Registration failure is non-fatal — the engine still runs, the KPI just
@@ -157,14 +179,17 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		PoolID:        e.poolID,
 		QueueName:     e.config.QueueName,
 		MaxWorkers:    e.config.MaxConcurrentActivities,
-		ActivityTypes: e.config.ActivityTypes,
+		ActivityTypes: types,
 	}
-	if err := e.backend.RegisterWorkerPool(engineCtx, info); err != nil {
+	registrationCtx, registrationCancel := context.WithTimeout(intakeCtx, storageAttemptTimeout)
+	if err := e.backend.RegisterWorkerPool(registrationCtx, info); err != nil {
 		slog.Warn("Failed to register worker pool", "error", err, "pool_id", e.poolID)
 		e.poolID = uuid.Nil
 	} else {
 		slog.Info("Registered worker pool", "pool_id", e.poolID, "max_workers", info.MaxWorkers)
 	}
+
+	registrationCancel()
 
 	var wg sync.WaitGroup
 
@@ -195,26 +220,29 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		})
 	}
 
-	// Fixed-goroutine worker pool: one worker per slot. Long waits inside
-	// handlers (child awaits, sleeps, signal waits) yield-park the activity
-	// rather than holding the worker, so no separate dispatcher model is
-	// needed for fan-out workloads.
-	for i := 0; i < e.config.MaxConcurrentActivities; i++ {
-		workerID := i
+	// Intake. A backend that can claim in bulk gets one dispatcher that
+	// claims exactly as many activities as the engine has idle slots; every
+	// other backend gets the fixed pool of one blocking-claim loop per slot.
+	// Long waits inside handlers (child awaits, sleeps, signal waits)
+	// yield-park the activity rather than holding the slot in either mode.
+	if batchQueue, ok := e.queue.(batchActivityQueue); ok {
 		wg.Go(func() {
-			e.runWorkerLoop(intakeCtx, engineCtx, workerID)
+			e.runBatchDispatcher(intakeCtx, engineCtx, batchQueue)
 		})
+	} else {
+		for i := range e.config.MaxConcurrentActivities {
+			wg.Go(func() {
+				e.runWorkerLoop(intakeCtx, engineCtx, i)
+			})
+		}
 	}
 
 	// Wait for shutdown signal or context cancellation
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// A Stop that ran to completion between the running CAS and the mu block
-	// above closed the previous shutdownCh, not the one published there — so
-	// re-check the flag instead of waiting on a signal that already fired.
-	// Any Stop after the mu block closes the published channel and wakes the
-	// select normally.
+	// Stop may have cancelled intake during pool registration.
+
 	if !e.running.Load() {
 		slog.Info("Shutdown requested during startup")
 	} else {
@@ -271,12 +299,25 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	}
 
 	done := make(chan string, len(tasks))
+	var drains sync.WaitGroup
 	for _, t := range tasks {
-		go func() {
+		drains.Go(func() {
 			t.fn()
 			done <- t.name
-		}()
+		})
 	}
+	drainsDone := make(chan struct{})
+	go func() { drains.Wait(); close(drainsDone) }()
+	defer func() {
+		engineCancel()
+		finish := func() { e.mu.Lock(); e.active = false; e.mu.Unlock() }
+		select {
+		case <-drainsDone:
+			finish()
+		default:
+			go func() { <-drainsDone; finish() }()
+		}
+	}()
 
 	finished := 0
 	for finished < len(tasks) {
@@ -311,8 +352,8 @@ func (e *WorkerEngine) Stop() {
 // (phase 2) and the final engine-context cancel (phase 3).
 func (e *WorkerEngine) stop() {
 	slog.Info("Stopping worker engine")
-	e.running.Store(false)
 	e.mu.Lock()
+	e.running.Store(false)
 	defer e.mu.Unlock()
 	if e.intakeCancel != nil {
 		e.intakeCancel()
@@ -337,10 +378,8 @@ const workerDequeueBlock = 15 * time.Second
 // context, which outlives intake so a draining handler can still ack).
 func (e *WorkerEngine) runWorkerLoop(ctx, handlerCtx context.Context, workerID int) {
 	slog.Debug("Starting worker loop", "worker_id", workerID)
-	// instanceID prefix keeps the label unique across engine processes; the
-	// loop itself is synchronous (claim → handle → ack), so one label per
-	// worker can never have two attempts in flight.
-	workerLabel := fmt.Sprintf("%s:worker-%d", e.instanceID, workerID)
+	// Every claim receives a fresh execution identity, including subsequent
+	// claims on the same worker slot. Old acknowledgements cannot match a new attempt.
 
 	for e.running.Load() {
 		select {
@@ -353,15 +392,14 @@ func (e *WorkerEngine) runWorkerLoop(ctx, handlerCtx context.Context, workerID i
 		// Blocking dequeue: parks inside the backend until work is signalled
 		// or the block window elapses. No idle sleep/backoff needed here —
 		// an empty return means the window expired and we simply re-enter.
+		workerLabel := fmt.Sprintf("%s:worker-%d:%s", e.instanceID, workerID, uuid.New())
 		act, err := e.queue.Dequeue(ctx, workerDequeueBlock, workerLabel)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
 			slog.Error("Failed to dequeue activity", "worker_id", workerID, "error", err)
-			select {
-			case <-time.After(time.Second):
-			case <-ctx.Done():
+			if !pauseAfterDequeueError(ctx) {
 				return
 			}
 			continue
@@ -377,6 +415,94 @@ func (e *WorkerEngine) runWorkerLoop(ctx, handlerCtx context.Context, workerID i
 	slog.Debug("Worker loop stopped", "worker_id", workerID)
 }
 
+// runBatchDispatcher is the intake loop for batch-capable backends. One
+// goroutine owns the engine's concurrency budget: idle slots are tokens in a
+// channel, the dispatcher gathers every slot idle right now, claims that many
+// activities in one round trip, and hands each claim to its own goroutine,
+// which returns the slot when the activity completes, parks, or fails.
+//
+// Claiming only what is idle means a lease is never held by an activity
+// waiting behind an in-memory backlog, and a busy engine issues one claim per
+// wave of freed slots instead of one per slot. Like runWorkerLoop it claims on
+// ctx (intake) and executes on handlerCtx (engine), and it does not return
+// until every activity it dispatched has finished, so Start's drain sees the
+// same thing it would from the fixed pool.
+func (e *WorkerEngine) runBatchDispatcher(ctx, handlerCtx context.Context, queue batchActivityQueue) {
+	n := e.config.MaxConcurrentActivities
+	slog.Debug("Starting batch dispatcher", "max_concurrent_activities", n)
+
+	// Slot numbers double as the worker_id in logs, matching the fixed pool.
+	idle := make(chan int, n)
+	for slot := range n {
+		idle <- slot
+	}
+	var inFlight sync.WaitGroup
+	defer inFlight.Wait()
+
+	var held []int // slots taken from idle and not yet assigned to a claim
+	for e.running.Load() {
+		if len(held) == 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case slot := <-idle:
+				held = append(held, slot)
+			}
+		}
+		held = takeIdle(idle, held)
+
+		// A fresh prefix per call: the backend appends each activity's id, so
+		// a token is unique per (call, activity), as the fixed pool's
+		// per-claim uuid is unique per claim.
+		prefix := fmt.Sprintf("%s:batch:%s", e.instanceID, uuid.New())
+		claims, err := queue.DequeueBatch(ctx, len(held), workerDequeueBlock, prefix)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Error("Failed to batch dequeue activities", "error", err, "limit", len(held))
+			if !pauseAfterDequeueError(ctx) {
+				return
+			}
+			continue
+		}
+		for _, claim := range claims {
+			slot := held[len(held)-1]
+			held = held[:len(held)-1]
+			inFlight.Go(func() {
+				defer func() { idle <- slot }()
+				e.processActivity(handlerCtx, claim.activity, claim.leaseID, slot)
+			})
+		}
+	}
+
+	slog.Debug("Batch dispatcher stopped")
+}
+
+// takeIdle appends every slot that is idle right now to held, without waiting.
+func takeIdle(idle <-chan int, held []int) []int {
+	for {
+		select {
+		case slot := <-idle:
+			held = append(held, slot)
+		default:
+			return held
+		}
+	}
+}
+
+// pauseAfterDequeueError holds an intake loop back for a second after a
+// failed claim so a struggling backend is not hammered. False means ctx ended
+// during the pause and the loop should exit.
+func pauseAfterDequeueError(ctx context.Context) bool {
+	select {
+	case <-time.After(time.Second):
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, workerLabel string, workerID int) {
 	activityID := act.ID
 	activityType := act.ActivityType
@@ -386,7 +512,7 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	handler, ok := e.handlers[activityType]
 	if !ok {
 		slog.Error("No handler found for activity type", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType)
-		if _, err := e.queue.MarkFailed(ctx, act, "handler_not_found", false, workerLabel); err != nil {
+		if _, err := e.queue.MarkFailed(ctx, act, "handler_not_found", true, workerLabel); err != nil {
 			slog.Error("Failed to mark activity as failed", "worker_id", workerID, "activity_id", activityID, "error", err)
 		}
 		return
@@ -399,7 +525,9 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	// yield-park this activity; awaits outside a handler block normally.
 	timeoutCtx = withHandlerScope(timeoutCtx)
 
-	scopedExecutor := newWorkerEngineWrapperWithDepth(e.queue, e.config.MaxActivityDepth).scopedForChild(act)
+	attemptQ := &attemptQueue{activityQueue: e.queue, backend: e.backend, owner: act.ID, worker: workerLabel, persistenceCtx: ctx, metrics: e.metrics}
+	timeoutCtx = context.WithValue(timeoutCtx, attemptQueueKey{}, attemptQ)
+	scopedExecutor := newWorkerEngineWrapperWithDepth(attemptQ, e.config.MaxActivityDepth).scopedForChild(act)
 
 	actCtx := ActivityContext{
 		ActivityID:       activityID,
@@ -411,7 +539,7 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 		ParentActivityID: act.ParentActivityID,
 		RootActivityID:   act.RootActivityID,
 		Depth:            act.Depth,
-		queue:            e.queue,
+		queue:            attemptQ,
 	}
 
 	payloadForDL := make(json.RawMessage, len(act.Payload))
@@ -428,27 +556,27 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 		return
 	}
 
-	// Check if we timed out
-	if timeoutCtx.Err() == context.DeadlineExceeded {
-		e.handleTimeout(ctx, act, handler, actCtx, payloadForDL, workerLabel, workerID, activityID, activityType, activityTimeout)
-		return
-	}
-
+	// A successfully returned outcome is worth persisting even if the handler
+	// deadline elapsed during checkpoint recovery. Ownership still fences it.
 	if handlerErr == nil {
 		e.handleSuccess(ctx, act, result, workerLabel, workerID, activityID, activityType)
 		return
 	}
-
-	retryable := true // default: unknown errors are retryable
-	if re, ok := handlerErr.(RetryableError); ok {
-		retryable = re.IsRetryable()
+	if se, ok := storage.IsStorageError(handlerErr); ok && se.Kind == storage.ErrClaimLost {
+		e.metrics.IncCounter("activity_claim_lost", 1)
+		slog.Warn("Activity execution lost its claim", "activity_id", activityID, "error", handlerErr)
+		return
 	}
-
-	if retryable {
-		e.handleRetryableFailure(ctx, act, handler, actCtx, payloadForDL, handlerErr.Error(), workerLabel, workerID, activityID, activityType)
-	} else {
+	retryable := retryableError(handlerErr)
+	if !retryable {
 		e.handleNonRetryableFailure(ctx, act, handlerErr.Error(), workerLabel, workerID, activityID, activityType)
+		return
 	}
+	if timeoutCtx.Err() == context.DeadlineExceeded {
+		e.handleTimeout(ctx, act, handler, actCtx, payloadForDL, workerLabel, workerID, activityID, activityType, activityTimeout)
+		return
+	}
+	e.handleRetryableFailure(ctx, act, handler, actCtx, payloadForDL, handlerErr.Error(), workerLabel, workerID, activityID, activityType)
 }
 
 // safeHandle calls the handler with panic recovery.
@@ -471,18 +599,23 @@ func (e *WorkerEngine) safeHandle(handler ActivityHandler, ctx ActivityContext, 
 }
 
 func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result json.RawMessage, workerLabel string, workerID int, activityID any, activityType string) {
-	// Result is persisted in the same transaction as the status flip: a crash
-	// here either leaves the row 'processing' (lease expires, activity reruns)
-	// or 'completed' with its result row present. There is no window where the
-	// activity is completed but the result is missing, which previously left
-	// awaiting parents polling until their own timeout.
-	if err := e.queue.MarkCompleted(ctx, act, result, workerLabel); err != nil {
-		// MarkCompleted failed — the row was no longer in 'processing' with
-		// this worker (lease likely expired and the reaper requeued it).
-		// Don't claim success: another worker will rerun the activity.
-		slog.Warn("Activity completed in handler but row was no longer claimable; another worker will rerun it",
-			"worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "error", err)
-		e.metrics.IncCounter("activity_lost_completion", 1)
+	started := time.Now()
+	e.metrics.IncCounter("activity_completion_pending_started", 1)
+	defer func() {
+		e.metrics.IncCounter("activity_completion_pending_finished", 1)
+		e.metrics.ObserveDuration("activity_completion_persistence", time.Since(started))
+	}()
+	attemptQ := &attemptQueue{backend: e.backend, owner: act.ID, worker: workerLabel}
+	err := retryStorage(ctx, "complete activity", e.metrics, attemptQ.renew, func(ctx context.Context) error {
+		return e.queue.MarkCompleted(ctx, act, result, workerLabel)
+	})
+	if err != nil {
+		counter := "activity_completion_error"
+		if se, ok := storage.IsStorageError(err); ok && se.Kind == storage.ErrClaimLost {
+			counter = "activity_claim_lost"
+		}
+		e.metrics.IncCounter(counter, 1)
+		slog.Error("Failed to confirm activity completion", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "error", err)
 		return
 	}
 	e.metrics.IncCounter("activity_completed", 1)
@@ -494,10 +627,28 @@ func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result 
 // requeues it, and the handler replays to the same Sleep — degraded latency
 // and one consumed retry, not lost work.
 func (e *WorkerEngine) handleYield(ctx context.Context, act *activity, ys *yieldPark, workerLabel string, workerID int, activityID any, activityType string) {
-	if err := e.queue.Yield(ctx, act, ys.wakeAt, workerLabel, ys.kind, ys.step); err != nil {
-		slog.Error("Failed to park yielding activity; lease expiry will recover it",
-			"worker_id", workerID, "activity_id", activityID, "activity_type", activityType,
-			"wake_at", ys.wakeAt, "error", err)
+	// Recheck waits periodically even if this process dies immediately after
+	// park commits. The original signal/timer deadline remains checkpointed;
+	// this only schedules a replay to discover a result or repark safely.
+	wakeAt := ys.wakeAt
+	if ys.recheck != uuid.Nil {
+		if recheckAt := time.Now().UTC().Add(time.Minute); wakeAt.After(recheckAt) {
+			wakeAt = recheckAt
+		}
+	}
+	attemptQ := &attemptQueue{backend: e.backend, owner: act.ID, worker: workerLabel}
+	err := retryStorage(ctx, "park activity", e.metrics, attemptQ.renew, func(ctx context.Context) error {
+		if b, ok := e.backend.(storage.DependencyStorage); ok && ys.recheck != uuid.Nil {
+			var producer *uuid.UUID
+			if ys.kind == "await" {
+				producer = &ys.recheck
+			}
+			return b.YieldForResult(ctx, act.ID, ys.recheck, producer, wakeAt, workerLabel, ys.kind, ys.step)
+		}
+		return e.queue.Yield(ctx, act, wakeAt, workerLabel, ys.kind, ys.step)
+	})
+	if err != nil {
+		slog.Error("Failed to confirm durable park", "activity_id", activityID, "error", err)
 		return
 	}
 	e.metrics.IncCounter("activity_yielded", 1)
@@ -509,9 +660,12 @@ func (e *WorkerEngine) handleYield(ctx context.Context, act *activity, ys *yield
 	// between the handler's final check and the park above produced no wake —
 	// the row wasn't 'waiting' yet when the producer looked. Re-check now
 	// that the park is committed and self-wake if the awaited result exists.
-	// Failure here is degraded latency, not lost work: the park deadline (or
-	// for child awaits, a later sibling completion) still wakes the row.
+	// Failure here is bounded by the one-minute replay deadline above plus
+	// queue availability. Durable dependency registration can avoid polling.
 	if ys.recheck == uuid.Nil {
+		return
+	}
+	if _, durable := e.backend.(storage.DependencyStorage); durable {
 		return
 	}
 	res, err := e.queue.GetResult(ctx, ys.recheck)
@@ -532,7 +686,7 @@ func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity
 	e.metrics.IncCounter("activity_retry", 1)
 	slog.Warn("Activity requesting retry", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "reason", reason)
 
-	deadLettered, err := e.queue.MarkFailed(ctx, act, reason, true, workerLabel)
+	deadLettered, err := e.persistFailure(ctx, act, reason, true, workerLabel)
 	if err != nil {
 		slog.Error("Failed to mark activity for retry", "worker_id", workerID, "activity_id", activityID, "error", err)
 		return
@@ -549,7 +703,7 @@ func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity
 			RootActivityID:   act.RootActivityID,
 			Depth:            act.Depth,
 		}
-		handler.OnDeadLetter(dlCtx, payloadForDL, reason)
+		e.callDeadLetter(handler, dlCtx, payloadForDL, reason)
 	}
 }
 
@@ -559,7 +713,7 @@ func (e *WorkerEngine) handleNonRetryableFailure(ctx context.Context, act *activ
 
 	// The error result row is written inside the AckFailure transaction by the
 	// backend, so no separate result-storage step is needed here.
-	if _, err := e.queue.MarkFailed(ctx, act, reason, false, workerLabel); err != nil {
+	if _, err := e.persistFailure(ctx, act, reason, false, workerLabel); err != nil {
 		slog.Error("Failed to mark activity as failed", "worker_id", workerID, "activity_id", activityID, "error", err)
 	}
 }
@@ -569,7 +723,7 @@ func (e *WorkerEngine) handleTimeout(ctx context.Context, act *activity, handler
 	errorMsg := "Activity execution timed out"
 	slog.Error("Activity timed out", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "timeout", timeout)
 
-	deadLettered, err := e.queue.MarkFailed(ctx, act, errorMsg, true, workerLabel)
+	deadLettered, err := e.persistFailure(ctx, act, errorMsg, true, workerLabel)
 	if err != nil {
 		slog.Error("Failed to mark activity as failed", "worker_id", workerID, "activity_id", activityID, "error", err)
 		return
@@ -586,8 +740,18 @@ func (e *WorkerEngine) handleTimeout(ctx context.Context, act *activity, handler
 			RootActivityID:   act.RootActivityID,
 			Depth:            act.Depth,
 		}
-		handler.OnDeadLetter(dlCtx, payloadForDL, errorMsg)
+		e.callDeadLetter(handler, dlCtx, payloadForDL, errorMsg)
 	}
+}
+
+func (e *WorkerEngine) callDeadLetter(handler ActivityHandler, ctx ActivityContext, payload json.RawMessage, reason string) {
+	defer func() {
+		if r := recover(); r != nil {
+			e.metrics.IncCounter("activity_dead_letter_hook_panic", 1)
+			slog.Error("Dead-letter hook panicked", "activity_id", ctx.ActivityID, "panic", r)
+		}
+	}()
+	handler.OnDeadLetter(ctx, payload, reason)
 }
 
 func (e *WorkerEngine) runScheduledProcessor(ctx context.Context) {
@@ -824,4 +988,16 @@ func (b *WorkerEngineBuilder) Build() (*WorkerEngine, error) {
 	}
 
 	return engine, nil
+}
+
+// Failure decisions are outcomes too: retry their acknowledgement independently
+// of the handler. An idempotent backend resolves an already-committed transition.
+func (e *WorkerEngine) persistFailure(ctx context.Context, act *activity, reason string, retryable bool, worker string) (dead bool, err error) {
+	q := &attemptQueue{backend: e.backend, owner: act.ID, worker: worker}
+	err = retryStorage(ctx, "record activity failure", e.metrics, q.renew, func(ctx context.Context) error {
+		var err error
+		dead, err = e.queue.MarkFailed(ctx, act, reason, retryable, worker)
+		return err
+	})
+	return
 }

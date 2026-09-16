@@ -49,7 +49,7 @@ type WorkerConfig struct {
 	ReaperBatchSize *int `json:"reaper_batch_size,omitempty"`
 
 	// ActivityTypes restricts this engine to only dequeue specific activity types.
-	// When nil, workers dequeue all activity types.
+	// When empty, workers dequeue only locally registered activity types.
 	ActivityTypes []string `json:"activity_types,omitempty"`
 
 	// MaxActivityDepth caps how deep the parent/child activity tree can grow.
@@ -85,4 +85,23 @@ func DefaultWorkerConfig() WorkerConfig {
 		ReaperIntervalSeconds:   &reaperInterval,
 		ReaperBatchSize:         &reaperBatch,
 	}
+}
+
+// Detach caller-owned slices and pointers before the engine starts goroutines.
+func cloneWorkerConfig(c WorkerConfig) WorkerConfig {
+	c.ActivityTypes = append([]string(nil), c.ActivityTypes...)
+	c.SchedulePollIntervalSeconds = cloneConfigPtr(c.SchedulePollIntervalSeconds)
+	c.LeaseMS = cloneConfigPtr(c.LeaseMS)
+	c.ReaperIntervalSeconds = cloneConfigPtr(c.ReaperIntervalSeconds)
+	c.ReaperBatchSize = cloneConfigPtr(c.ReaperBatchSize)
+	c.Retention = cloneConfigPtr(c.Retention)
+	c.ShutdownGraceSeconds = cloneConfigPtr(c.ShutdownGraceSeconds)
+	return c
+}
+func cloneConfigPtr[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
 }
