@@ -39,7 +39,7 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage/postgres"
 )
 
-const paymentActivity = "process_payment"
+var paymentActivity = runnerq.NameOf[ProcessPayment]()
 
 // ProcessPayment exercises run / signal-wait / sleep / await-child in one
 // durable workflow. A short activity timeout (set at enqueue) makes the
@@ -48,8 +48,6 @@ const paymentActivity = "process_payment"
 type ProcessPayment struct {
 	runnerq.DefaultDeadLetterHandler
 }
-
-func (h *ProcessPayment) ActivityType() string { return paymentActivity }
 
 func (h *ProcessPayment) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	// Step 1 — a named side effect. Shows as "run:authorize" in the Steps tab.
@@ -82,7 +80,7 @@ func (h *ProcessPayment) Handle(ctx runnerq.ActivityContext, payload json.RawMes
 	}
 
 	// Step 5 — spawn and await a child. Parks → banner: "Awaiting child …".
-	notify, err := ctx.ActivityExecutor.Activity("notify_customer").Step("notify").Payload(payload).Execute(ctx.Ctx)
+	notify, err := ctx.ActivityExecutor.Activity(runnerq.NameOf[NotifyCustomer]()).Step("notify").Payload(payload).Execute(ctx.Ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +97,6 @@ type NotifyCustomer struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
-func (h *NotifyCustomer) ActivityType() string { return "notify_customer" }
 func (h *NotifyCustomer) Handle(_ runnerq.ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 	time.Sleep(20 * time.Second)
 	return json.RawMessage(`{"notified":true,"channel":"email"}`), nil
@@ -118,8 +115,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("build: %v", err)
 	}
-	engine.RegisterActivity(paymentActivity, &ProcessPayment{})
-	engine.RegisterActivity("notify_customer", &NotifyCustomer{})
+	engine.RegisterActivity(&ProcessPayment{})
+	engine.RegisterActivity(&NotifyCustomer{})
 	go func() {
 		if err := engine.Start(ctx); err != nil {
 			log.Fatalf("engine stopped: %v", err)

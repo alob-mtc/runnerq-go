@@ -282,7 +282,7 @@ func TestCallerCancellationDrainsAndRejectsOverlappingStart(t *testing.T) {
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
 	defer unblock()
-	e.RegisterActivity("test", &funcHandler{fn: func(c ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+	e.RegisterActivityWithName("test", &funcHandler{fn: func(c ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 		close(entered)
 		<-release
 		return json.RawMessage(`true`), c.Ctx.Err()
@@ -297,7 +297,7 @@ func TestCallerCancellationDrainsAndRejectsOverlappingStart(t *testing.T) {
 	if err := e.Start(context.Background()); err == nil {
 		t.Fatal("overlapping Start accepted")
 	}
-	mustPanic(t, func() { e.RegisterActivity("other", &funcHandler{}) })
+	mustPanic(t, func() { e.RegisterActivityWithName("other", &funcHandler{}) })
 	mustPanic(t, func() { e.SetMetrics(nil) })
 	unblock()
 	if err := receive(t, b.ack); err != nil {
@@ -313,7 +313,7 @@ func TestDefaultRoutingAndFreshIdentityPerClaim(t *testing.T) {
 	cfg := DefaultWorkerConfig()
 	cfg.MaxConcurrentActivities = 1
 	e := NewWorkerEngineWithBackend(b, cfg)
-	e.RegisterActivity("test", &funcHandler{fn: func(ActivityContext, json.RawMessage) (json.RawMessage, error) { return nil, nil }})
+	e.RegisterActivityWithName("test", &funcHandler{fn: func(ActivityContext, json.RawMessage) (json.RawMessage, error) { return nil, nil }})
 	for range 2 {
 		b.claims <- storage.QueuedActivity{ID: uuid.New(), ActivityType: "test", TimeoutSeconds: 30}
 	}
@@ -344,7 +344,7 @@ func TestStartRemainsBlockedAfterGraceUntilHandlerExits(t *testing.T) {
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
 	defer unblock()
-	e.RegisterActivity("test", &funcHandler{fn: func(ActivityContext, json.RawMessage) (json.RawMessage, error) {
+	e.RegisterActivityWithName("test", &funcHandler{fn: func(ActivityContext, json.RawMessage) (json.RawMessage, error) {
 		close(entered)
 		<-release
 		return nil, nil

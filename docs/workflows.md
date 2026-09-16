@@ -9,7 +9,6 @@ handler.
 
 ```go
 type ActivityHandler interface {
-    ActivityType() string
     Handle(ctx ActivityContext, payload json.RawMessage) (json.RawMessage, error)
     OnDeadLetter(ctx ActivityContext, payload json.RawMessage, errorMsg string)
 }
@@ -26,6 +25,60 @@ A handler returns:
 - any other non-nil `error` — treated as retryable.
 
 See [Retries & Dead Letter](retries-and-dead-letter.md) for the failure model.
+
+## Naming activities
+
+Every activity carries a type string that routes it to a handler. Registration
+decides that string, not the handler:
+
+```go
+// Derived from the handler's Go type name: "ResizeImage".
+engine.RegisterActivity(&ResizeImage{})
+
+// Pinned explicitly.
+engine.RegisterActivityWithName("resize_image", &ResizeImage{})
+```
+
+Derivation uses the bare type name — no package prefix, no case changes — and
+panics for unnamed types (anonymous structs) and duplicate registrations.
+`runnerq.NameOf[T]()` derives the same string for spawns, so a caller with the
+handler type in scope never repeats it by hand:
+
+```go
+exec.Activity(runnerq.NameOf[ResizeImage]()).Payload(p).Execute(ctx)
+```
+
+Prefer a pinned name when:
+
+- **The type is persisted.** Every enqueued row stores its activity type, so
+  renaming a handler struct strands whatever is already queued, parked, or
+  scheduled. A pinned name decouples the store from Go identifiers.
+- **One handler type serves several activity types**, as in
+  [workload isolation](../examples/12-workload-isolation).
+- **Producers are outside this Go module** and enqueue by string.
+
+`NameOf` knows nothing about registration: a handler pinned under
+`"resize_image"` must be spawned as `"resize_image"`, not
+`NameOf[ResizeImage]()`.
+
+### Migrating from explicit names (v0.4 and earlier)
+
+Activities already in the store keep the type string they were enqueued
+with. If a deploy switches `ChargeCard` from `"charge_card"` to the derived
+`"ChargeCard"`, every queued, parked, or scheduled `"charge_card"` row is
+dispatched with no matching handler and fails as `handler_not_found`.
+
+Keep the old string until the store has drained it:
+
+```go
+// Before: engine.RegisterActivity("charge_card", &ChargeCard{})
+engine.RegisterActivityWithName("charge_card", &ChargeCard{})
+executor.Activity("charge_card").Payload(p).Execute(ctx)
+```
+
+Producers that enqueue by string — other services, other languages — must
+keep sending the legacy type as well, since `NameOf` only reflects the Go
+type name and never consults the store.
 
 ## The activity context
 

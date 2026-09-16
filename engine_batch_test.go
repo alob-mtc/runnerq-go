@@ -90,8 +90,6 @@ func newGatedHandler() *gatedHandler {
 	return &gatedHandler{started: make(chan uuid.UUID, 16), release: make(chan struct{}, 16)}
 }
 
-func (h *gatedHandler) ActivityType() string { return "test" }
-
 func (h *gatedHandler) Handle(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 	n := h.inFlight.Add(1)
 	defer h.inFlight.Add(-1)
@@ -290,7 +288,7 @@ func TestStartUsesBatchIntakeWhenBackendClaimsInBulk(t *testing.T) {
 	cfg := DefaultWorkerConfig()
 	cfg.MaxConcurrentActivities = 3
 	e := NewWorkerEngineWithBackend(b, cfg)
-	e.RegisterActivity("test", &funcHandler{fn: func(ActivityContext, json.RawMessage) (json.RawMessage, error) { return nil, nil }})
+	e.RegisterActivityWithName("test", &funcHandler{fn: func(ActivityContext, json.RawMessage) (json.RawMessage, error) { return nil, nil }})
 	b.claims <- storage.QueuedActivity{ID: uuid.New(), ActivityType: "test", TimeoutSeconds: 30}
 
 	done := make(chan error, 1)

@@ -360,10 +360,11 @@ func (c ActivityContext) waitForCheckpoint(id uuid.UUID, wake time.Time) (*activ
 
 // ActivityHandler is the interface that all activity handlers must implement.
 // Implementations should be safe for concurrent use.
+//
+// The activity type a handler serves is decided at registration, not by the
+// handler: RegisterActivity derives it from the handler's type name and
+// RegisterActivityWithName pins it explicitly.
 type ActivityHandler interface {
-	// ActivityType returns the activity type string this handler processes.
-	ActivityType() string
-
 	// Handle processes the activity with the given payload and context.
 	// Returns:
 	//   (result, nil)       - completed successfully, result may be nil

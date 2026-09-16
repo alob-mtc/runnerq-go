@@ -29,8 +29,6 @@ type SignupWorkflow struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
-func (h *SignupWorkflow) ActivityType() string { return "signup" }
-
 func (h *SignupWorkflow) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	var in struct {
 		Email string `json:"email"`
@@ -74,7 +72,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("build: %v", err)
 	}
-	engine.RegisterActivity("signup", &SignupWorkflow{})
+	engine.RegisterActivity(&SignupWorkflow{})
 
 	// Start the engine; on exit, stop it and wait for the graceful drain to
 	// finish before closing the backend (correct shutdown ordering).
@@ -94,7 +92,7 @@ func main() {
 	// Kick off the workflow and wait for its result.
 	fmt.Println("starting signup workflow...")
 	future, err := engine.GetActivityExecutor().
-		Activity("signup").
+		Activity(runnerq.NameOf[SignupWorkflow]()).
 		Payload(json.RawMessage(`{"email":"ada@example.com"}`)).
 		Execute(ctx)
 	if err != nil {

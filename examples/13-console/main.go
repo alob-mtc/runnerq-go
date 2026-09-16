@@ -33,8 +33,6 @@ type FulfillOrder struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
-func (h *FulfillOrder) ActivityType() string { return "fulfill_order" }
-
 func (h *FulfillOrder) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	var in struct {
 		Order int `json:"order"`
@@ -67,7 +65,7 @@ func (h *FulfillOrder) Handle(ctx runnerq.ActivityContext, payload json.RawMessa
 	}
 
 	// A child activity — shows the workflow tree.
-	ship, err := ctx.ActivityExecutor.Activity("ship_order").Step("ship").Payload(payload).Execute(ctx.Ctx)
+	ship, err := ctx.ActivityExecutor.Activity(runnerq.NameOf[ShipOrder]()).Step("ship").Payload(payload).Execute(ctx.Ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +76,6 @@ type ShipOrder struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
-func (h *ShipOrder) ActivityType() string { return "ship_order" }
 func (h *ShipOrder) Handle(_ runnerq.ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 	time.Sleep(time.Second)
 	return json.RawMessage(`{"tracking":"1Z999"}`), nil
@@ -97,8 +94,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("build: %v", err)
 	}
-	engine.RegisterActivity("fulfill_order", &FulfillOrder{})
-	engine.RegisterActivity("ship_order", &ShipOrder{})
+	engine.RegisterActivity(&FulfillOrder{})
+	engine.RegisterActivity(&ShipOrder{})
 	go func() {
 		if err := engine.Start(ctx); err != nil {
 			log.Fatalf("engine stopped: %v", err)
@@ -118,7 +115,7 @@ func main() {
 			// this, the sleep fits the default 300s budget and waits
 			// in-process, appearing only as "processing".
 			if _, err := engine.GetActivityExecutor().
-				Activity("fulfill_order").
+				Activity(runnerq.NameOf[FulfillOrder]()).
 				Timeout(4 * time.Second).
 				Payload(payload).
 				Execute(ctx); err != nil {

@@ -80,7 +80,6 @@ type funcHandler struct {
 	fn func(ctx ActivityContext, payload json.RawMessage) (json.RawMessage, error)
 }
 
-func (h *funcHandler) ActivityType() string { return "func" }
 func (h *funcHandler) Handle(ctx ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	return h.fn(ctx, payload)
 }
@@ -115,8 +114,8 @@ func TestStepSpawnMemoizedAcrossParentRetry(t *testing.T) {
 	}}
 
 	rig := newStepsRig(t, func(e *WorkerEngine) {
-		e.RegisterActivity("orchestrate", parent)
-		e.RegisterActivity("reserve", child)
+		e.RegisterActivityWithName("orchestrate", parent)
+		e.RegisterActivityWithName("reserve", child)
 	})
 
 	fut, err := rig.engine.GetActivityExecutor().
@@ -158,7 +157,7 @@ func TestRunCheckpointSurvivesRetry(t *testing.T) {
 		return out, nil
 	}}
 
-	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("pay", h) })
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("pay", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
 		Activity("pay").Payload(json.RawMessage(`{}`)).Execute(context.Background())
@@ -199,7 +198,7 @@ func TestRunCheckpointsPermanentFailure(t *testing.T) {
 		return json.RawMessage(`{"observed":"stored failure"}`), nil
 	}}
 
-	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("doomed", h) })
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("doomed", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
 		Activity("doomed").Payload(json.RawMessage(`{}`)).Execute(context.Background())
@@ -235,7 +234,7 @@ func TestSleepResumesRemainderOnRetry(t *testing.T) {
 		return json.RawMessage(`{"woke":true}`), nil
 	}}
 
-	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("napper", h) })
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("napper", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
 		Activity("napper").Payload(json.RawMessage(`{}`)).Execute(context.Background())
@@ -272,7 +271,7 @@ func TestShortSleepInShortTimeoutStaysInProcess(t *testing.T) {
 		return json.RawMessage(`{"ok":true}`), nil
 	}}
 
-	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("blinker", h) })
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("blinker", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
 		Activity("blinker").
@@ -316,7 +315,7 @@ func TestSleepYieldsBeyondTimeoutBudget(t *testing.T) {
 		return json.RawMessage(`{"cooled":true}`), nil
 	}}
 
-	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("cooler", h) })
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("cooler", h) })
 
 	start := time.Now()
 	fut, err := rig.engine.GetActivityExecutor().
@@ -381,7 +380,7 @@ func TestStepHistoryRecorded(t *testing.T) {
 		}
 		return json.RawMessage(`{"done":true}`), nil
 	}}
-	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("func", h) })
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("func", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().Activity("func").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
@@ -428,7 +427,7 @@ func TestYieldEventCarriesWaitReason(t *testing.T) {
 		}
 		return json.RawMessage(`{"slept":true}`), nil
 	}}
-	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("func", h) })
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("func", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
 		Activity("func").Timeout(2 * time.Second).Payload(json.RawMessage(`{}`)).Execute(context.Background())
@@ -471,8 +470,8 @@ func TestStepChildCarriesStepNameInKey(t *testing.T) {
 		return fut.GetResult(ctx.Ctx)
 	}}
 	rig := newStepsRig(t, func(e *WorkerEngine) {
-		e.RegisterActivity("parent", parent)
-		e.RegisterActivity("child", child)
+		e.RegisterActivityWithName("parent", parent)
+		e.RegisterActivityWithName("child", child)
 	})
 
 	fut, err := rig.engine.GetActivityExecutor().Activity("parent").Payload(json.RawMessage(`{}`)).Execute(context.Background())

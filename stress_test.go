@@ -313,17 +313,17 @@ func TestStressThroughputBatchVsSingle(t *testing.T) {
 		queue := stressQueue(mode)
 		counter := &runCounter{}
 		register := func(e *WorkerEngine, _ int) {
-			e.RegisterActivity("work", &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+			e.RegisterActivityWithName("work", &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 				counter.hit(ctx.ActivityID)
 				time.Sleep(time.Duration(1+rand.IntN(8)) * time.Millisecond)
 				return json.RawMessage(`"ok"`), nil
 			}})
-			e.RegisterActivity("child", &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+			e.RegisterActivityWithName("child", &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 				counter.hit(ctx.ActivityID)
 				time.Sleep(2500 * time.Millisecond) // past the 2s await grace: parents park
 				return json.RawMessage(`"child"`), nil
 			}})
-			e.RegisterActivity("parent", &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+			e.RegisterActivityWithName("parent", &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 				counter.hit(ctx.ActivityID)
 				futs := make([]*ActivityFuture, 0, children)
 				for i := range children {
@@ -410,7 +410,7 @@ func TestStressCrashRecovery(t *testing.T) {
 	crashed := make(chan struct{})
 	var stranded atomic.Int32
 	register := func(e *WorkerEngine, idx int) {
-		e.RegisterActivity("work", &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		e.RegisterActivityWithName("work", &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 			counter.hit(ctx.ActivityID)
 			select {
 			case <-time.After(time.Duration(20+rand.IntN(30)) * time.Millisecond):
@@ -495,7 +495,7 @@ func TestStressIdleAndBurstClaimRate(t *testing.T) {
 			return cb
 		},
 		func(e *WorkerEngine, _ int) {
-			e.RegisterActivity("work", &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+			e.RegisterActivityWithName("work", &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 				counter.hit(ctx.ActivityID)
 				time.Sleep(2 * time.Millisecond)
 				return nil, nil
@@ -557,7 +557,7 @@ func TestStressFailureMix(t *testing.T) {
 		}
 	}
 	es := startEngines(t, dsn, queue, 2, workers, nil, func(e *WorkerEngine, _ int) {
-		e.RegisterActivity("work", &funcHandler{fn: func(ctx ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
+		e.RegisterActivityWithName("work", &funcHandler{fn: func(ctx ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 			n := counter.hit(ctx.ActivityID)
 			var p struct{ I int }
 			_ = json.Unmarshal(payload, &p)

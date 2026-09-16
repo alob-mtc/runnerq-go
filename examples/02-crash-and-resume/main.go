@@ -35,8 +35,6 @@ type FulfillOrder struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
-func (h *FulfillOrder) ActivityType() string { return "fulfill_order" }
-
 func (h *FulfillOrder) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	// Step 1 — reserve inventory.
 	if _, err := ctx.Run("reserve-inventory", func() (json.RawMessage, error) {
@@ -91,7 +89,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("build: %v", err)
 	}
-	engine.RegisterActivity("fulfill_order", &FulfillOrder{})
+	engine.RegisterActivity(&FulfillOrder{})
 
 	// Start the engine; on exit, stop it and wait for the graceful drain to
 	// finish before closing the backend (correct shutdown ordering).
@@ -113,7 +111,7 @@ func main() {
 	// The fixed idempotency key is what makes re-running reattach to the same
 	// workflow rather than starting a new one.
 	future, err := engine.GetActivityExecutor().
-		Activity("fulfill_order").
+		Activity(runnerq.NameOf[FulfillOrder]()).
 		IdempotencyKeyOption(orderID, runnerq.ReturnExisting).
 		Timeout(8 * time.Second).
 		Payload(json.RawMessage(`{"order_id":"` + orderID + `"}`)).

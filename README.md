@@ -182,8 +182,6 @@ import (
 
 type Greeting struct{ runnerq.DefaultDeadLetterHandler }
 
-func (h *Greeting) ActivityType() string { return "greeting" }
-
 func (h *Greeting) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
     greeting, err := ctx.Run("compose", func() (json.RawMessage, error) {
         return json.Marshal("hello, " + string(payload))
@@ -204,11 +202,11 @@ func main() {
     if err != nil {
         log.Fatal(err)
     }
-    engine.RegisterActivity("greeting", &Greeting{})
+    engine.RegisterActivity(&Greeting{}) // serves activity type "Greeting"
     go engine.Start(ctx)
 
     future, _ := engine.GetActivityExecutor().
-        Activity("greeting").
+        Activity(runnerq.NameOf[Greeting]()).
         Payload(json.RawMessage(`"world"`)).
         Execute(ctx)
 

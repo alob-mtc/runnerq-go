@@ -35,8 +35,6 @@ type BillingRun struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
-func (h *BillingRun) ActivityType() string { return "billing_run" }
-
 func (h *BillingRun) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	fmt.Printf("billing_run attempt #%d\n", ctx.RetryCount)
 
@@ -81,7 +79,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("build: %v", err)
 	}
-	engine.RegisterActivity("billing_run", &BillingRun{})
+	engine.RegisterActivity(&BillingRun{})
 
 	// Start the engine; on exit, stop it and wait for the graceful drain to
 	// finish before closing the backend (correct shutdown ordering).
@@ -99,7 +97,7 @@ func main() {
 	}()
 
 	future, err := engine.GetActivityExecutor().
-		Activity("billing_run").
+		Activity(runnerq.NameOf[BillingRun]()).
 		Payload(json.RawMessage(`{"campaign":"june"}`)).
 		Execute(ctx)
 	if err != nil {

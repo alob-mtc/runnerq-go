@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -103,17 +104,58 @@ func (e *WorkerEngine) MaxConcurrentActivities() int {
 	return e.config.MaxConcurrentActivities
 }
 
-// RegisterActivity registers an activity handler for a given activity type.
-func (e *WorkerEngine) RegisterActivity(activityType string, handler ActivityHandler) {
+// RegisterActivity registers a handler under an activity type derived from
+// its Go type name: &ResizeImage{} serves "ResizeImage". NameOf derives the
+// same string for spawns. Panics for handlers whose type has no name (use
+// RegisterActivityWithName), for a type already registered, or once the
+// engine is running.
+//
+// The activity type is persisted with every enqueued activity. Renaming a
+// handler struct therefore strands rows already in the store; pin the name
+// with RegisterActivityWithName where that matters.
+func (e *WorkerEngine) RegisterActivity(handler ActivityHandler) {
+	if isNilHandler(handler) {
+		panic("handler must be non-nil")
+	}
+	activityType, err := activityTypeOf(reflect.TypeOf(handler))
+	if err != nil {
+		panic(err)
+	}
+	e.RegisterActivityWithName(activityType, handler)
+}
+
+// RegisterActivityWithName registers a handler under an explicit activity
+// type. Use it to decouple the persisted type from the handler's Go name, or
+// to serve several types from one handler type. Panics on an empty type or
+// nil handler, a type already registered, or once the engine is running.
+func (e *WorkerEngine) RegisterActivityWithName(activityType string, handler ActivityHandler) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.active {
 		panic("cannot register activities while engine is active")
 	}
-	if activityType == "" || handler == nil {
+	if activityType == "" || isNilHandler(handler) {
 		panic("activity type and handler must be non-empty")
 	}
+	if _, dup := e.handlers[activityType]; dup {
+		panic(fmt.Sprintf("activity type %q is already registered", activityType))
+	}
 	e.handlers[activityType] = handler
+}
+
+// isNilHandler reports whether handler is nil, including a typed nil such as
+// (*ChargeCard)(nil) wrapped in the interface — which compares unequal to nil
+// yet panics (or silently misbehaves) on the first Handle call.
+func isNilHandler(handler ActivityHandler) bool {
+	if handler == nil {
+		return true
+	}
+	v := reflect.ValueOf(handler)
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.Interface:
+		return v.IsNil()
+	}
+	return false
 }
 
 // GetActivityExecutor returns an ActivityExecutor for orchestrating activities.

@@ -33,7 +33,7 @@ func TestRecoveryWorkerProcessHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.RegisterActivity("resilient", &funcHandler{fn: func(c ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+	e.RegisterActivityWithName("resilient", &funcHandler{fn: func(c ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 		_, err := c.Run("charge", func() (json.RawMessage, error) { return json.RawMessage(`{"charged":true}`), nil })
 		if err != nil {
 			return nil, err
@@ -60,7 +60,7 @@ func TestContract_SideEffectExactlyOnceAcrossCrashRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	var rerun atomic.Int32
-	e.RegisterActivity("resilient", &funcHandler{fn: func(c ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+	e.RegisterActivityWithName("resilient", &funcHandler{fn: func(c ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 		return c.Run("charge", func() (json.RawMessage, error) { rerun.Add(1); return json.RawMessage(`"unexpected reexecution"`), nil })
 	}})
 	fut, err := e.GetActivityExecutor().Activity("resilient").Payload(json.RawMessage(`{}`)).Execute(ctx)
@@ -168,7 +168,7 @@ func TestEngineReconcilesLostPostgresCompletionReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	var runs atomic.Int32
-	e.RegisterActivity("receipt", &funcHandler{fn: func(ActivityContext, json.RawMessage) (json.RawMessage, error) {
+	e.RegisterActivityWithName("receipt", &funcHandler{fn: func(ActivityContext, json.RawMessage) (json.RawMessage, error) {
 		runs.Add(1)
 		return json.RawMessage(`"original"`), nil
 	}})
@@ -194,7 +194,7 @@ func TestEngineReconcilesLostPostgresCompletionReply(t *testing.T) {
 
 func TestRehydratedFutureRegistersIndependentConsumers(t *testing.T) {
 	rig := newStepsRig(t, func(e *WorkerEngine) {
-		e.RegisterActivity("producer", &funcHandler{fn: func(c ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		e.RegisterActivityWithName("producer", &funcHandler{fn: func(c ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 			select {
 			case <-time.After(3 * time.Second):
 				return json.RawMessage(`"shared"`), nil
@@ -202,7 +202,7 @@ func TestRehydratedFutureRegistersIndependentConsumers(t *testing.T) {
 				return nil, c.Ctx.Err()
 			}
 		}})
-		e.RegisterActivity("consumer", &funcHandler{fn: func(c ActivityContext, p json.RawMessage) (json.RawMessage, error) {
+		e.RegisterActivityWithName("consumer", &funcHandler{fn: func(c ActivityContext, p json.RawMessage) (json.RawMessage, error) {
 			var id uuid.UUID
 			if err := json.Unmarshal(p, &id); err != nil {
 				return nil, err

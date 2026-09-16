@@ -248,6 +248,12 @@ already exist (idempotency table, permanent results table, lineage columns):
 - No OpenTelemetry trace propagation across the enqueue→dequeue boundary.
 - No injectable logger — everything uses the global slog default.
 - `GetActivityEvents`/`GetResult` don't filter by queue_name (postgres.go:709, 1122-1128).
+- ◐ Activity naming API (Sept 2026): `ActivityType()` dropped from the handler
+  interface; `RegisterActivity(h)` derives the type from the Go type name,
+  `RegisterActivityWithName` pins it, `NameOf[T]()` names spawns. Deferred until
+  go.mod moves to 1.27 (generic methods): make `ActivityExecutor` a concrete type
+  so spawns read `ctx.ActivityExecutor.Activity[child]()`, with `ActivityNamed`
+  for pinned/cross-process names.
 
 ---
 

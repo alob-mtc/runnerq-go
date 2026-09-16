@@ -6,7 +6,7 @@ activity, so the work runs once no matter how many times the event arrives.
 
 ## What this shows
 
-A `/webhook` endpoint enqueues a `process_event` activity keyed by the event
+A `/webhook` endpoint enqueues a `ProcessEvent` activity keyed by the event
 ID with `ReturnExisting`. The program delivers one event three times and a
 second event once; the processor runs twice total.
 
@@ -31,7 +31,7 @@ delivering webhooks: first event ×3, second event ×1
 
 ```go
 engine.GetActivityExecutor().
-    Activity("process_event").
+    Activity(runnerq.NameOf[ProcessEvent]()).
     IdempotencyKeyOption(eventID, runnerq.ReturnExisting).   // dedup on the event ID
     Payload(payload).
     Execute(ctx)

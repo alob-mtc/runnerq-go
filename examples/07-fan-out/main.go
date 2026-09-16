@@ -31,8 +31,6 @@ type ProcessDocument struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
-func (h *ProcessDocument) ActivityType() string { return "process_document" }
-
 func (h *ProcessDocument) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	pages := []string{"intro", "body", "appendix"}
 
@@ -42,7 +40,7 @@ func (h *ProcessDocument) Handle(ctx runnerq.ActivityContext, payload json.RawMe
 	for i, page := range pages {
 		p, _ := json.Marshal(map[string]any{"page": page, "index": i})
 		fut, err := ctx.ActivityExecutor.
-			Activity("process_page").
+			Activity(runnerq.NameOf[ProcessPage]()).
 			Step(fmt.Sprintf("page-%d", i)).
 			Payload(p).
 			Execute(ctx.Ctx)
@@ -77,8 +75,6 @@ type ProcessPage struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
-func (h *ProcessPage) ActivityType() string { return "process_page" }
-
 func (h *ProcessPage) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	var in struct {
 		Page  string `json:"page"`
@@ -104,8 +100,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("build: %v", err)
 	}
-	engine.RegisterActivity("process_document", &ProcessDocument{})
-	engine.RegisterActivity("process_page", &ProcessPage{})
+	engine.RegisterActivity(&ProcessDocument{})
+	engine.RegisterActivity(&ProcessPage{})
 
 	// Start the engine; on exit, stop it and wait for the graceful drain to
 	// finish before closing the backend (correct shutdown ordering).
@@ -123,7 +119,7 @@ func main() {
 	}()
 
 	future, err := engine.GetActivityExecutor().
-		Activity("process_document").
+		Activity(runnerq.NameOf[ProcessDocument]()).
 		Payload(json.RawMessage(`{"doc":"report.pdf"}`)).
 		Execute(ctx)
 	if err != nil {

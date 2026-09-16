@@ -60,8 +60,8 @@ func TestRetentionSweepsCompletedWorkflowEndToEnd(t *testing.T) {
 		}
 		return fut.GetResult(ctx.Ctx)
 	}}
-	engine.RegisterActivity("root", parent)
-	engine.RegisterActivity("leaf", child)
+	engine.RegisterActivityWithName("root", parent)
+	engine.RegisterActivityWithName("leaf", child)
 
 	startDone := make(chan error, 1)
 	go func() { startDone <- engine.Start(ctx) }()

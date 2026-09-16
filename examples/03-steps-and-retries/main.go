@@ -34,15 +34,13 @@ type ProcessOrder struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
-func (h *ProcessOrder) ActivityType() string { return "process_order" }
-
 func (h *ProcessOrder) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	fmt.Printf("process_order attempt #%d\n", ctx.RetryCount)
 
 	// Spawn the reserve child as a named step. On a parent retry this exact
 	// spawn reattaches to the existing child instead of creating a new one.
 	fut, err := ctx.ActivityExecutor.
-		Activity("reserve_inventory").
+		Activity(runnerq.NameOf[ReserveInventory]()).
 		Step("reserve").
 		Payload(payload).
 		Execute(ctx.Ctx)
@@ -70,8 +68,6 @@ type ReserveInventory struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
-func (h *ReserveInventory) ActivityType() string { return "reserve_inventory" }
-
 func (h *ReserveInventory) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	n := reserveRuns.Add(1)
 	fmt.Printf("    ▶ reserve_inventory EXECUTING (run #%d)\n", n)
@@ -90,8 +86,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("build: %v", err)
 	}
-	engine.RegisterActivity("process_order", &ProcessOrder{})
-	engine.RegisterActivity("reserve_inventory", &ReserveInventory{})
+	engine.RegisterActivity(&ProcessOrder{})
+	engine.RegisterActivity(&ReserveInventory{})
 
 	// Start the engine; on exit, stop it and wait for the graceful drain to
 	// finish before closing the backend (correct shutdown ordering).
@@ -109,7 +105,7 @@ func main() {
 	}()
 
 	future, err := engine.GetActivityExecutor().
-		Activity("process_order").
+		Activity(runnerq.NameOf[ProcessOrder]()).
 		Payload(json.RawMessage(`{"order_id":"42"}`)).
 		Execute(ctx)
 	if err != nil {

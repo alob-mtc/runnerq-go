@@ -31,8 +31,6 @@ type ExpenseApproval struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
-func (h *ExpenseApproval) ActivityType() string { return "expense_approval" }
-
 func (h *ExpenseApproval) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	if _, err := ctx.Run("file-request", func() (json.RawMessage, error) {
 		fmt.Println("  ▶ expense filed, routing for approval")
@@ -69,7 +67,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("build: %v", err)
 	}
-	engine.RegisterActivity("expense_approval", &ExpenseApproval{})
+	engine.RegisterActivity(&ExpenseApproval{})
 
 	// Start the engine; on exit, stop it and wait for the graceful drain to
 	// finish before closing the backend (correct shutdown ordering).
@@ -88,7 +86,7 @@ func main() {
 
 	// Start the workflow; its activity ID is the handle we signal.
 	future, err := engine.GetActivityExecutor().
-		Activity("expense_approval").
+		Activity(runnerq.NameOf[ExpenseApproval]()).
 		Payload(json.RawMessage(`{"amount":4200,"who":"katherine"}`)).
 		Execute(ctx)
 	if err != nil {

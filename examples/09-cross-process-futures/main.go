@@ -33,8 +33,6 @@ type ResizeImage struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
-func (h *ResizeImage) ActivityType() string { return "resize_image" }
-
 func (h *ResizeImage) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	time.Sleep(2 * time.Second) // simulate real work
 	return json.RawMessage(`{"width":800,"height":600}`), nil
@@ -52,7 +50,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("build: %v", err)
 	}
-	engine.RegisterActivity("resize_image", &ResizeImage{})
+	engine.RegisterActivity(&ResizeImage{})
 
 	engineDone := make(chan struct{})
 	go func() {
@@ -72,7 +70,7 @@ func main() {
 	// POST /jobs — enqueue and return the activity ID. The caller polls with it.
 	mux.HandleFunc("POST /jobs", func(w http.ResponseWriter, r *http.Request) {
 		fut, err := engine.GetActivityExecutor().
-			Activity("resize_image").
+			Activity(runnerq.NameOf[ResizeImage]()).
 			Payload(json.RawMessage(`{"src":"photo.jpg"}`)).
 			Execute(r.Context())
 		if err != nil {

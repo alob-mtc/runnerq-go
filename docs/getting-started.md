@@ -30,14 +30,15 @@ tuning, use `postgres.WithConfig` (see [Configuration](configuration.md)).
 ## Write a workflow
 
 A workflow is an activity handler — a type implementing `ActivityHandler`.
-Embed `DefaultDeadLetterHandler` unless you need a dead-letter callback.
+Embed `DefaultDeadLetterHandler` unless you need a dead-letter callback. The
+handler's type name doubles as its activity type (`Greeting` here); see
+[Workflows & Activities](workflows.md#naming-activities) for pinning a name
+explicitly.
 
 ```go
 type Greeting struct {
     runnerq.DefaultDeadLetterHandler
 }
-
-func (h *Greeting) ActivityType() string { return "greeting" }
 
 func (h *Greeting) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
     name := string(payload)
@@ -55,7 +56,7 @@ engine, err := runnerq.Builder().
 if err != nil {
     log.Fatal(err)
 }
-engine.RegisterActivity("greeting", &Greeting{})
+engine.RegisterActivity(&Greeting{}) // serves activity type "Greeting"
 
 // Start blocks until the context is cancelled or a SIGINT/SIGTERM arrives.
 go engine.Start(ctx)
@@ -65,7 +66,7 @@ go engine.Start(ctx)
 
 ```go
 future, err := engine.GetActivityExecutor().
-    Activity("greeting").
+    Activity(runnerq.NameOf[Greeting]()).
     Payload(json.RawMessage(`"world"`)).
     Execute(ctx)
 if err != nil {

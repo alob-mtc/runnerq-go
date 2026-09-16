@@ -36,8 +36,8 @@ func TestParentParksAwaitingSlowChild(t *testing.T) {
 	}}
 
 	rig := newStepsRig(t, func(e *WorkerEngine) {
-		e.RegisterActivity("parent", parent)
-		e.RegisterActivity("slow_child", child)
+		e.RegisterActivityWithName("parent", parent)
+		e.RegisterActivityWithName("slow_child", child)
 	})
 
 	fut, err := rig.engine.GetActivityExecutor().
@@ -98,8 +98,8 @@ func TestAwaitFastChildStaysInProcess(t *testing.T) {
 	}}
 
 	rig := newStepsRig(t, func(e *WorkerEngine) {
-		e.RegisterActivity("parent_fast", parent)
-		e.RegisterActivity("fast_child", child)
+		e.RegisterActivityWithName("parent_fast", parent)
+		e.RegisterActivityWithName("fast_child", child)
 	})
 
 	fut, err := rig.engine.GetActivityExecutor().
@@ -151,9 +151,9 @@ func TestAwaitChainWakesRecursively(t *testing.T) {
 	}}
 
 	rig := newStepsRig(t, func(e *WorkerEngine) {
-		e.RegisterActivity("chain_root", root)
-		e.RegisterActivity("chain_mid", mid)
-		e.RegisterActivity("chain_leaf", leaf)
+		e.RegisterActivityWithName("chain_root", root)
+		e.RegisterActivityWithName("chain_mid", mid)
+		e.RegisterActivityWithName("chain_leaf", leaf)
 	})
 
 	fut, err := rig.engine.GetActivityExecutor().
@@ -200,8 +200,8 @@ func TestWaitAllFanOut(t *testing.T) {
 	}}
 
 	rig := newStepsRig(t, func(e *WorkerEngine) {
-		e.RegisterActivity("fanout", parent)
-		e.RegisterActivity("echo", child)
+		e.RegisterActivityWithName("fanout", parent)
+		e.RegisterActivityWithName("echo", child)
 	})
 
 	fut, err := rig.engine.GetActivityExecutor().
@@ -233,7 +233,7 @@ func TestDelayScheduledNotWokenBySignal(t *testing.T) {
 		startedAt.Store(time.Now().UnixMilli())
 		return json.RawMessage(`{}`), nil
 	}}
-	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("delayed", h) })
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("delayed", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
 		Activity("delayed").
