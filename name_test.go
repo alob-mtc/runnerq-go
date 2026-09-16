@@ -37,6 +37,8 @@ func TestRegisterActivityDerivesNameAndRejectsBadInput(t *testing.T) {
 	// Duplicate names are a configuration bug, for pinned names too.
 	mustPanic(t, func() { e.RegisterActivityWithName("namedHandler", &funcHandler{}) })
 	mustPanic(t, func() { e.RegisterActivity(nil) })
+	mustPanic(t, func() { e.RegisterActivity((*namedHandler)(nil)) })
+	mustPanic(t, func() { e.RegisterActivityWithName("typed-nil", (*namedHandler)(nil)) })
 	mustPanic(t, func() { e.RegisterActivityWithName("", &funcHandler{}) })
 	mustPanic(t, func() { e.RegisterActivityWithName("x", nil) })
 

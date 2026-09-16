@@ -61,6 +61,25 @@ Prefer a pinned name when:
 `"resize_image"` must be spawned as `"resize_image"`, not
 `NameOf[ResizeImage]()`.
 
+### Migrating from explicit names (v0.4 and earlier)
+
+Activities already in the store keep the type string they were enqueued
+with. If a deploy switches `ChargeCard` from `"charge_card"` to the derived
+`"ChargeCard"`, every queued, parked, or scheduled `"charge_card"` row is
+dispatched with no matching handler and fails as `handler_not_found`.
+
+Keep the old string until the store has drained it:
+
+```go
+// Before: engine.RegisterActivity("charge_card", &ChargeCard{})
+engine.RegisterActivityWithName("charge_card", &ChargeCard{})
+executor.Activity("charge_card").Payload(p).Execute(ctx)
+```
+
+Producers that enqueue by string — other services, other languages — must
+keep sending the legacy type as well, since `NameOf` only reflects the Go
+type name and never consults the store.
+
 ## The activity context
 
 `ActivityContext` carries everything a handler needs:

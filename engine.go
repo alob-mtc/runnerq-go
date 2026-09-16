@@ -114,7 +114,7 @@ func (e *WorkerEngine) MaxConcurrentActivities() int {
 // handler struct therefore strands rows already in the store; pin the name
 // with RegisterActivityWithName where that matters.
 func (e *WorkerEngine) RegisterActivity(handler ActivityHandler) {
-	if handler == nil {
+	if isNilHandler(handler) {
 		panic("handler must be non-nil")
 	}
 	activityType, err := activityTypeOf(reflect.TypeOf(handler))
@@ -134,13 +134,28 @@ func (e *WorkerEngine) RegisterActivityWithName(activityType string, handler Act
 	if e.active {
 		panic("cannot register activities while engine is active")
 	}
-	if activityType == "" || handler == nil {
+	if activityType == "" || isNilHandler(handler) {
 		panic("activity type and handler must be non-empty")
 	}
 	if _, dup := e.handlers[activityType]; dup {
 		panic(fmt.Sprintf("activity type %q is already registered", activityType))
 	}
 	e.handlers[activityType] = handler
+}
+
+// isNilHandler reports whether handler is nil, including a typed nil such as
+// (*ChargeCard)(nil) wrapped in the interface — which compares unequal to nil
+// yet panics (or silently misbehaves) on the first Handle call.
+func isNilHandler(handler ActivityHandler) bool {
+	if handler == nil {
+		return true
+	}
+	v := reflect.ValueOf(handler)
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.Interface:
+		return v.IsNil()
+	}
+	return false
 }
 
 // GetActivityExecutor returns an ActivityExecutor for orchestrating activities.
