@@ -142,6 +142,20 @@ func validateQueueName(name string) error {
 const schemaAdvisoryLockKey int64 = 0x52554E4E45525121 // "RUNNERQ!"
 
 func (b *PostgresBackend) initSchema(ctx context.Context) error {
+	conn, err := b.pool.Acquire(ctx)
+	if err != nil {
+		return databaseError(err, fmt.Sprintf("Failed to acquire connection for schema init: %v", err))
+	}
+	defer conn.Release()
+
+	// Fast path: nothing to create means no DDL, no advisory lock, and no
+	// table locks taken against live traffic (see schema_check.go).
+	if current, err := schemaCurrent(ctx, conn); err != nil {
+		return err
+	} else if current {
+		return nil
+	}
+
 	// Schema init must be serialized: ALTER TABLE takes ACCESS EXCLUSIVE
 	// before evaluating IF NOT EXISTS, so two backends initializing
 	// concurrently (multiple engine processes booting, parallel tests) take
@@ -149,12 +163,6 @@ func (b *PostgresBackend) initSchema(ctx context.Context) error {
 	// "deadlock detected" (SQLSTATE 40P01). A session-level advisory lock on
 	// a dedicated connection makes inits run one at a time; the lock
 	// auto-releases if the session dies.
-	conn, err := b.pool.Acquire(ctx)
-	if err != nil {
-		return databaseError(err, fmt.Sprintf("Failed to acquire connection for schema init: %v", err))
-	}
-	defer conn.Release()
-
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, schemaAdvisoryLockKey); err != nil {
 		return databaseError(err, fmt.Sprintf("Failed to acquire schema lock: %v", err))
 	}
@@ -168,25 +176,38 @@ func (b *PostgresBackend) initSchema(ctx context.Context) error {
 		}
 	}()
 
-	if _, err := conn.Exec(ctx, schemaSql); err != nil {
+	// Another process may have finished the migration while we waited for
+	// the lock; the DDL is idempotent, but skipping it avoids its locks.
+	if current, err := schemaCurrent(ctx, conn); err != nil {
+		return err
+	} else if current {
+		return nil
+	}
+
+	// The DDL runs against whatever traffic other processes are serving and
+	// can be chosen as a deadlock victim; it is idempotent, so retry.
+	err = retryDeadlock(ctx, "schema", func() error {
+		_, err := conn.Exec(ctx, schemaSql)
+		return err
+	})
+	if err != nil {
 		return databaseError(err, fmt.Sprintf("Failed to initialize schema: %v", err))
 	}
 
-	if err := b.ensureDequeueIndexes(ctx, conn); err != nil {
-		return err
-	}
-	return nil
+	return b.ensureDequeueIndexes(ctx, conn)
 }
 
 // dequeueIndexes are the hot claim-path indexes, built CONCURRENTLY (outside
 // schemaSql) so their creation never takes the SHARE lock that would block
 // every write on runnerq_activities during the build. dropAfter names the
 // previous version, removed only once the replacement is valid.
-var dequeueIndexes = []struct {
+type dequeueIndex struct {
 	name      string
 	ddl       string
 	dropAfter string
-}{
+}
+
+var dequeueIndexes = []dequeueIndex{
 	{
 		// Serves the single-type dequeue form: with activity_type pinned by
 		// equality, the remaining key columns match the dequeue ORDER BY
@@ -230,6 +251,18 @@ var dequeueIndexes = []struct {
 // is valid, so the claim path is never left unindexed.
 func (b *PostgresBackend) ensureDequeueIndexes(ctx context.Context, conn *pgxpool.Conn) error {
 	for _, idx := range dequeueIndexes {
+		// Re-running the whole step after a deadlock is what makes it safe:
+		// a CONCURRENTLY build killed mid-way leaves an INVALID index that
+		// the inspection below drops before rebuilding.
+		if err := retryDeadlock(ctx, idx.name, func() error { return b.ensureDequeueIndex(ctx, conn, idx) }); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *PostgresBackend) ensureDequeueIndex(ctx context.Context, conn *pgxpool.Conn, idx dequeueIndex) error {
+	{
 		var valid *bool
 		err := conn.QueryRow(ctx, `
 			SELECT i.indisvalid
@@ -251,7 +284,7 @@ func (b *PostgresBackend) ensureDequeueIndexes(ctx context.Context, conn *pgxpoo
 			if _, err := conn.Exec(ctx, "DROP INDEX IF EXISTS "+pgx.Identifier{idx.dropAfter}.Sanitize()); err != nil {
 				return databaseError(err, fmt.Sprintf("Failed to drop superseded index %s: %v", idx.dropAfter, err))
 			}
-			continue
+			return nil
 		}
 
 		if _, err := conn.Exec(ctx, idx.ddl); err != nil {

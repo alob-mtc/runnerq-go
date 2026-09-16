@@ -33,11 +33,16 @@ func testBackend(t *testing.T) *PostgresBackend {
 // the same queue name simulate separate processes sharing a database.
 func testBackendNamed(t *testing.T, queueName string) *PostgresBackend {
 	t.Helper()
+	return testBackendNamedCtx(t, context.Background(), queueName)
+}
+
+func testBackendNamedCtx(t *testing.T, ctx context.Context, queueName string) *PostgresBackend {
+	t.Helper()
 	dsn := os.Getenv("RUNNERQ_TEST_DSN")
 	if dsn == "" {
 		t.Skip("RUNNERQ_TEST_DSN not set; skipping integration test")
 	}
-	b, err := WithConfig(context.Background(), dsn, queueName, 30_000, 5)
+	b, err := WithConfig(ctx, dsn, queueName, 30_000, 5)
 	if err != nil {
 		t.Fatalf("connect backend: %v", err)
 	}
