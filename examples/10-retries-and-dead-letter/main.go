@@ -31,8 +31,6 @@ var attempts atomic.Int32
 // DefaultDeadLetterHandler — it implements OnDeadLetter itself.
 type ChargeCard struct{}
 
-func (h *ChargeCard) ActivityType() string { return "charge_card" }
-
 func (h *ChargeCard) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	n := attempts.Add(1)
 	fmt.Printf("  ▶ attempt #%d (RetryCount=%d) — calling gateway...\n", n, ctx.RetryCount)
@@ -56,7 +54,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("build: %v", err)
 	}
-	engine.RegisterActivity("charge_card", &ChargeCard{})
+	engine.RegisterActivity(&ChargeCard{})
 
 	engineDone := make(chan struct{})
 	go func() {
@@ -72,7 +70,7 @@ func main() {
 	}()
 
 	future, err := engine.GetActivityExecutor().
-		Activity("charge_card").
+		Activity(runnerq.NameOf[ChargeCard]()).
 		MaxRetries(2). // 2 attempts, then dead-letter
 		Payload(json.RawMessage(`{"amount":4200}`)).
 		Execute(ctx)

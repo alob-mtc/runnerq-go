@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -103,8 +104,31 @@ func (e *WorkerEngine) MaxConcurrentActivities() int {
 	return e.config.MaxConcurrentActivities
 }
 
-// RegisterActivity registers an activity handler for a given activity type.
-func (e *WorkerEngine) RegisterActivity(activityType string, handler ActivityHandler) {
+// RegisterActivity registers a handler under an activity type derived from
+// its Go type name: &ResizeImage{} serves "ResizeImage". NameOf derives the
+// same string for spawns. Panics for handlers whose type has no name (use
+// RegisterActivityWithName), for a type already registered, or once the
+// engine is running.
+//
+// The activity type is persisted with every enqueued activity. Renaming a
+// handler struct therefore strands rows already in the store; pin the name
+// with RegisterActivityWithName where that matters.
+func (e *WorkerEngine) RegisterActivity(handler ActivityHandler) {
+	if handler == nil {
+		panic("handler must be non-nil")
+	}
+	activityType, err := activityTypeOf(reflect.TypeOf(handler))
+	if err != nil {
+		panic(err)
+	}
+	e.RegisterActivityWithName(activityType, handler)
+}
+
+// RegisterActivityWithName registers a handler under an explicit activity
+// type. Use it to decouple the persisted type from the handler's Go name, or
+// to serve several types from one handler type. Panics on an empty type or
+// nil handler, a type already registered, or once the engine is running.
+func (e *WorkerEngine) RegisterActivityWithName(activityType string, handler ActivityHandler) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.active {
@@ -112,6 +136,9 @@ func (e *WorkerEngine) RegisterActivity(activityType string, handler ActivityHan
 	}
 	if activityType == "" || handler == nil {
 		panic("activity type and handler must be non-empty")
+	}
+	if _, dup := e.handlers[activityType]; dup {
+		panic(fmt.Sprintf("activity type %q is already registered", activityType))
 	}
 	e.handlers[activityType] = handler
 }

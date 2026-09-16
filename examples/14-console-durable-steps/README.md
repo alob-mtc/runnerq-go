@@ -3,7 +3,7 @@
 A focused visual test for the console's durable-execution views (the Steps tab
 and the "Blocked on" banner).
 
-Each `process_payment` workflow walks through every durable primitive:
+Each `ProcessPayment` workflow walks through every durable primitive:
 
 | Step | Primitive | What you see in the console |
 |------|-----------|------------------------------|

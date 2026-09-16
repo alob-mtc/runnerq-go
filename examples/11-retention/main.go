@@ -28,8 +28,6 @@ type QuickJob struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
-func (h *QuickJob) ActivityType() string { return "quick_job" }
-
 func (h *QuickJob) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	return json.RawMessage(`{"done":true}`), nil
 }
@@ -54,7 +52,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("build: %v", err)
 	}
-	engine.RegisterActivity("quick_job", &QuickJob{})
+	engine.RegisterActivity(&QuickJob{})
 
 	engineDone := make(chan struct{})
 	go func() {
@@ -70,7 +68,7 @@ func main() {
 	}()
 
 	future, err := engine.GetActivityExecutor().
-		Activity("quick_job").
+		Activity(runnerq.NameOf[QuickJob]()).
 		Payload(json.RawMessage(`{}`)).
 		Execute(ctx)
 	if err != nil {

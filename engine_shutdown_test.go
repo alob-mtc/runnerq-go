@@ -23,8 +23,6 @@ type slowHandler struct {
 	calls atomic.Int32
 }
 
-func (h *slowHandler) ActivityType() string { return "slow" }
-
 func (h *slowHandler) Handle(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 	h.calls.Add(1)
 	select {
@@ -62,7 +60,7 @@ func TestGracefulShutdownCompletesInFlightActivity(t *testing.T) {
 		t.Fatalf("build engine: %v", err)
 	}
 	handler := &slowHandler{dur: 1500 * time.Millisecond}
-	engine.RegisterActivity("slow", handler)
+	engine.RegisterActivityWithName("slow", handler)
 
 	startDone := make(chan error, 1)
 	go func() { startDone <- engine.Start(ctx) }()
@@ -137,7 +135,7 @@ func TestConcurrentStopDoesNotPanic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build engine: %v", err)
 	}
-	engine.RegisterActivity("slow", &slowHandler{dur: time.Millisecond})
+	engine.RegisterActivityWithName("slow", &slowHandler{dur: time.Millisecond})
 
 	startDone := make(chan error, 1)
 	go func() { startDone <- engine.Start(ctx) }()

@@ -104,7 +104,7 @@ func TestContract_NoLostNoDuplicateWork_ConcurrentFleets(t *testing.T) {
 		if err != nil {
 			t.Fatalf("build engine %d: %v", f, err)
 		}
-		e.RegisterActivity("unit", &funcHandler{fn: fn})
+		e.RegisterActivityWithName("unit", &funcHandler{fn: fn})
 		engines = append(engines, e)
 	}
 
@@ -167,7 +167,7 @@ func TestContract_ConcurrentIdempotentEnqueue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	e.RegisterActivity("once", &funcHandler{fn: func(_ ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+	e.RegisterActivityWithName("once", &funcHandler{fn: func(_ ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 		runs.Add(1)
 		return json.RawMessage(`{"ok":true}`), nil
 	}})

@@ -24,6 +24,6 @@
 //	    MaxWorkers(8).
 //	    Build()
 //
-//	engine.RegisterActivity("send_email", &SendEmailHandler{})
+//	engine.RegisterActivity(&SendEmail{}) // serves activity type "SendEmail"
 //	engine.Start(ctx)
 package runnerq

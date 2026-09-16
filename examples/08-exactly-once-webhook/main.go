@@ -37,8 +37,6 @@ type ProcessEvent struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
-func (h *ProcessEvent) ActivityType() string { return "process_event" }
-
 func (h *ProcessEvent) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	var in struct {
 		EventID string `json:"event_id"`
@@ -66,7 +64,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("build: %v", err)
 	}
-	engine.RegisterActivity("process_event", &ProcessEvent{})
+	engine.RegisterActivity(&ProcessEvent{})
 
 	engineDone := make(chan struct{})
 	go func() {
@@ -92,7 +90,7 @@ func main() {
 		}
 		payload, _ := json.Marshal(map[string]string{"event_id": eventID})
 		_, err := engine.GetActivityExecutor().
-			Activity("process_event").
+			Activity(runnerq.NameOf[ProcessEvent]()).
 			IdempotencyKeyOption(eventID, runnerq.ReturnExisting).
 			Payload(payload).
 			Execute(r.Context())

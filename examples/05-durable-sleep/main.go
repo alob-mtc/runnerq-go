@@ -31,8 +31,6 @@ type Onboarding struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
-func (h *Onboarding) ActivityType() string { return "onboarding" }
-
 func (h *Onboarding) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	if _, err := ctx.Run("send-welcome", func() (json.RawMessage, error) {
 		fmt.Printf("  ▶ %s  welcome email sent\n", time.Now().Format("15:04:05"))
@@ -69,7 +67,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("build: %v", err)
 	}
-	engine.RegisterActivity("onboarding", &Onboarding{})
+	engine.RegisterActivity(&Onboarding{})
 
 	// Start the engine; on exit, stop it and wait for the graceful drain to
 	// finish before closing the backend (correct shutdown ordering).
@@ -87,7 +85,7 @@ func main() {
 	}()
 
 	future, err := engine.GetActivityExecutor().
-		Activity("onboarding").
+		Activity(runnerq.NameOf[Onboarding]()).
 		Payload(json.RawMessage(`{"user":"grace"}`)).
 		Execute(ctx)
 	if err != nil {

@@ -40,7 +40,7 @@ func TestSignalBufferedBeforeWait(t *testing.T) {
 		t.Fatalf("build engine: %v", err)
 	}
 	var invocations atomic.Int32
-	engine.RegisterActivity("approve_me", &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+	engine.RegisterActivityWithName("approve_me", &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 		invocations.Add(1)
 		return ctx.WaitForSignal("approval", 0)
 	}})
@@ -95,7 +95,7 @@ func TestSignalWakesParkedWaiterAcrossProcesses(t *testing.T) {
 		invocations.Add(1)
 		return ctx.WaitForSignal("human-approval", 0)
 	}}
-	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("gate", h) })
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("gate", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
 		Activity("gate").Payload(json.RawMessage(`{}`)).Execute(context.Background())
@@ -156,7 +156,7 @@ func TestSignalTimeoutInProcess(t *testing.T) {
 		}
 		return json.RawMessage(`{"timed_out":true}`), nil
 	}}
-	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("waiter", h) })
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("waiter", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
 		Activity("waiter").Payload(json.RawMessage(`{}`)).Execute(context.Background())
@@ -198,7 +198,7 @@ func TestSignalTimeoutSurvivesPark(t *testing.T) {
 		}
 		return nil, NewNonRetryError("signal unexpectedly delivered")
 	}}
-	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("slow_gate", h) })
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("slow_gate", h) })
 
 	start := time.Now()
 	fut, err := rig.engine.GetActivityExecutor().
@@ -261,7 +261,7 @@ func TestSignalByKeyWakesWorkflowOwningKey(t *testing.T) {
 		invocations.Add(1)
 		return ctx.WaitForSignal("settled", 0) // park until signalled
 	}}
-	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("xfer", h) })
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("xfer", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
 		Activity("xfer").
@@ -303,7 +303,7 @@ func TestSignalRecordedWithName(t *testing.T) {
 	h := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 		return ctx.WaitForSignal("approve", 0)
 	}}
-	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivity("gate", h) })
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("gate", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().Activity("gate").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {

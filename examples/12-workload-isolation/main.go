@@ -29,18 +29,18 @@ import (
 // Per-fleet counters, tagged by which engine's handler ran.
 var notif, reports, finance atomic.Int32
 
-func handler(activityType string, counter *atomic.Int32, work time.Duration) runnerq.ActivityHandler {
-	return &countingHandler{activityType: activityType, counter: counter, work: work}
+// One handler type serves several activity types, so each registration pins
+// its name with RegisterActivityWithName.
+func handler(counter *atomic.Int32, work time.Duration) runnerq.ActivityHandler {
+	return &countingHandler{counter: counter, work: work}
 }
 
 type countingHandler struct {
 	runnerq.DefaultDeadLetterHandler
-	activityType string
-	counter      *atomic.Int32
-	work         time.Duration
+	counter *atomic.Int32
+	work    time.Duration
 }
 
-func (h *countingHandler) ActivityType() string { return h.activityType }
 func (h *countingHandler) Handle(_ runnerq.ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 	h.counter.Add(1)
 	time.Sleep(h.work)
@@ -58,16 +58,16 @@ func main() {
 
 	// Notifications fleet — only send_email / send_sms.
 	notifEngine := mustBuild(backend, []string{"send_email", "send_sms"})
-	notifEngine.RegisterActivity("send_email", handler("send_email", &notif, 200*time.Millisecond))
-	notifEngine.RegisterActivity("send_sms", handler("send_sms", &notif, 200*time.Millisecond))
+	notifEngine.RegisterActivityWithName("send_email", handler(&notif, 200*time.Millisecond))
+	notifEngine.RegisterActivityWithName("send_sms", handler(&notif, 200*time.Millisecond))
 
 	// Reports fleet — only generate_report (slow; isolated so it can't starve notifications).
 	reportEngine := mustBuild(backend, []string{"generate_report"})
-	reportEngine.RegisterActivity("generate_report", handler("generate_report", &reports, time.Second))
+	reportEngine.RegisterActivityWithName("generate_report", handler(&reports, time.Second))
 
 	// Finance fleet — only reconcile_ledger.
 	financeEngine := mustBuild(backend, []string{"reconcile_ledger"})
-	financeEngine.RegisterActivity("reconcile_ledger", handler("reconcile_ledger", &finance, 300*time.Millisecond))
+	financeEngine.RegisterActivityWithName("reconcile_ledger", handler(&finance, 300*time.Millisecond))
 
 	engines := []*runnerq.WorkerEngine{notifEngine, reportEngine, financeEngine}
 	var dones []chan struct{}

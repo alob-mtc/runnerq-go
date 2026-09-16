@@ -9,7 +9,6 @@ handler.
 
 ```go
 type ActivityHandler interface {
-    ActivityType() string
     Handle(ctx ActivityContext, payload json.RawMessage) (json.RawMessage, error)
     OnDeadLetter(ctx ActivityContext, payload json.RawMessage, errorMsg string)
 }
@@ -26,6 +25,41 @@ A handler returns:
 - any other non-nil `error` — treated as retryable.
 
 See [Retries & Dead Letter](retries-and-dead-letter.md) for the failure model.
+
+## Naming activities
+
+Every activity carries a type string that routes it to a handler. Registration
+decides that string, not the handler:
+
+```go
+// Derived from the handler's Go type name: "ResizeImage".
+engine.RegisterActivity(&ResizeImage{})
+
+// Pinned explicitly.
+engine.RegisterActivityWithName("resize_image", &ResizeImage{})
+```
+
+Derivation uses the bare type name — no package prefix, no case changes — and
+panics for unnamed types (anonymous structs) and duplicate registrations.
+`runnerq.NameOf[T]()` derives the same string for spawns, so a caller with the
+handler type in scope never repeats it by hand:
+
+```go
+exec.Activity(runnerq.NameOf[ResizeImage]()).Payload(p).Execute(ctx)
+```
+
+Prefer a pinned name when:
+
+- **The type is persisted.** Every enqueued row stores its activity type, so
+  renaming a handler struct strands whatever is already queued, parked, or
+  scheduled. A pinned name decouples the store from Go identifiers.
+- **One handler type serves several activity types**, as in
+  [workload isolation](../examples/12-workload-isolation).
+- **Producers are outside this Go module** and enqueue by string.
+
+`NameOf` knows nothing about registration: a handler pinned under
+`"resize_image"` must be spawned as `"resize_image"`, not
+`NameOf[ResizeImage]()`.
 
 ## The activity context
 
