@@ -70,6 +70,12 @@ func (q *scriptedBatchQueue) MarkCompleted(ctx context.Context, _ *activity, _ j
 	return nil
 }
 
+// MarkFailed absorbs the failure a gated handler reports when test cleanup
+// cancels its context; nothing observes it.
+func (q *scriptedBatchQueue) MarkFailed(context.Context, *activity, string, bool, string) (bool, error) {
+	return false, nil
+}
+
 // gatedHandler holds every activity until the test releases it and records
 // the peak number of activities running at once.
 type gatedHandler struct {
@@ -123,6 +129,9 @@ func newClaims(n int) []claimedActivity {
 
 // startDispatcher runs the dispatcher with the given capacity and returns a
 // channel closed when it exits plus the cancel for its intake context.
+// Cleanup cancels intake and then the handler context, so a gated handler
+// still blocked after a failed assertion unwinds instead of holding the
+// dispatcher (and the test) until its activity timeout.
 func startDispatcher(t *testing.T, q batchActivityQueue, capacity int, h ActivityHandler) (done <-chan struct{}, cancel context.CancelFunc) {
 	t.Helper()
 	cfg := DefaultWorkerConfig()
@@ -130,14 +139,16 @@ func startDispatcher(t *testing.T, q batchActivityQueue, capacity int, h Activit
 	e := &WorkerEngine{queue: q, handlers: map[string]ActivityHandler{"test": h}, metrics: NoopMetrics{}, config: cfg}
 	e.running.Store(true)
 	ctx, cancelFn := context.WithCancel(context.Background())
+	handlerCtx, cancelHandlers := context.WithCancel(context.Background())
 	stopped := make(chan struct{})
 	go func() {
 		defer close(stopped)
-		e.runBatchDispatcher(ctx, context.Background(), q)
+		e.runBatchDispatcher(ctx, handlerCtx, q)
 	}()
 	t.Cleanup(func() {
 		e.running.Store(false)
 		cancelFn()
+		cancelHandlers()
 		<-stopped
 	})
 	return stopped, cancelFn
