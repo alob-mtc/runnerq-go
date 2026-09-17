@@ -163,7 +163,7 @@ func (b *PostgresBackend) initSchema(ctx context.Context) error {
 	// "deadlock detected" (SQLSTATE 40P01). A session-level advisory lock on
 	// a dedicated connection makes inits run one at a time; the lock
 	// auto-releases if the session dies.
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, schemaAdvisoryLockKey); err != nil {
+	if err := acquireSchemaLock(ctx, conn); err != nil {
 		return databaseError(err, fmt.Sprintf("Failed to acquire schema lock: %v", err))
 	}
 	defer func() {
@@ -195,6 +195,37 @@ func (b *PostgresBackend) initSchema(ctx context.Context) error {
 	}
 
 	return b.ensureDequeueIndexes(ctx, conn)
+}
+
+// schemaLockPoll is the interval between pg_try_advisory_lock attempts while
+// another session holds the schema lock.
+const schemaLockPoll = 50 * time.Millisecond
+
+// acquireSchemaLock takes the session-level schema advisory lock on conn,
+// polling with pg_try_advisory_lock instead of blocking in pg_advisory_lock.
+//
+// A blocked SELECT pg_advisory_lock holds its snapshot for as long as it
+// waits, and the holder's CREATE INDEX CONCURRENTLY (ensureDequeueIndexes)
+// waits for every older snapshot to end before it can finish. Holder waits
+// on waiter, waiter waits on holder, and Postgres resolves the cycle by
+// killing one side with 40P01 — the second process to boot against a fresh
+// database failed to start. Each poll here is a short statement whose
+// snapshot ends immediately, so a waiter never pins the index build.
+func acquireSchemaLock(ctx context.Context, conn *pgxpool.Conn) error {
+	for {
+		var locked bool
+		if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, schemaAdvisoryLockKey).Scan(&locked); err != nil {
+			return err
+		}
+		if locked {
+			return nil
+		}
+		select {
+		case <-time.After(schemaLockPoll):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // dequeueIndexes are the hot claim-path indexes, built CONCURRENTLY (outside
