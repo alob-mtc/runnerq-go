@@ -19,7 +19,7 @@ func (h *Checkout) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) 
         return nil, err
     }
 
-    ship, err := ctx.ActivityExecutor.Activity("ship").Step("ship").Payload(payload).Execute(ctx.Ctx)
+    ship, err := ctx.ActivityExecutor.ActivityNamed("ship").Step("ship").Payload(payload).Execute(ctx.Ctx)
     if err != nil {
         return nil, err
     }
@@ -87,7 +87,7 @@ await children **park** in the database — no goroutine, no lease, no retry
 burned while they wait.
 
 ```go
-fut, _ := ctx.ActivityExecutor.Activity("reserve").Step("reserve").Payload(p).Execute(ctx.Ctx)
+fut, _ := ctx.ActivityExecutor.ActivityNamed("reserve").Step("reserve").Payload(p).Execute(ctx.Ctx)
 reserved, _ := fut.GetResult(ctx.Ctx)   // memoized on replay
 ```
 
@@ -117,7 +117,7 @@ Idempotency keys make enqueuing exactly-once — dedupe webhooks and event
 handlers with one option.
 
 ```go
-executor.Activity("process_event").
+executor.ActivityNamed("process_event").
     Payload(p).
     IdempotencyKeyOption(eventID, runnerq.ReturnExisting).   // duplicate deliveries collapse to one
     Execute(ctx)
@@ -129,7 +129,7 @@ Priorities, exponential-backoff retries, a dead-letter queue, scheduling, and
 worker-level type filtering so slow jobs can't starve latency-sensitive ones.
 
 ```go
-executor.Activity("send_email").
+executor.ActivityNamed("send_email").
     Payload(p).
     Priority(runnerq.PriorityHigh).
     MaxRetries(5).
@@ -213,7 +213,7 @@ func main() {
     go engine.Start(ctx)
 
     future, _ := engine.GetActivityExecutor().
-        Activity(runnerq.NameOf[Greeting]()).
+        Activity[Greeting]().
         Payload(json.RawMessage(`"world"`)).
         Execute(ctx)
 

@@ -57,7 +57,7 @@ provider idempotency key to your payment API, etc.). See
 
 ```go
 fut, err := ctx.ActivityExecutor.
-    Activity("reserve_inventory").
+    ActivityNamed("reserve_inventory").
     Step("reserve").
     Payload(payload).
     Execute(ctx.Ctx)
@@ -139,7 +139,7 @@ func (h *FulfillOrder) Handle(ctx runnerq.ActivityContext, payload json.RawMessa
     })
     if err != nil { return nil, err }
 
-    fut, err := ctx.ActivityExecutor.Activity("ship").Step("ship").Payload(payload).Execute(ctx.Ctx)
+    fut, err := ctx.ActivityExecutor.ActivityNamed("ship").Step("ship").Payload(payload).Execute(ctx.Ctx)
     if err != nil { return nil, err }
     if _, err := fut.GetResult(ctx.Ctx); err != nil { return nil, err }
 

@@ -65,7 +65,7 @@ func (h *FulfillOrder) Handle(ctx runnerq.ActivityContext, payload json.RawMessa
 	}
 
 	// A child activity — shows the workflow tree.
-	ship, err := ctx.ActivityExecutor.Activity(runnerq.NameOf[ShipOrder]()).Step("ship").Payload(payload).Execute(ctx.Ctx)
+	ship, err := ctx.ActivityExecutor.Activity[ShipOrder]().Step("ship").Payload(payload).Execute(ctx.Ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +115,7 @@ func main() {
 			// this, the sleep fits the default 300s budget and waits
 			// in-process, appearing only as "processing".
 			if _, err := engine.GetActivityExecutor().
-				Activity(runnerq.NameOf[FulfillOrder]()).
+				Activity[FulfillOrder]().
 				Timeout(4 * time.Second).
 				Payload(payload).
 				Execute(ctx); err != nil {

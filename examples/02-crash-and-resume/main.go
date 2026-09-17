@@ -111,7 +111,7 @@ func main() {
 	// The fixed idempotency key is what makes re-running reattach to the same
 	// workflow rather than starting a new one.
 	future, err := engine.GetActivityExecutor().
-		Activity(runnerq.NameOf[FulfillOrder]()).
+		Activity[FulfillOrder]().
 		IdempotencyKeyOption(orderID, runnerq.ReturnExisting).
 		Timeout(8 * time.Second).
 		Payload(json.RawMessage(`{"order_id":"` + orderID + `"}`)).

@@ -102,7 +102,7 @@ func main() {
 	}()
 
 	future, err := engine.GetActivityExecutor().
-		Activity(runnerq.NameOf[BillingRun]()).
+		Activity[BillingRun]().
 		Payload(json.RawMessage(`{"campaign":"june"}`)).
 		Execute(ctx)
 	if err != nil {

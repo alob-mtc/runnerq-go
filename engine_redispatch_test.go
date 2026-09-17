@@ -27,7 +27,7 @@ func TestParentParksAwaitingSlowChild(t *testing.T) {
 	}}
 	parent := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 		parentRuns.Add(1)
-		fut, err := ctx.ActivityExecutor.Activity("slow_child").Step("work").
+		fut, err := ctx.ActivityExecutor.ActivityNamed("slow_child").Step("work").
 			Payload(json.RawMessage(`{}`)).Execute(ctx.Ctx)
 		if err != nil {
 			return nil, err
@@ -41,7 +41,7 @@ func TestParentParksAwaitingSlowChild(t *testing.T) {
 	})
 
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("parent").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+		ActivityNamed("parent").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestAwaitFastChildStaysInProcess(t *testing.T) {
 	}}
 	parent := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 		parentRuns.Add(1)
-		fut, err := ctx.ActivityExecutor.Activity("fast_child").Step("work").
+		fut, err := ctx.ActivityExecutor.ActivityNamed("fast_child").Step("work").
 			Payload(json.RawMessage(`{}`)).Execute(ctx.Ctx)
 		if err != nil {
 			return nil, err
@@ -103,7 +103,7 @@ func TestAwaitFastChildStaysInProcess(t *testing.T) {
 	})
 
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("parent_fast").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+		ActivityNamed("parent_fast").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestAwaitChainWakesRecursively(t *testing.T) {
 		return json.RawMessage(`{"leaf":"done"}`), nil
 	}}
 	mid := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
-		fut, err := ctx.ActivityExecutor.Activity("chain_leaf").Step("leaf").
+		fut, err := ctx.ActivityExecutor.ActivityNamed("chain_leaf").Step("leaf").
 			Payload(json.RawMessage(`{}`)).Execute(ctx.Ctx)
 		if err != nil {
 			return nil, err
@@ -142,7 +142,7 @@ func TestAwaitChainWakesRecursively(t *testing.T) {
 		return fut.GetResult(ctx.Ctx)
 	}}
 	root := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
-		fut, err := ctx.ActivityExecutor.Activity("chain_mid").Step("mid").
+		fut, err := ctx.ActivityExecutor.ActivityNamed("chain_mid").Step("mid").
 			Payload(json.RawMessage(`{}`)).Execute(ctx.Ctx)
 		if err != nil {
 			return nil, err
@@ -157,7 +157,7 @@ func TestAwaitChainWakesRecursively(t *testing.T) {
 	})
 
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("chain_root").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+		ActivityNamed("chain_root").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestWaitAllFanOut(t *testing.T) {
 	parent := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 		var futs []*ActivityFuture
 		for _, name := range []string{"a", "b", "c"} {
-			fut, err := ctx.ActivityExecutor.Activity("echo").Step(name).
+			fut, err := ctx.ActivityExecutor.ActivityNamed("echo").Step(name).
 				Payload(json.RawMessage(`"` + name + `"`)).Execute(ctx.Ctx)
 			if err != nil {
 				return nil, err
@@ -205,7 +205,7 @@ func TestWaitAllFanOut(t *testing.T) {
 	})
 
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("fanout").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+		ActivityNamed("fanout").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -236,7 +236,7 @@ func TestDelayScheduledNotWokenBySignal(t *testing.T) {
 	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("delayed", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("delayed").
+		ActivityNamed("delayed").
 		Delay(4 * time.Second).
 		Payload(json.RawMessage(`{}`)).
 		Execute(context.Background())

@@ -31,7 +31,7 @@ delivering webhooks: first event ×3, second event ×1
 
 ```go
 engine.GetActivityExecutor().
-    Activity(runnerq.NameOf[ProcessEvent]()).
+    Activity[ProcessEvent]().
     IdempotencyKeyOption(eventID, runnerq.ReturnExisting).   // dedup on the event ID
     Payload(payload).
     Execute(ctx)

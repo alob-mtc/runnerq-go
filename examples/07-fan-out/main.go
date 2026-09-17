@@ -40,7 +40,7 @@ func (h *ProcessDocument) Handle(ctx runnerq.ActivityContext, payload json.RawMe
 	for i, page := range pages {
 		p, _ := json.Marshal(map[string]any{"page": page, "index": i})
 		fut, err := ctx.ActivityExecutor.
-			Activity(runnerq.NameOf[ProcessPage]()).
+			Activity[ProcessPage]().
 			Step(fmt.Sprintf("page-%d", i)).
 			Payload(p).
 			Execute(ctx.Ctx)
@@ -119,7 +119,7 @@ func main() {
 	}()
 
 	future, err := engine.GetActivityExecutor().
-		Activity(runnerq.NameOf[ProcessDocument]()).
+		Activity[ProcessDocument]().
 		Payload(json.RawMessage(`{"doc":"report.pdf"}`)).
 		Execute(ctx)
 	if err != nil {

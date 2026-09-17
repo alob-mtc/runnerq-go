@@ -47,7 +47,7 @@ func TestSignalBufferedBeforeWait(t *testing.T) {
 
 	// Enqueue and signal BEFORE the engine starts: the signal is buffered.
 	fut, err := engine.GetActivityExecutor().
-		Activity("approve_me").Payload(json.RawMessage(`{}`)).Execute(ctx)
+		ActivityNamed("approve_me").Payload(json.RawMessage(`{}`)).Execute(ctx)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestSignalWakesParkedWaiterAcrossProcesses(t *testing.T) {
 	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("gate", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("gate").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+		ActivityNamed("gate").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestSignalTimeoutInProcess(t *testing.T) {
 	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("waiter", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("waiter").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+		ActivityNamed("waiter").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestSignalTimeoutSurvivesPark(t *testing.T) {
 
 	start := time.Now()
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("slow_gate").
+		ActivityNamed("slow_gate").
 		Timeout(2 * time.Second). // 4s wait in a 2s budget → must park
 		Payload(json.RawMessage(`{}`)).
 		Execute(context.Background())
@@ -264,7 +264,7 @@ func TestSignalByKeyWakesWorkflowOwningKey(t *testing.T) {
 	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("xfer", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("xfer").
+		ActivityNamed("xfer").
 		IdempotencyKeyOption(key, ReturnExisting).
 		Payload(json.RawMessage(`{}`)).
 		Execute(context.Background())
@@ -305,7 +305,7 @@ func TestSignalRecordedWithName(t *testing.T) {
 	}}
 	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("gate", h) })
 
-	fut, err := rig.engine.GetActivityExecutor().Activity("gate").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+	fut, err := rig.engine.GetActivityExecutor().ActivityNamed("gate").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}

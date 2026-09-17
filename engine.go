@@ -158,10 +158,10 @@ func isNilHandler(handler ActivityHandler) bool {
 	return false
 }
 
-// GetActivityExecutor returns an ActivityExecutor for orchestrating activities.
-// Spawns made through the returned executor are roots (no parent lineage).
-func (e *WorkerEngine) GetActivityExecutor() ActivityExecutor {
-	return newWorkerEngineWrapperWithDepth(e.queue, e.config.MaxActivityDepth)
+// GetActivityExecutor returns an executor for spawning activities from
+// outside a handler. Spawns made through it are roots (no parent lineage).
+func (e *WorkerEngine) GetActivityExecutor() *ActivityExecutor {
+	return newActivityExecutor(e.queue, e.config.MaxActivityDepth)
 }
 
 // Start starts the worker engine and blocks until shutdown or error.
@@ -569,7 +569,7 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 
 	attemptQ := &attemptQueue{activityQueue: e.queue, backend: e.backend, owner: act.ID, worker: workerLabel, persistenceCtx: ctx, metrics: e.metrics}
 	timeoutCtx = context.WithValue(timeoutCtx, attemptQueueKey{}, attemptQ)
-	scopedExecutor := newWorkerEngineWrapperWithDepth(attemptQ, e.config.MaxActivityDepth).scopedForChild(act)
+	scopedExecutor := newActivityExecutor(attemptQ, e.config.MaxActivityDepth).scopedForChild(act)
 
 	actCtx := ActivityContext{
 		ActivityID:       activityID,
@@ -740,7 +740,7 @@ func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity
 			RetryCount:       0,
 			Metadata:         make(map[string]string),
 			Ctx:              ctx,
-			ActivityExecutor: newWorkerEngineWrapperWithDepth(e.queue, e.config.MaxActivityDepth).scopedForChild(act),
+			ActivityExecutor: newActivityExecutor(e.queue, e.config.MaxActivityDepth).scopedForChild(act),
 			ParentActivityID: act.ParentActivityID,
 			RootActivityID:   act.RootActivityID,
 			Depth:            act.Depth,
@@ -777,7 +777,7 @@ func (e *WorkerEngine) handleTimeout(ctx context.Context, act *activity, handler
 			RetryCount:       0,
 			Metadata:         make(map[string]string),
 			Ctx:              ctx,
-			ActivityExecutor: newWorkerEngineWrapperWithDepth(e.queue, e.config.MaxActivityDepth).scopedForChild(act),
+			ActivityExecutor: newActivityExecutor(e.queue, e.config.MaxActivityDepth).scopedForChild(act),
 			ParentActivityID: act.ParentActivityID,
 			RootActivityID:   act.RootActivityID,
 			Depth:            act.Depth,

@@ -99,7 +99,7 @@ func main() {
 	// Kick off the workflow and wait for its result.
 	fmt.Println("starting signup workflow...")
 	future, err := engine.GetActivityExecutor().
-		Activity(runnerq.NameOf[SignupWorkflow]()).
+		Activity[SignupWorkflow]().
 		Payload(json.RawMessage(`{"email":"ada@example.com"}`)).
 		Execute(ctx)
 	if err != nil {

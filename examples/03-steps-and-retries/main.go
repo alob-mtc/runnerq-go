@@ -40,7 +40,7 @@ func (h *ProcessOrder) Handle(ctx runnerq.ActivityContext, payload json.RawMessa
 	// Spawn the reserve child as a named step. On a parent retry this exact
 	// spawn reattaches to the existing child instead of creating a new one.
 	fut, err := ctx.ActivityExecutor.
-		Activity(runnerq.NameOf[ReserveInventory]()).
+		Activity[ReserveInventory]().
 		Step("reserve").
 		Payload(payload).
 		Execute(ctx.Ctx)
@@ -105,7 +105,7 @@ func main() {
 	}()
 
 	future, err := engine.GetActivityExecutor().
-		Activity(runnerq.NameOf[ProcessOrder]()).
+		Activity[ProcessOrder]().
 		Payload(json.RawMessage(`{"order_id":"42"}`)).
 		Execute(ctx)
 	if err != nil {

@@ -93,7 +93,7 @@ func main() {
 	mix := []string{"send_email", "send_sms", "generate_report", "reconcile_ledger"}
 	fmt.Println("enqueuing a mix of 12 activities across 4 types...")
 	for i := range 12 {
-		if _, err := exec.Activity(mix[i%len(mix)]).Payload(json.RawMessage(`{}`)).Execute(ctx); err != nil {
+		if _, err := exec.ActivityNamed(mix[i%len(mix)]).Payload(json.RawMessage(`{}`)).Execute(ctx); err != nil {
 			log.Fatalf("enqueue: %v", err)
 		}
 	}

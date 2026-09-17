@@ -27,9 +27,9 @@ type ActivityContext struct {
 	// Ctx is the Go context for cancellation and deadline propagation.
 	Ctx context.Context
 
-	// ActivityExecutor allows executing other activities from within a handler.
-	// Spawns made through this executor are tagged as children of this activity.
-	ActivityExecutor ActivityExecutor
+	// ActivityExecutor spawns other activities from within a handler.
+	// Spawns made through it are tagged as children of this activity.
+	ActivityExecutor *ActivityExecutor
 
 	// ParentActivityID is the direct parent of this activity, if any.
 	ParentActivityID *uuid.UUID

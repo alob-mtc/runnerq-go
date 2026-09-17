@@ -57,7 +57,7 @@ Sizing guidance:
 `.Delay(d)` runs an activity no earlier than `now + d`:
 
 ```go
-executor.Activity("send_reminder").Payload(p).Delay(1 * time.Hour).Execute(ctx)
+executor.ActivityNamed("send_reminder").Payload(p).Delay(1 * time.Hour).Execute(ctx)
 ```
 
 For durable, in-workflow waits use `ctx.Sleep` instead — see

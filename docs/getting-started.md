@@ -66,7 +66,7 @@ go engine.Start(ctx)
 
 ```go
 future, err := engine.GetActivityExecutor().
-    Activity(runnerq.NameOf[Greeting]()).
+    Activity[Greeting]().
     Payload(json.RawMessage(`"world"`)).
     Execute(ctx)
 if err != nil {

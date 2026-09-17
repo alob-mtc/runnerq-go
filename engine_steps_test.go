@@ -96,7 +96,7 @@ func TestStepSpawnMemoizedAcrossParentRetry(t *testing.T) {
 	parent := &funcHandler{fn: func(ctx ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 		parentRuns.Add(1)
 		fut, err := ctx.ActivityExecutor.
-			Activity("reserve").
+			ActivityNamed("reserve").
 			Step("reserve").
 			Payload(json.RawMessage(`{}`)).
 			Execute(ctx.Ctx)
@@ -119,7 +119,7 @@ func TestStepSpawnMemoizedAcrossParentRetry(t *testing.T) {
 	})
 
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("orchestrate").
+		ActivityNamed("orchestrate").
 		Payload(json.RawMessage(`{}`)).
 		Execute(context.Background())
 	if err != nil {
@@ -160,7 +160,7 @@ func TestRunCheckpointSurvivesRetry(t *testing.T) {
 	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("pay", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("pay").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+		ActivityNamed("pay").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestRunCheckpointsPermanentFailure(t *testing.T) {
 	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("doomed", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("doomed").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+		ActivityNamed("doomed").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestSleepResumesRemainderOnRetry(t *testing.T) {
 	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("napper", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("napper").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+		ActivityNamed("napper").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestShortSleepInShortTimeoutStaysInProcess(t *testing.T) {
 	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("blinker", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("blinker").
+		ActivityNamed("blinker").
 		Timeout(2 * time.Second).
 		Payload(json.RawMessage(`{}`)).
 		Execute(context.Background())
@@ -319,7 +319,7 @@ func TestSleepYieldsBeyondTimeoutBudget(t *testing.T) {
 
 	start := time.Now()
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("cooler").
+		ActivityNamed("cooler").
 		Timeout(2 * time.Second).
 		Payload(json.RawMessage(`{}`)).
 		Execute(context.Background())
@@ -382,7 +382,7 @@ func TestStepHistoryRecorded(t *testing.T) {
 	}}
 	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("func", h) })
 
-	fut, err := rig.engine.GetActivityExecutor().Activity("func").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+	fut, err := rig.engine.GetActivityExecutor().ActivityNamed("func").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -430,7 +430,7 @@ func TestYieldEventCarriesWaitReason(t *testing.T) {
 	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("func", h) })
 
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("func").Timeout(2 * time.Second).Payload(json.RawMessage(`{}`)).Execute(context.Background())
+		ActivityNamed("func").Timeout(2 * time.Second).Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -463,7 +463,7 @@ func TestStepChildCarriesStepNameInKey(t *testing.T) {
 		return json.RawMessage(`{"child":true}`), nil
 	}}
 	parent := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
-		fut, err := ctx.ActivityExecutor.Activity("child").Step("worker").Payload(json.RawMessage(`{}`)).Execute(ctx.Ctx)
+		fut, err := ctx.ActivityExecutor.ActivityNamed("child").Step("worker").Payload(json.RawMessage(`{}`)).Execute(ctx.Ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -474,7 +474,7 @@ func TestStepChildCarriesStepNameInKey(t *testing.T) {
 		e.RegisterActivityWithName("child", child)
 	})
 
-	fut, err := rig.engine.GetActivityExecutor().Activity("parent").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+	fut, err := rig.engine.GetActivityExecutor().ActivityNamed("parent").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -520,7 +520,7 @@ func TestRunStepTypedResultSurvivesRetry(t *testing.T) {
 
 	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("typed", h) })
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("typed").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+		ActivityNamed("typed").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -564,7 +564,7 @@ func TestRunStepDecodeMismatchIsNonRetryable(t *testing.T) {
 
 	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("shape", h) })
 	fut, err := rig.engine.GetActivityExecutor().
-		Activity("shape").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+		ActivityNamed("shape").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}

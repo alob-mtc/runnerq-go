@@ -59,7 +59,7 @@ Two things make this work:
 ```go
 // 1. A fixed idempotency key, so re-running reattaches to the SAME workflow.
 engine.GetActivityExecutor().
-    Activity(runnerq.NameOf[FulfillOrder]()).
+    Activity[FulfillOrder]().
     IdempotencyKeyOption(orderID, runnerq.ReturnExisting).
     Payload(...).Execute(ctx)
 
