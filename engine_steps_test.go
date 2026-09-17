@@ -489,3 +489,118 @@ func TestStepChildCarriesStepNameInKey(t *testing.T) {
 		t.Fatalf("child idempotency key = %v, want rq:step:...:worker", key)
 	}
 }
+
+// ctx.RunStep: the typed result is encoded into the checkpoint and decoded
+// back on replay — fn runs once, the retried attempt gets the struct.
+func TestRunStepTypedResultSurvivesRetry(t *testing.T) {
+	type receipt struct {
+		ChargeID string `json:"charge_id"`
+		Cents    int    `json:"cents"`
+	}
+	var fnRuns atomic.Int32
+	var sawCtx atomic.Bool
+
+	h := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		r, err := ctx.RunStep("charge", func(c context.Context) (receipt, error) {
+			fnRuns.Add(1)
+			sawCtx.Store(c != nil && c.Err() == nil)
+			return receipt{ChargeID: "ch_1", Cents: 4200}, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if ctx.RetryCount == 0 {
+			return nil, NewRetryError("forced crash after charge")
+		}
+		if r.ChargeID != "ch_1" || r.Cents != 4200 {
+			return nil, NewNonRetryError("replayed receipt mismatch: " + r.ChargeID)
+		}
+		return json.Marshal(r)
+	}}
+
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("typed", h) })
+	fut, err := rig.engine.GetActivityExecutor().
+		Activity("typed").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	res := rig.await(t, fut.activityID, 30*time.Second)
+	var got receipt
+	if res.State != storage.ResultOk || json.Unmarshal(res.Data, &got) != nil || got != (receipt{ChargeID: "ch_1", Cents: 4200}) {
+		t.Fatalf("result = %v %s, want Ok with the decoded receipt", res.State, res.Data)
+	}
+	if n := fnRuns.Load(); n != 1 {
+		t.Fatalf("typed step ran %d times, want exactly 1", n)
+	}
+	if !sawCtx.Load() {
+		t.Fatal("step received a nil or already-cancelled context")
+	}
+}
+
+// ctx.RunStep: a stored result that no longer decodes into R (the type
+// changed between deploys) is a permanent error — retrying can't fix it.
+func TestRunStepDecodeMismatchIsNonRetryable(t *testing.T) {
+	h := &funcHandler{fn: func(ctx ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		if ctx.RetryCount == 0 {
+			if _, err := ctx.RunStep("shape", func(context.Context) (map[string]string, error) {
+				return map[string]string{"v": "1"}, nil
+			}); err != nil {
+				return nil, err
+			}
+			return nil, NewRetryError("forced crash; the next attempt reads with a different R")
+		}
+		_, err := ctx.RunStep("shape", func(context.Context) (int, error) { return 0, nil })
+		if err == nil {
+			return nil, NewNonRetryError("decoding an object into int succeeded")
+		}
+		if re, ok := err.(RetryableError); !ok || re.IsRetryable() {
+			return nil, NewNonRetryError("decode mismatch was not a non-retryable error: " + err.Error())
+		}
+		if !strings.Contains(err.Error(), `"shape"`) {
+			return nil, NewNonRetryError("error does not name the step: " + err.Error())
+		}
+		return json.RawMessage(`{"observed":"decode mismatch"}`), nil
+	}}
+
+	rig := newStepsRig(t, func(e *WorkerEngine) { e.RegisterActivityWithName("shape", h) })
+	fut, err := rig.engine.GetActivityExecutor().
+		Activity("shape").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if res := rig.await(t, fut.activityID, 30*time.Second); res.State != storage.ResultOk {
+		t.Fatalf("result = %v %s, want Ok", res.State, res.Data)
+	}
+}
+
+// ctx.RunStep on a hand-built context (no checkpoint storage) still runs fn
+// with a live context, round-trips the value, and turns an unencodable
+// result into a permanent error.
+func TestRunStepWithoutQueue(t *testing.T) {
+	c := ActivityContext{ActivityID: uuid.New()}
+
+	n, err := c.RunStep("n", func(sc context.Context) (int, error) {
+		if sc == nil {
+			t.Fatal("nil step context")
+		}
+		return 7, nil
+	})
+	if err != nil || n != 7 {
+		t.Fatalf("RunStep = %d, %v; want 7", n, err)
+	}
+
+	raw, err := c.RunStep("raw", func(context.Context) (json.RawMessage, error) {
+		return json.RawMessage(`{"k":[1,2]}`), nil
+	})
+	if err != nil || string(raw) != `{"k":[1,2]}` {
+		t.Fatalf("RawMessage passthrough = %s, %v", raw, err)
+	}
+
+	_, err = c.RunStep("bad", func(context.Context) (chan int, error) { return make(chan int), nil })
+	if re, ok := err.(RetryableError); !ok || re.IsRetryable() {
+		t.Fatalf("unencodable result err = %v, want non-retryable", err)
+	}
+	if _, err := c.RunStep("", func(context.Context) (int, error) { return 1, nil }); err == nil {
+		t.Fatal("empty step name accepted")
+	}
+}

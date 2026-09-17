@@ -4,10 +4,13 @@ The smallest useful RunnerQ program: a durable two-step workflow.
 
 ## What this shows
 
-A workflow is just an activity handler. Inside it, each `ctx.Run(name, fn)` is
-a **step** whose result is checkpointed in Postgres. Steps run at most once —
-if the process restarted between them, the first would be skipped and the
-second resumed. (Example 02 proves that; here we just run it through.)
+A workflow is just an activity handler. Inside it, each `ctx.RunStep(name, fn)`
+is a **step** whose typed result is checkpointed in Postgres. A step whose
+result was recorded never re-runs — if the process restarted between them,
+the first would replay from its checkpoint and the second would resume. A
+crash *between* the side effect and the checkpoint commit does re-run `fn`,
+so keep external effects idempotent. (Example 02 proves the replay; here we
+just run it through.)
 
 ## Run it
 
@@ -29,15 +32,16 @@ starting signup workflow...
 
 ```go
 func (h *SignupWorkflow) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
-    user, err := ctx.Run("create-account", func() (json.RawMessage, error) {
-        return createAccount(payload)   // checkpointed: runs at most once
+    user, err := ctx.RunStep("create-account", func(c context.Context) (Account, error) {
+        return createAccount(c, payload)   // checkpointed: runs at most once
     })
     if err != nil { return nil, err }
 
-    _, err = ctx.Run("send-welcome", func() (json.RawMessage, error) {
-        return sendWelcome(user)        // only after the account is durable
+    _, err = ctx.RunStep("send-welcome", func(c context.Context) (bool, error) {
+        return true, sendWelcome(c, user)  // only after the account is durable
     })
-    return user, err
+    if err != nil { return nil, err }
+    return json.Marshal(user)
 }
 ```
 

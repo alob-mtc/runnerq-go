@@ -124,6 +124,54 @@ func (c ActivityContext) Run(name string, fn func() (json.RawMessage, error)) (j
 	return out, nil
 }
 
+// Step is a typed unit of work for RunStep: it receives a context derived
+// from the activity's (so the activity timeout still bounds it) and returns
+// a JSON-encodable result.
+type Step[R any] func(ctx context.Context) (R, error)
+
+// RunStep is the typed form of Run: fn's result is encoded with
+// encoding/json into the checkpoint, and a replaying attempt decodes the
+// stored result into R without re-running fn. R must round-trip through
+// encoding/json; json.RawMessage passes through unchanged. Semantics and the
+// step-name rules are those of Run.
+//
+//	receipt, err := ctx.RunStep("charge", func(c context.Context) (Receipt, error) {
+//	    return payments.Charge(c, orderID, amount)
+//	})
+//
+// A stored result that no longer decodes into R — the type changed between
+// deploys — fails as a NonRetryError naming the step, since retrying cannot
+// fix it. An encode failure is also a NonRetryError and is checkpointed as
+// a permanent step failure, because the side effect has already happened.
+func (c ActivityContext) RunStep[R any](name string, fn Step[R]) (R, error) {
+	var zero R
+	raw, err := c.Run(name, func() (json.RawMessage, error) {
+		parent := c.Ctx
+		if parent == nil {
+			parent = context.Background()
+		}
+		stepCtx, cancel := context.WithCancel(parent)
+		defer cancel()
+		out, err := fn(stepCtx)
+		if err != nil {
+			return nil, err
+		}
+		data, err := json.Marshal(out)
+		if err != nil {
+			return nil, NewNonRetryError(fmt.Sprintf("step %q: cannot encode %T result: %v", name, out, err))
+		}
+		return data, nil
+	})
+	if err != nil {
+		return zero, err
+	}
+	var out R
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return zero, NewNonRetryError(fmt.Sprintf("step %q: stored result does not decode into %T: %v", name, out, err))
+	}
+	return out, nil
+}
+
 // yieldMargin is how much handler-deadline headroom Sleep requires to wait
 // in-process. A wake that wouldn't land at least this far before the
 // activity's timeout yields instead, so the sleep never converts into a

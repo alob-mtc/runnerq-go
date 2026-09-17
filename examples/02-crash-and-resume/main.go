@@ -37,18 +37,18 @@ type FulfillOrder struct {
 
 func (h *FulfillOrder) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	// Step 1 — reserve inventory.
-	if _, err := ctx.Run("reserve-inventory", func() (json.RawMessage, error) {
+	if _, err := ctx.RunStep("reserve-inventory", func(context.Context) (bool, error) {
 		fmt.Println("  ▶ EXECUTING reserve-inventory   (real side effect)")
-		return json.RawMessage(`{"reserved":true}`), nil
+		return true, nil
 	}); err != nil {
 		return nil, err
 	}
 	fmt.Println("  ✓ reserve-inventory")
 
 	// Step 2 — charge the card. This is the side effect we must never repeat.
-	if _, err := ctx.Run("charge-card", func() (json.RawMessage, error) {
+	if _, err := ctx.RunStep("charge-card", func(context.Context) (string, error) {
 		fmt.Println("  ▶ EXECUTING charge-card         (real side effect — charges $$$)")
-		return json.RawMessage(`{"charge_id":"ch_777"}`), nil
+		return "ch_777", nil // the charge ID, checkpointed
 	}); err != nil {
 		return nil, err
 	}
@@ -62,9 +62,9 @@ func (h *FulfillOrder) Handle(ctx runnerq.ActivityContext, payload json.RawMessa
 	time.Sleep(6 * time.Second)
 
 	// Step 3 — ship.
-	if _, err := ctx.Run("ship-order", func() (json.RawMessage, error) {
+	if _, err := ctx.RunStep("ship-order", func(context.Context) (string, error) {
 		fmt.Println("  ▶ EXECUTING ship-order          (real side effect)")
-		return json.RawMessage(`{"tracking":"1Z999"}`), nil
+		return "1Z999", nil // the tracking number, checkpointed
 	}); err != nil {
 		return nil, err
 	}

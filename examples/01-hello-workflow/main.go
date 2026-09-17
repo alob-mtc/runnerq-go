@@ -29,6 +29,13 @@ type SignupWorkflow struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
+// Account is the typed result of the create-account step. RunStep encodes it
+// into the checkpoint and hands it back decoded on replay.
+type Account struct {
+	UserID string `json:"user_id"`
+	Email  string `json:"email"`
+}
+
 func (h *SignupWorkflow) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	var in struct {
 		Email string `json:"email"`
@@ -37,11 +44,11 @@ func (h *SignupWorkflow) Handle(ctx runnerq.ActivityContext, payload json.RawMes
 		return nil, runnerq.NewNonRetryError("invalid payload")
 	}
 
-	// Step 1: create the account. ctx.Run checkpoints the result, so this
+	// Step 1: create the account. ctx.RunStep checkpoints the result, so this
 	// runs at most once across any number of retries or restarts.
-	userJSON, err := ctx.Run("create-account", func() (json.RawMessage, error) {
+	user, err := ctx.RunStep("create-account", func(context.Context) (Account, error) {
 		fmt.Printf("  ▶ creating account for %s\n", in.Email)
-		return json.Marshal(map[string]string{"user_id": "u_1001", "email": in.Email})
+		return Account{UserID: "u_1001", Email: in.Email}, nil
 	})
 	if err != nil {
 		return nil, err
@@ -49,15 +56,15 @@ func (h *SignupWorkflow) Handle(ctx runnerq.ActivityContext, payload json.RawMes
 
 	// Step 2: send the welcome email — only fires once the account is durably
 	// recorded, and never twice.
-	_, err = ctx.Run("send-welcome", func() (json.RawMessage, error) {
+	_, err = ctx.RunStep("send-welcome", func(context.Context) (bool, error) {
 		fmt.Printf("  ▶ sending welcome email to %s\n", in.Email)
-		return json.RawMessage(`{"sent":true}`), nil
+		return true, nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	return userJSON, nil
+	return json.Marshal(user)
 }
 
 func main() {

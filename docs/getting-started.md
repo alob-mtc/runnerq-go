@@ -6,7 +6,7 @@
 go get github.com/alob-mtc/runnerq-go
 ```
 
-Requires Go 1.25+ and a PostgreSQL database (12+).
+Requires Go 1.27+ and a PostgreSQL database (12+).
 
 ## Connect to Postgres
 
