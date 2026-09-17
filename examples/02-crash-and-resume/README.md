@@ -64,7 +64,7 @@ engine.GetActivityExecutor().
     Payload(...).Execute(ctx)
 
 // 2. ctx.RunStep checkpoints each step, so a replay skips completed ones.
-chargeID, err := ctx.RunStep("charge-card", func(c context.Context) (string, error) {
+charge, err := ctx.RunStep("charge-card", func(c context.Context) (Charge, error) {
     return chargeCard(c, ...)   // never runs twice for this workflow
 })
 ```

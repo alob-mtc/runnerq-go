@@ -5,9 +5,12 @@ The smallest useful RunnerQ program: a durable two-step workflow.
 ## What this shows
 
 A workflow is just an activity handler. Inside it, each `ctx.RunStep(name, fn)`
-is a **step** whose typed result is checkpointed in Postgres. Steps run at most once —
-if the process restarted between them, the first would be skipped and the
-second resumed. (Example 02 proves that; here we just run it through.)
+is a **step** whose typed result is checkpointed in Postgres. A step whose
+result was recorded never re-runs — if the process restarted between them,
+the first would replay from its checkpoint and the second would resume. A
+crash *between* the side effect and the checkpoint commit does re-run `fn`,
+so keep external effects idempotent. (Example 02 proves the replay; here we
+just run it through.)
 
 ## Run it
 

@@ -35,20 +35,35 @@ type FulfillOrder struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
+// Step results keep the JSON shapes earlier versions of this example stored,
+// so a workflow parked by an older build resumes under the fixed order key
+// instead of failing to decode.
+type Reservation struct {
+	Reserved bool `json:"reserved"`
+}
+
+type Charge struct {
+	ChargeID string `json:"charge_id"`
+}
+
+type Shipment struct {
+	Tracking string `json:"tracking"`
+}
+
 func (h *FulfillOrder) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	// Step 1 — reserve inventory.
-	if _, err := ctx.RunStep("reserve-inventory", func(context.Context) (bool, error) {
+	if _, err := ctx.RunStep("reserve-inventory", func(context.Context) (Reservation, error) {
 		fmt.Println("  ▶ EXECUTING reserve-inventory   (real side effect)")
-		return true, nil
+		return Reservation{Reserved: true}, nil
 	}); err != nil {
 		return nil, err
 	}
 	fmt.Println("  ✓ reserve-inventory")
 
 	// Step 2 — charge the card. This is the side effect we must never repeat.
-	if _, err := ctx.RunStep("charge-card", func(context.Context) (string, error) {
+	if _, err := ctx.RunStep("charge-card", func(context.Context) (Charge, error) {
 		fmt.Println("  ▶ EXECUTING charge-card         (real side effect — charges $$$)")
-		return "ch_777", nil // the charge ID, checkpointed
+		return Charge{ChargeID: "ch_777"}, nil
 	}); err != nil {
 		return nil, err
 	}
@@ -62,9 +77,9 @@ func (h *FulfillOrder) Handle(ctx runnerq.ActivityContext, payload json.RawMessa
 	time.Sleep(6 * time.Second)
 
 	// Step 3 — ship.
-	if _, err := ctx.RunStep("ship-order", func(context.Context) (string, error) {
+	if _, err := ctx.RunStep("ship-order", func(context.Context) (Shipment, error) {
 		fmt.Println("  ▶ EXECUTING ship-order          (real side effect)")
-		return "1Z999", nil // the tracking number, checkpointed
+		return Shipment{Tracking: "1Z999"}, nil
 	}); err != nil {
 		return nil, err
 	}

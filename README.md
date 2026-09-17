@@ -13,7 +13,7 @@ func (h *Checkout) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) 
     // Each step is checkpointed in Postgres. Crash after the charge and
     // restart — the charge is NOT repeated; the workflow resumes at shipping.
     receipt, err := ctx.RunStep("charge-card", func(c context.Context) (Receipt, error) {
-        return chargeCard(c, payload)   // runs exactly once
+        return chargeCard(c, payload)   // at most once per recorded success
     })
     if err != nil {
         return nil, err
@@ -184,7 +184,11 @@ type Greeting struct{ runnerq.DefaultDeadLetterHandler }
 
 func (h *Greeting) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
     greeting, err := ctx.RunStep("compose", func(context.Context) (string, error) {
-        return "hello, " + string(payload), nil
+        var name string
+        if err := json.Unmarshal(payload, &name); err != nil {
+            return "", runnerq.NewNonRetryError(err.Error())
+        }
+        return "hello, " + name, nil
     })
     if err != nil {
         return nil, err
