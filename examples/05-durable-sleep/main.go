@@ -32,9 +32,9 @@ type Onboarding struct {
 }
 
 func (h *Onboarding) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
-	if _, err := ctx.Run("send-welcome", func() (json.RawMessage, error) {
+	if _, err := ctx.RunStep("send-welcome", func(context.Context) (string, error) {
 		fmt.Printf("  ▶ %s  welcome email sent\n", time.Now().Format("15:04:05"))
-		return json.RawMessage(`{"sent":"welcome"}`), nil
+		return "welcome", nil
 	}); err != nil {
 		return nil, err
 	}
@@ -45,9 +45,9 @@ func (h *Onboarding) Handle(ctx runnerq.ActivityContext, payload json.RawMessage
 		return nil, err
 	}
 
-	if _, err := ctx.Run("send-tips", func() (json.RawMessage, error) {
+	if _, err := ctx.RunStep("send-tips", func(context.Context) (string, error) {
 		fmt.Printf("  ▶ %s  tips email sent\n", time.Now().Format("15:04:05"))
-		return json.RawMessage(`{"sent":"tips"}`), nil
+		return "tips", nil
 	}); err != nil {
 		return nil, err
 	}

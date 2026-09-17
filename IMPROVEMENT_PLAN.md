@@ -250,10 +250,11 @@ already exist (idempotency table, permanent results table, lineage columns):
 - `GetActivityEvents`/`GetResult` don't filter by queue_name (postgres.go:709, 1122-1128).
 - ◐ Activity naming API (Sept 2026): `ActivityType()` dropped from the handler
   interface; `RegisterActivity(h)` derives the type from the Go type name,
-  `RegisterActivityWithName` pins it, `NameOf[T]()` names spawns. Deferred until
-  go.mod moves to 1.27 (generic methods): make `ActivityExecutor` a concrete type
-  so spawns read `ctx.ActivityExecutor.Activity[child]()`, with `ActivityNamed`
-  for pinned/cross-process names.
+  `RegisterActivityWithName` pins it, `NameOf[T]()` names spawns (v0.5.0).
+  go.mod is on 1.27 as of v0.6.0, and `ctx.RunStep[R]` is the first generic
+  method. Next: make `ActivityExecutor` a concrete type so spawns read
+  `ctx.ActivityExecutor.Activity[child]()`, with `ActivityNamed` for
+  pinned/cross-process names; then typed `Await[R]` / `WaitForSignal[R]`.
 
 ---
 

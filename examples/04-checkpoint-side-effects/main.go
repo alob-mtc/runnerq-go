@@ -35,36 +35,41 @@ type BillingRun struct {
 	runnerq.DefaultDeadLetterHandler
 }
 
+// Receipt is the typed, checkpointed result of the charge step.
+type Receipt struct {
+	ChargeID string `json:"charge_id"`
+}
+
 func (h *BillingRun) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
 	fmt.Printf("billing_run attempt #%d\n", ctx.RetryCount)
 
 	// Charge once. Memoized on every retry after the first success.
-	receipt, err := ctx.Run("charge-credits", func() (json.RawMessage, error) {
+	receipt, err := ctx.RunStep("charge-credits", func(context.Context) (Receipt, error) {
 		n := chargeRuns.Add(1)
 		fmt.Printf("  ▶ charge-credits EXECUTING (run #%d) — real money moves here\n", n)
-		return json.RawMessage(`{"charge_id":"ch_42"}`), nil
+		return Receipt{ChargeID: "ch_42"}, nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	// Send the batch. Fails transiently on the first two attempts; ctx.Run
+	// Send the batch. Fails transiently on the first two attempts; RunStep
 	// does not checkpoint retryable failures, so this step re-runs while the
 	// charge above stays memoized.
-	_, err = ctx.Run("send-batch", func() (json.RawMessage, error) {
+	delivered, err := ctx.RunStep("send-batch", func(context.Context) (int, error) {
 		n := sendRuns.Add(1)
 		fmt.Printf("  ▶ send-batch EXECUTING (run #%d)\n", n)
 		if n < 3 {
-			return nil, runnerq.NewRetryError("smtp temporarily unavailable")
+			return 0, runnerq.NewRetryError("smtp temporarily unavailable")
 		}
-		return json.RawMessage(`{"delivered":1000}`), nil
+		return 1000, nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	fmt.Println("  ✓ batch delivered")
-	return receipt, nil
+	fmt.Printf("  ✓ batch delivered (%d messages)\n", delivered)
+	return json.Marshal(receipt)
 }
 
 func main() {

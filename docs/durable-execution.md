@@ -15,19 +15,29 @@ that must not repeat.
 
 - A handler may run **many times**. Code *outside* a durable primitive
   re-executes on every replay. Keep bare code free of side effects, or move
-  the side effect into a `ctx.Run`.
+  the side effect into a `ctx.RunStep`.
 - Each durable primitive has a **name**. Names must be **stable across
   retries** and **unique within the handler**. The name is the checkpoint key.
 - Delivery is **at-least-once**; checkpoints make recorded successes
   **at-most-once**.
 
-## `ctx.Run` — checkpoint a side effect
+## `ctx.RunStep` — checkpoint a side effect
 
 ```go
-receipt, err := ctx.Run("charge-card", func() (json.RawMessage, error) {
-    return chargeCard(payload)   // runs at most once per recorded success
+receipt, err := ctx.RunStep("charge-card", func(c context.Context) (Receipt, error) {
+    return chargeCard(c, payload)   // runs at most once per recorded success
 })
 ```
+
+`fn` is a `runnerq.Step[R]`: it receives a context derived from the
+activity's, so the activity timeout still bounds it, and returns any `R` that
+round-trips through `encoding/json`. The result is encoded into the
+checkpoint and decoded back into `R` on replay. If a deploy changes `R` so
+that a stored result no longer decodes, the step fails with a `NonRetryError`
+naming it — retrying cannot fix a shape mismatch.
+
+`ctx.Run(name, func() (json.RawMessage, error))` is the untyped form for
+callers already holding JSON. Both share the same checkpoint semantics.
 
 On replay, a step whose result is stored returns it **without re-running
 `fn`**. Semantics:
@@ -124,8 +134,8 @@ activity) and `processing`. The console surfaces it; signal delivery wakes only
 
 ```go
 func (h *FulfillOrder) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
-    receipt, err := ctx.Run("charge", func() (json.RawMessage, error) {
-        return chargeCard(payload)
+    receipt, err := ctx.RunStep("charge", func(c context.Context) (Receipt, error) {
+        return chargeCard(c, payload)
     })
     if err != nil { return nil, err }
 
@@ -138,9 +148,11 @@ func (h *FulfillOrder) Handle(ctx runnerq.ActivityContext, payload json.RawMessa
     feedback, err := ctx.WaitForSignal("delivered-confirmation", 7*24*time.Hour)
     if runnerq.IsSignalTimeout(err) { feedback = nil } else if err != nil { return nil, err }
 
-    return ctx.Run("close-order", func() (json.RawMessage, error) {
-        return closeOrder(receipt, feedback)
+    closed, err := ctx.RunStep("close-order", func(c context.Context) (Order, error) {
+        return closeOrder(c, receipt, feedback)
     })
+    if err != nil { return nil, err }
+    return json.Marshal(closed)
 }
 ```
 

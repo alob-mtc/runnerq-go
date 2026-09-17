@@ -93,7 +93,7 @@ type name and never consults the store.
 | `Ctx` | a `context.Context` bounded by the activity timeout |
 | `ActivityExecutor` | spawn child activities (tagged as children of this one) |
 | `ParentActivityID`, `RootActivityID`, `Depth` | lineage |
-| `Run`, `Sleep`, `WaitForSignal` | durable primitives — see [Durable Execution](durable-execution.md) |
+| `RunStep`, `Run`, `Sleep`, `WaitForSignal` | durable primitives — see [Durable Execution](durable-execution.md) |
 
 ```go
 func (h *MyHandler) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {

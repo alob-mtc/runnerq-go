@@ -34,9 +34,9 @@ go run .
 ## The key idea
 
 ```go
-ctx.Run("send-welcome", sendWelcome)
-ctx.Sleep("drip-delay", 24*time.Hour)   // persisted deadline; resumes the remainder
-ctx.Run("send-tips", sendTips)
+ctx.RunStep("send-welcome", sendWelcome)   // sendWelcome is a runnerq.Step[string]
+ctx.Sleep("drip-delay", 24*time.Hour)      // persisted deadline; resumes the remainder
+ctx.RunStep("send-tips", sendTips)
 ```
 
 If the process restarts mid-sleep, the workflow replays: `send-welcome` is

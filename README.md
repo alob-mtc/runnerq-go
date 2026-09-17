@@ -12,8 +12,8 @@ resumes from where it left off without redoing completed work.
 func (h *Checkout) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
     // Each step is checkpointed in Postgres. Crash after the charge and
     // restart — the charge is NOT repeated; the workflow resumes at shipping.
-    receipt, err := ctx.Run("charge-card", func() (json.RawMessage, error) {
-        return chargeCard(payload)   // runs exactly once
+    receipt, err := ctx.RunStep("charge-card", func(c context.Context) (Receipt, error) {
+        return chargeCard(c, payload)   // runs exactly once
     })
     if err != nil {
         return nil, err
@@ -69,13 +69,13 @@ RunnerQ gives you durable execution as a **library**:
 
 ### Durable workflows that survive crashes
 
-A handler that calls `ctx.Run` steps is a durable workflow. Each step's result
+A handler that calls `ctx.RunStep` steps is a durable workflow. Each step's result
 is checkpointed; if the process dies, the handler replays and completed steps
 return their stored results instead of re-executing.
 
 ```go
-receipt, err := ctx.Run("charge-card", func() (json.RawMessage, error) {
-    return chargeCard(payload)   // at most once, even across retries and restarts
+receipt, err := ctx.RunStep("charge-card", func(c context.Context) (Receipt, error) {
+    return chargeCard(c, payload)   // at most once, even across retries and restarts
 })
 ```
 
@@ -183,10 +183,13 @@ import (
 type Greeting struct{ runnerq.DefaultDeadLetterHandler }
 
 func (h *Greeting) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
-    greeting, err := ctx.Run("compose", func() (json.RawMessage, error) {
-        return json.Marshal("hello, " + string(payload))
+    greeting, err := ctx.RunStep("compose", func(context.Context) (string, error) {
+        return "hello, " + string(payload), nil
     })
-    return greeting, err
+    if err != nil {
+        return nil, err
+    }
+    return json.Marshal(greeting)
 }
 
 func main() {

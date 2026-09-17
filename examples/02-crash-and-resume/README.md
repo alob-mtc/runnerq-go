@@ -63,9 +63,9 @@ engine.GetActivityExecutor().
     IdempotencyKeyOption(orderID, runnerq.ReturnExisting).
     Payload(...).Execute(ctx)
 
-// 2. ctx.Run checkpoints each step, so a replay skips completed ones.
-ctx.Run("charge-card", func() (json.RawMessage, error) {
-    return chargeCard(...)   // never runs twice for this workflow
+// 2. ctx.RunStep checkpoints each step, so a replay skips completed ones.
+chargeID, err := ctx.RunStep("charge-card", func(c context.Context) (string, error) {
+    return chargeCard(c, ...)   // never runs twice for this workflow
 })
 ```
 
