@@ -19,7 +19,7 @@ func (h *Checkout) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) 
         return nil, err
     }
 
-    ship, err := ctx.ActivityExecutor.Activity("ship").Step("ship").Payload(payload).Execute(ctx.Ctx)
+    ship, err := ctx.ActivityExecutor.Activity[Ship]().Step("ship").Payload(payload).Execute(ctx.Ctx)
     if err != nil {
         return nil, err
     }
@@ -87,7 +87,7 @@ await children **park** in the database — no goroutine, no lease, no retry
 burned while they wait.
 
 ```go
-fut, _ := ctx.ActivityExecutor.Activity("reserve").Step("reserve").Payload(p).Execute(ctx.Ctx)
+fut, _ := ctx.ActivityExecutor.Activity[Reserve]().Step("reserve").Payload(p).Execute(ctx.Ctx)
 reserved, _ := fut.GetResult(ctx.Ctx)   // memoized on replay
 ```
 
@@ -117,7 +117,7 @@ Idempotency keys make enqueuing exactly-once — dedupe webhooks and event
 handlers with one option.
 
 ```go
-executor.Activity("process_event").
+executor.ActivityNamed("process_event").
     Payload(p).
     IdempotencyKeyOption(eventID, runnerq.ReturnExisting).   // duplicate deliveries collapse to one
     Execute(ctx)
@@ -129,7 +129,7 @@ Priorities, exponential-backoff retries, a dead-letter queue, scheduling, and
 worker-level type filtering so slow jobs can't starve latency-sensitive ones.
 
 ```go
-executor.Activity("send_email").
+executor.ActivityNamed("send_email").
     Payload(p).
     Priority(runnerq.PriorityHigh).
     MaxRetries(5).
@@ -213,7 +213,7 @@ func main() {
     go engine.Start(ctx)
 
     future, _ := engine.GetActivityExecutor().
-        Activity(runnerq.NameOf[Greeting]()).
+        Activity[Greeting]().
         Payload(json.RawMessage(`"world"`)).
         Execute(ctx)
 
@@ -221,6 +221,24 @@ func main() {
     fmt.Println(string(result))   // "hello, world"
 }
 ```
+
+Every registration and spawn comes in two interchangeable forms. The
+**typed** form above derives the activity name from the handler type, so
+nothing can drift; it is the one to reach for. The **named** form takes a
+string you choose, for names that must outlive a refactor, one handler
+serving several types, or producers with no Go type in scope. It is also the
+shape of the v0.5 API, which is where to stay if you cannot yet move to
+Go 1.27 (required by v0.6+).
+
+```go
+engine.RegisterActivity(&Greeting{})                       // typed
+engine.GetActivityExecutor().Activity[Greeting]()
+
+engine.RegisterActivityWithName("greeting", &Greeting{})   // named
+engine.GetActivityExecutor().ActivityNamed("greeting")
+```
+
+See [Naming activities](docs/workflows.md#naming-activities).
 
 ## Examples
 

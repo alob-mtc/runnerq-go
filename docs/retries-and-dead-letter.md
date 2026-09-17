@@ -22,7 +22,7 @@ roughly `retry_delay * 2^attempt`, capped by `MaxRetryDelay` (default 1 hour).
 on the `ActivityContext` tells the handler which attempt it's on.
 
 ```go
-executor.Activity("call_api").
+executor.ActivityNamed("call_api").
     Payload(p).
     MaxRetries(10).
     MaxRetryDelay(5 * time.Minute).

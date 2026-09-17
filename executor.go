@@ -15,11 +15,6 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// ActivityExecutor allows executing activities, enabling orchestration.
-type ActivityExecutor interface {
-	Activity(activityType string) *ActivityBuilder
-}
-
 // ActivityFuture represents a pending activity result that can be awaited.
 type ActivityFuture struct {
 	queue      activityQueue
@@ -154,7 +149,7 @@ func translateResult(result *activityResult) (json.RawMessage, error) {
 
 // ActivityBuilder builds and executes activities with fluent configuration.
 type ActivityBuilder struct {
-	wrapper        *WorkerEngineWrapper
+	exec           *ActivityExecutor
 	activityType   string
 	payload        json.RawMessage
 	priority       *ActivityPriority
@@ -330,12 +325,14 @@ func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) 
 		}
 	}
 
-	return b.wrapper.executeActivity(ctx, b.activityType, b.payload, option, b.asRoot, b.step)
+	return b.exec.executeActivity(ctx, b.activityType, b.payload, option, b.asRoot, b.step)
 }
 
-// WorkerEngineWrapper provides activity execution capabilities.
-// It implements ActivityExecutor.
-type WorkerEngineWrapper struct {
+// ActivityExecutor spawns activities. The engine's executor
+// (GetActivityExecutor) spawns roots; the one on an ActivityContext spawns
+// children of the running activity. Name the target by handler type with
+// Activity, or by string with ActivityNamed.
+type ActivityExecutor struct {
 	queue    activityQueue
 	maxDepth uint16
 	lineage  *lineageScope // nil at engine level; set when scoped to a running parent
@@ -348,15 +345,15 @@ type lineageScope struct {
 	childDepth uint16 // depth of the CHILD being spawned (parent.Depth + 1)
 }
 
-func newWorkerEngineWrapperWithDepth(queue activityQueue, maxDepth uint16) *WorkerEngineWrapper {
+func newActivityExecutor(queue activityQueue, maxDepth uint16) *ActivityExecutor {
 	if maxDepth == 0 {
 		maxDepth = DefaultMaxActivityDepth
 	}
-	return &WorkerEngineWrapper{queue: queue, maxDepth: maxDepth}
+	return &ActivityExecutor{queue: queue, maxDepth: maxDepth}
 }
 
-// scopedForChild returns a wrapper whose spawns will be tagged as children of parent.
-func (w *WorkerEngineWrapper) scopedForChild(parent *activity) *WorkerEngineWrapper {
+// scopedForChild returns an executor whose spawns will be tagged as children of parent.
+func (w *ActivityExecutor) scopedForChild(parent *activity) *ActivityExecutor {
 	rootID := parent.RootActivityID
 	if rootID == (uuid.UUID{}) {
 		rootID = parent.ID
@@ -368,7 +365,7 @@ func (w *WorkerEngineWrapper) scopedForChild(parent *activity) *WorkerEngineWrap
 	if parent.Depth < math.MaxUint16 {
 		childDepth = parent.Depth + 1
 	}
-	return &WorkerEngineWrapper{
+	return &ActivityExecutor{
 		queue:    w.queue,
 		maxDepth: w.maxDepth,
 		lineage: &lineageScope{
@@ -379,15 +376,28 @@ func (w *WorkerEngineWrapper) scopedForChild(parent *activity) *WorkerEngineWrap
 	}
 }
 
-// Activity creates a fluent activity builder.
-func (w *WorkerEngineWrapper) Activity(activityType string) *ActivityBuilder {
+// Activity starts a spawn of the activity served by handler type T — the
+// type passed to RegisterActivity, so registration and spawn cannot drift:
+//
+//	fut, err := ctx.ActivityExecutor.Activity[ResizeImage]().Payload(p).Execute(ctx.Ctx)
+//
+// T may be the handler struct or a pointer to it. Handlers registered under
+// a pinned name (RegisterActivityWithName) are spawned with ActivityNamed.
+func (w *ActivityExecutor) Activity[T any]() *ActivityBuilder {
+	return w.ActivityNamed(NameOf[T]())
+}
+
+// ActivityNamed starts a spawn of activityType by its string — for handlers
+// registered under a pinned name, and for producers that never see the
+// handler type (other services, other languages).
+func (w *ActivityExecutor) ActivityNamed(activityType string) *ActivityBuilder {
 	return &ActivityBuilder{
-		wrapper:      w,
+		exec:         w,
 		activityType: activityType,
 	}
 }
 
-func (w *WorkerEngineWrapper) executeActivity(ctx context.Context, activityType string, payload json.RawMessage, option *ActivityOption, asRoot bool, step string) (*ActivityFuture, error) {
+func (w *ActivityExecutor) executeActivity(ctx context.Context, activityType string, payload json.RawMessage, option *ActivityOption, asRoot bool, step string) (*ActivityFuture, error) {
 	a := newActivity(activityType, payload, option)
 
 	if w.lineage != nil && !asRoot {

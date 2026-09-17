@@ -85,7 +85,7 @@ func main() {
 	}()
 
 	future, err := engine.GetActivityExecutor().
-		Activity(runnerq.NameOf[Onboarding]()).
+		Activity[Onboarding]().
 		Payload(json.RawMessage(`{"user":"grace"}`)).
 		Execute(ctx)
 	if err != nil {

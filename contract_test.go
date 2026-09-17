@@ -113,7 +113,7 @@ func TestContract_NoLostNoDuplicateWork_ConcurrentFleets(t *testing.T) {
 	exec := engines[0].GetActivityExecutor()
 	for i := range activities {
 		p, _ := json.Marshal(map[string]int{"id": i})
-		if _, err := exec.Activity("unit").Payload(p).Execute(context.Background()); err != nil {
+		if _, err := exec.ActivityNamed("unit").Payload(p).Execute(context.Background()); err != nil {
 			t.Fatalf("enqueue %d: %v", i, err)
 		}
 	}
@@ -181,7 +181,7 @@ func TestContract_ConcurrentIdempotentEnqueue(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			fut, err := exec.Activity("once").
+			fut, err := exec.ActivityNamed("once").
 				IdempotencyKeyOption("same-event", ReturnExisting).
 				Payload(json.RawMessage(`{}`)).
 				Execute(context.Background())

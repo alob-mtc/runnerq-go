@@ -6,16 +6,17 @@ import (
 )
 
 // NameOf returns the activity type derived from T, exactly as RegisterActivity
-// derives it from a handler value — so a spawn can name its target by type
-// instead of by string:
+// derives it from a handler value and ActivityExecutor.Activity derives it
+// for a spawn. Use it where an API takes the type as a string:
 //
 //	engine.RegisterActivity(&ResizeImage{})
-//	exec.Activity(runnerq.NameOf[ResizeImage]()).Payload(p).Execute(ctx)
+//	runnerq.Builder().ActivityTypes([]string{runnerq.NameOf[ResizeImage]()})
+//	engine.SignalByKey(ctx, runnerq.NameOf[ResizeImage](), key, "approved", p)
 //
 // T may be the handler struct or a pointer to it; both yield the same name.
 // NameOf panics for types with no name (anonymous structs, unnamed func
 // types). It knows nothing about registration: a handler registered under a
-// pinned name via RegisterActivityWithName must be spawned by that name.
+// pinned name via RegisterActivityWithName is addressed by that name.
 func NameOf[T any]() string {
 	name, err := activityTypeOf(reflect.TypeOf((*T)(nil)).Elem())
 	if err != nil {

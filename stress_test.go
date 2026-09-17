@@ -273,7 +273,7 @@ func enqueueMany(t *testing.T, e *WorkerEngine, typ string, n int, opts func(*Ac
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			b := e.GetActivityExecutor().Activity(typ).Payload(json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)))
+			b := e.GetActivityExecutor().ActivityNamed(typ).Payload(json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)))
 			if opts != nil {
 				opts(b, i)
 			}
@@ -327,7 +327,7 @@ func TestStressThroughputBatchVsSingle(t *testing.T) {
 				counter.hit(ctx.ActivityID)
 				futs := make([]*ActivityFuture, 0, children)
 				for i := range children {
-					f, err := ctx.ActivityExecutor.Activity("child").Step(fmt.Sprintf("c%d", i)).Payload(json.RawMessage(`{}`)).Execute(ctx.Ctx)
+					f, err := ctx.ActivityExecutor.ActivityNamed("child").Step(fmt.Sprintf("c%d", i)).Payload(json.RawMessage(`{}`)).Execute(ctx.Ctx)
 					if err != nil {
 						return nil, err
 					}

@@ -68,7 +68,7 @@ func main() {
 	}()
 
 	future, err := engine.GetActivityExecutor().
-		Activity(runnerq.NameOf[QuickJob]()).
+		Activity[QuickJob]().
 		Payload(json.RawMessage(`{}`)).
 		Execute(ctx)
 	if err != nil {

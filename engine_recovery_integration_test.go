@@ -63,7 +63,7 @@ func TestContract_SideEffectExactlyOnceAcrossCrashRecovery(t *testing.T) {
 	e.RegisterActivityWithName("resilient", &funcHandler{fn: func(c ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 		return c.Run("charge", func() (json.RawMessage, error) { rerun.Add(1); return json.RawMessage(`"unexpected reexecution"`), nil })
 	}})
-	fut, err := e.GetActivityExecutor().Activity("resilient").Payload(json.RawMessage(`{}`)).Execute(ctx)
+	fut, err := e.GetActivityExecutor().ActivityNamed("resilient").Payload(json.RawMessage(`{}`)).Execute(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestEngineReconcilesLostPostgresCompletionReply(t *testing.T) {
 		return json.RawMessage(`"original"`), nil
 	}})
 	startEngine(t, e)
-	f, err := e.GetActivityExecutor().Activity("receipt").Payload(json.RawMessage(`{}`)).MaxRetries(1).Execute(context.Background())
+	f, err := e.GetActivityExecutor().ActivityNamed("receipt").Payload(json.RawMessage(`{}`)).MaxRetries(1).Execute(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,14 +210,14 @@ func TestRehydratedFutureRegistersIndependentConsumers(t *testing.T) {
 			return FutureFor(e.backend, id).GetResult(c.Ctx)
 		}})
 	})
-	f, err := rig.engine.GetActivityExecutor().Activity("producer").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+	f, err := rig.engine.GetActivityExecutor().ActivityNamed("producer").Payload(json.RawMessage(`{}`)).Execute(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	payload, _ := json.Marshal(f.ActivityID())
 	var consumers []*ActivityFuture
 	for range 2 {
-		c, err := rig.engine.GetActivityExecutor().Activity("consumer").Payload(payload).Execute(context.Background())
+		c, err := rig.engine.GetActivityExecutor().ActivityNamed("consumer").Payload(payload).Execute(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}

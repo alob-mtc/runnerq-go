@@ -53,7 +53,7 @@ func TestRetentionSweepsCompletedWorkflowEndToEnd(t *testing.T) {
 		}); err != nil {
 			return nil, err
 		}
-		fut, err := ctx.ActivityExecutor.Activity("leaf").Step("leaf").
+		fut, err := ctx.ActivityExecutor.ActivityNamed("leaf").Step("leaf").
 			Payload(json.RawMessage(`{}`)).Execute(ctx.Ctx)
 		if err != nil {
 			return nil, err
@@ -78,7 +78,7 @@ func TestRetentionSweepsCompletedWorkflowEndToEnd(t *testing.T) {
 	})
 
 	fut, err := engine.GetActivityExecutor().
-		Activity("root").Payload(json.RawMessage(`{}`)).Execute(ctx)
+		ActivityNamed("root").Payload(json.RawMessage(`{}`)).Execute(ctx)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}

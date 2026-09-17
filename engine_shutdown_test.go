@@ -66,7 +66,7 @@ func TestGracefulShutdownCompletesInFlightActivity(t *testing.T) {
 	go func() { startDone <- engine.Start(ctx) }()
 
 	fut, err := engine.GetActivityExecutor().
-		Activity("slow").
+		ActivityNamed("slow").
 		Payload(json.RawMessage(`{}`)).
 		Execute(ctx)
 	if err != nil {

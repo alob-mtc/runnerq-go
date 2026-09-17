@@ -80,7 +80,7 @@ func (h *ProcessPayment) Handle(ctx runnerq.ActivityContext, payload json.RawMes
 	}
 
 	// Step 5 — spawn and await a child. Parks → banner: "Awaiting child …".
-	notify, err := ctx.ActivityExecutor.Activity(runnerq.NameOf[NotifyCustomer]()).Step("notify").Payload(payload).Execute(ctx.Ctx)
+	notify, err := ctx.ActivityExecutor.Activity[NotifyCustomer]().Step("notify").Payload(payload).Execute(ctx.Ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +137,7 @@ func main() {
 			// A 5s timeout (well under the 90s signal wait and 10s sleep) forces
 			// those waits to PARK, which is what shows the Blocked-on banner.
 			if _, err := engine.GetActivityExecutor().
-				Activity(paymentActivity).
+				Activity[ProcessPayment]().
 				IdempotencyKeyOption(ref, runnerq.ReturnExisting).
 				Timeout(5 * time.Second).
 				Payload(payload).
