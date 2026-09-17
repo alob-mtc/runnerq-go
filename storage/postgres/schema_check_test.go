@@ -139,3 +139,73 @@ func TestSchemaInitIgnoresSameNamedIndexInOtherSchema(t *testing.T) {
 		t.Fatal("init dropped an index that belongs to another schema")
 	}
 }
+
+// A waiter for the schema lock must not sit inside a blocked
+// pg_advisory_lock: that statement pins a snapshot, and the holder's CREATE
+// INDEX CONCURRENTLY waits for all older snapshots — a cycle Postgres breaks
+// with 40P01. With the lock held externally and the fast path disabled, a
+// booting backend must wait without any session blocked on the advisory
+// lock, then complete once the lock is released.
+func TestSchemaInitWaitsForLockWithoutPinningSnapshot(t *testing.T) {
+	b := testBackend(t)
+	ctx := context.Background()
+	if _, err := b.pool.Exec(ctx, `DROP INDEX IF EXISTS idx_runnerq_root_status`); err != nil {
+		t.Fatal(err)
+	}
+
+	holder, err := b.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Release()
+	if _, err := holder.Exec(ctx, `SELECT pg_advisory_lock($1)`, schemaAdvisoryLockKey); err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		if _, err := holder.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, schemaAdvisoryLockKey); err != nil {
+			t.Errorf("unlock: %v", err)
+		}
+	}
+	defer release()
+
+	connectCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	done := make(chan *PostgresBackend, 1)
+	go func() { done <- testBackendNamedCtx(t, connectCtx, "t_lockpoll") }()
+
+	select {
+	case other := <-done:
+		other.Close()
+		t.Fatal("backend initialized while another session held the schema lock")
+	case <-time.After(500 * time.Millisecond):
+	}
+	var blocked int
+	if err := holder.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND wait_event = 'advisory'`).Scan(&blocked); err != nil {
+		t.Fatal(err)
+	}
+	if blocked != 0 {
+		t.Fatalf("%d session(s) blocked inside pg_advisory_lock while waiting for the schema lock; a blocked waiter pins a snapshot and can deadlock the holder's CREATE INDEX CONCURRENTLY", blocked)
+	}
+
+	release()
+	select {
+	case other := <-done:
+		other.Close()
+	case <-time.After(15 * time.Second):
+		t.Fatal("backend did not initialize after the schema lock was released")
+	}
+
+	conn, err := b.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if current, err := schemaCurrent(ctx, conn); err != nil || !current {
+		t.Fatalf("schema not restored after the waiter initialized: %v, %v", current, err)
+	}
+}
