@@ -29,27 +29,39 @@ See [Retries & Dead Letter](retries-and-dead-letter.md) for the failure model.
 ## Naming activities
 
 Every activity carries a type string that routes it to a handler. Registration
-decides that string, not the handler:
+decides that string, not the handler, and there are **two ways to say it**.
+Both are first-class and can be mixed in one program.
+
+| | Typed (recommended) | Named |
+|---|---|---|
+| Register | `engine.RegisterActivity(&ResizeImage{})` | `engine.RegisterActivityWithName("resize_image", &ResizeImage{})` |
+| Spawn | `exec.Activity[ResizeImage]()` | `exec.ActivityNamed("resize_image")` |
+| Type string | derived: `"ResizeImage"` | whatever you pass |
+
+**Typed** derives the type from the handler's Go type name, so registration
+and spawn can never drift and there is no string to keep in sync. Reach for
+it by default.
+
+**Named** takes the string from you. It is not a legacy path: it is how you
+pin a type that must outlive a refactor, serve several types from one handler,
+or enqueue from a producer that has no Go type in scope. It is also the shape
+of the v0.5 API, so code written against v0.5 keeps the same structure
+(`RegisterActivity(name, h)` there is `RegisterActivityWithName` here, and
+`Activity(name)` is `ActivityNamed`). RunnerQ v0.6+ requires Go 1.27; on an
+older toolchain stay on v0.5, where the named form is the only one.
 
 ```go
-// Derived from the handler's Go type name: "ResizeImage".
+// Typed: the handler type is the name.
 engine.RegisterActivity(&ResizeImage{})
+exec.Activity[ResizeImage]().Payload(p).Execute(ctx)
 
-// Pinned explicitly.
+// Named: you choose the string.
 engine.RegisterActivityWithName("resize_image", &ResizeImage{})
+exec.ActivityNamed("resize_image").Payload(p).Execute(ctx)
 ```
 
 Derivation uses the bare type name — no package prefix, no case changes — and
 panics for unnamed types (anonymous structs) and duplicate registrations.
-Spawns name their target the same way. `Activity[T]()` derives the type from
-the handler, so registration and spawn cannot drift; `ActivityNamed(string)`
-addresses a pinned name or one the caller only knows as a string:
-
-```go
-exec.Activity[ResizeImage]().Payload(p).Execute(ctx)
-exec.ActivityNamed("resize_image").Payload(p).Execute(ctx)
-```
-
 `runnerq.NameOf[T]()` returns the derived string for APIs that take one —
 `ActivityTypes` on the builder, `SignalByKey`.
 

@@ -19,7 +19,7 @@ func (h *Checkout) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) 
         return nil, err
     }
 
-    ship, err := ctx.ActivityExecutor.ActivityNamed("ship").Step("ship").Payload(payload).Execute(ctx.Ctx)
+    ship, err := ctx.ActivityExecutor.Activity[Ship]().Step("ship").Payload(payload).Execute(ctx.Ctx)
     if err != nil {
         return nil, err
     }
@@ -87,7 +87,7 @@ await children **park** in the database — no goroutine, no lease, no retry
 burned while they wait.
 
 ```go
-fut, _ := ctx.ActivityExecutor.ActivityNamed("reserve").Step("reserve").Payload(p).Execute(ctx.Ctx)
+fut, _ := ctx.ActivityExecutor.Activity[Reserve]().Step("reserve").Payload(p).Execute(ctx.Ctx)
 reserved, _ := fut.GetResult(ctx.Ctx)   // memoized on replay
 ```
 
@@ -221,6 +221,24 @@ func main() {
     fmt.Println(string(result))   // "hello, world"
 }
 ```
+
+Every registration and spawn comes in two interchangeable forms. The
+**typed** form above derives the activity name from the handler type, so
+nothing can drift; it is the one to reach for. The **named** form takes a
+string you choose, for names that must outlive a refactor, one handler
+serving several types, or producers with no Go type in scope. It is also the
+shape of the v0.5 API, which is where to stay if you cannot yet move to
+Go 1.27 (required by v0.6+).
+
+```go
+engine.RegisterActivity(&Greeting{})                       // typed
+engine.GetActivityExecutor().Activity[Greeting]()
+
+engine.RegisterActivityWithName("greeting", &Greeting{})   // named
+engine.GetActivityExecutor().ActivityNamed("greeting")
+```
+
+See [Naming activities](docs/workflows.md#naming-activities).
 
 ## Examples
 
