@@ -54,6 +54,9 @@ type WorkerEngine struct {
 	// and was still running.
 	instanceID string
 
+	// heartbeatInterval overrides attemptHeartbeatInterval; zero uses it.
+	heartbeatInterval time.Duration
+
 	poolID uuid.UUID // identity used for worker_pools registration; zero if backend doesn't support it
 }
 
@@ -561,8 +564,12 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	}
 
 	activityTimeout := time.Duration(act.TimeoutSeconds) * time.Second
-	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, activityTimeout)
+	deadlineCtx, timeoutCancel := context.WithTimeout(ctx, activityTimeout)
 	defer timeoutCancel()
+	// revoke cancels the handler early when the heartbeat finds the claim
+	// lost; context.Cause then reports the ErrClaimLost error.
+	timeoutCtx, revoke := context.WithCancelCause(deadlineCtx)
+	defer revoke(nil)
 	// Mark the context as handler-scoped so in-handler GetResult calls may
 	// yield-park this activity; awaits outside a handler block normally.
 	timeoutCtx = withHandlerScope(timeoutCtx)
@@ -587,7 +594,20 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	payloadForDL := make(json.RawMessage, len(act.Payload))
 	copy(payloadForDL, act.Payload)
 
+	stopHeartbeat := attemptQ.heartbeat(timeoutCtx, e.heartbeatInterval, revoke)
 	result, handlerErr := e.safeHandle(handler, actCtx, act.Payload)
+	stopHeartbeat()
+
+	// Another execution owns the activity now. Whatever the handler returned —
+	// a result included — belongs to a superseded attempt; the acks would be
+	// rejected by the fence anyway.
+	if cause := context.Cause(timeoutCtx); cause != nil {
+		if se, ok := storage.IsStorageError(cause); ok && se.Kind == storage.ErrClaimLost {
+			e.metrics.IncCounter("activity_claim_lost", 1)
+			slog.Warn("Activity execution lost its claim; handler was cancelled", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "error", cause)
+			return
+		}
+	}
 
 	// A yielding durable Sleep is not a failure: park the activity until its
 	// wake time without consuming a retry. Checked before the timeout so a

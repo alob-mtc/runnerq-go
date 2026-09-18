@@ -442,12 +442,21 @@ func strPtr(s string) *string { return &s }
 // ============================================================================
 
 func (b *PostgresBackend) Enqueue(ctx context.Context, a storage.QueuedActivity) error {
+	return b.enqueue(ctx, a, nil)
+}
+
+// enqueue inserts one activity. A non-nil fence makes the insert conditional
+// on the spawning execution's claim, checked in the same transaction.
+func (b *PostgresBackend) enqueue(ctx context.Context, a storage.QueuedActivity, fence *spawnFence) error {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
 		return databaseError(err, fmt.Sprintf("Failed to begin transaction: %v", err))
 	}
 	defer tx.Rollback(ctx)
 
+	if err := b.verifySpawnFenceTx(ctx, tx, fence); err != nil {
+		return err
+	}
 	if err := b.enqueueInTx(ctx, tx, &a); err != nil {
 		return err
 	}
@@ -1754,15 +1763,19 @@ func (b *PostgresBackend) GetResult(ctx context.Context, activityID uuid.UUID) (
 }
 
 func (b *PostgresBackend) EnqueueIdempotent(ctx context.Context, a *storage.QueuedActivity) (*storage.IdempotencyResult, error) {
+	return b.enqueueIdempotent(ctx, a, nil)
+}
+
+func (b *PostgresBackend) enqueueIdempotent(ctx context.Context, a *storage.QueuedActivity, fence *spawnFence) (*storage.IdempotencyResult, error) {
 	if a.IdempotencyKey == nil {
-		return nil, b.Enqueue(ctx, *a)
+		return nil, b.enqueue(ctx, *a, fence)
 	}
 	key := a.IdempotencyKey.Key
 	behavior := a.IdempotencyKey.Behavior
 
 	const maxAttempts = 3
 	for range maxAttempts {
-		result, done, err := b.tryEnqueueIdempotent(ctx, a, key, behavior)
+		result, done, err := b.tryEnqueueIdempotent(ctx, a, key, behavior, fence)
 		if err != nil {
 			return nil, err
 		}
@@ -1780,12 +1793,17 @@ func (b *PostgresBackend) EnqueueIdempotent(ctx context.Context, a *storage.Queu
 // commit (or roll back) together — there is no state where the key points at
 // an activity that was never enqueued. Returns done=false when the key row
 // disappeared mid-attempt and the caller should retry.
-func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.QueuedActivity, key string, behavior storage.IdempotencyBehavior) (*storage.IdempotencyResult, bool, error) {
+func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.QueuedActivity, key string, behavior storage.IdempotencyBehavior, fence *spawnFence) (*storage.IdempotencyResult, bool, error) {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
 		return nil, false, databaseError(err, fmt.Sprintf("Failed to begin transaction: %v", err))
 	}
 	defer tx.Rollback(ctx)
+
+	// Lock order: the spawner's own row, then the idempotency key row.
+	if err := b.verifySpawnFenceTx(ctx, tx, fence); err != nil {
+		return nil, false, err
+	}
 
 	resolvedKey, err := b.resolveBusinessKeyTx(ctx, tx, key, a.ActivityType)
 	if err != nil {

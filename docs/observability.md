@@ -81,7 +81,8 @@ The default is `runnerq.NoopMetrics`. Counters currently emitted:
 | `activity_retry` | requested a retry |
 | `activity_failed_non_retry` | failed permanently |
 | `activity_timeout` | exceeded its timeout |
-| `activity_lost_completion` | finished but the lease had moved on (work will rerun) |
+| `activity_claim_lost` | the execution lost its claim — cancelled mid-handler by the heartbeat, or its ack was rejected by the fence (the replacement execution owns the outcome) |
+| `activity_heartbeat_failed` | a claim renewal failed and will be retried on the next beat |
 | `activity_yielded` | parked for a durable wait (sleep/signal/await) |
 | `activity_trees_swept` | workflow trees deleted by retention |
 

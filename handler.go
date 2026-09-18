@@ -24,7 +24,12 @@ type ActivityContext struct {
 	// Metadata is custom metadata associated with the activity.
 	Metadata map[string]string
 
-	// Ctx is the Go context for cancellation and deadline propagation.
+	// Ctx is the Go context for cancellation and deadline propagation. It ends
+	// at the activity's timeout, and earlier if this execution loses its claim
+	// (its lease expired and the activity was handed to another worker) —
+	// context.Cause(Ctx) is then a storage ErrClaimLost error. Handlers must
+	// stop on cancellation: the engine cannot interrupt one that ignores it,
+	// and its side effects would overlap the replacement execution's.
 	Ctx context.Context
 
 	// ActivityExecutor spawns other activities from within a handler.

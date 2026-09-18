@@ -20,6 +20,17 @@ type CheckpointStorage interface {
 	StoreCheckpoint(ctx context.Context, resultID, ownerID uuid.UUID, workerID string, result ActivityResult, step string) error
 }
 
+// SpawnStorage fences activities spawned from inside a handler on the spawning
+// execution's claim: the claim check and the insert commit together, so an
+// execution that lost its lease — and whose replacement may already be issuing
+// the same spawns — cannot add children to the tree. ownerID is the executing
+// activity, which is also the fence for spawns detached with AsRoot. Both
+// methods return ErrClaimLost when workerID no longer holds ownerID.
+type SpawnStorage interface {
+	EnqueueForWorker(ctx context.Context, a QueuedActivity, ownerID uuid.UUID, workerID string) error
+	EnqueueIdempotentForWorker(ctx context.Context, a *QueuedActivity, ownerID uuid.UUID, workerID string) (*IdempotencyResult, error)
+}
+
 // DependencyStorage keeps result consumers independent of parent lineage.
 // References survive replay and are removed with consumer-tree retention.
 // RegisterDependency rejects missing producers for rehydrated activity futures.

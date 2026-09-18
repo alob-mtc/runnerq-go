@@ -229,3 +229,58 @@ func TestRehydratedFutureRegistersIndependentConsumers(t *testing.T) {
 		}
 	}
 }
+
+// A live execution whose lease was taken away (a stall longer than the lease)
+// learns of it from its heartbeat: its handler is cancelled with the cause,
+// its spawns are rejected, and only the replacement execution completes.
+func TestSupersededExecutionIsCancelledAndCannotSpawn(t *testing.T) {
+	var runs atomic.Int32
+	firstRunning := make(chan struct{})
+	firstCause := make(chan error, 1)
+	staleSpawn := make(chan error, 1)
+	rig := newStepsRig(t, func(e *WorkerEngine) {
+		e.heartbeatInterval = 50 * time.Millisecond
+		e.RegisterActivityWithName("child", &funcHandler{fn: func(ActivityContext, json.RawMessage) (json.RawMessage, error) { return nil, nil }})
+		e.RegisterActivityWithName("parent", &funcHandler{fn: func(c ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+			if runs.Add(1) > 1 {
+				return json.RawMessage(`"replacement"`), nil
+			}
+			close(firstRunning)
+			<-c.Ctx.Done()
+			firstCause <- context.Cause(c.Ctx)
+			// A handler that ignores cancellation still cannot grow the tree.
+			_, err := c.ActivityExecutor.ActivityNamed("child").Payload(json.RawMessage(`{}`)).Execute(context.Background())
+			staleSpawn <- err
+			return json.RawMessage(`"superseded"`), nil
+		}})
+	})
+	ctx := context.Background()
+	fut, err := rig.engine.GetActivityExecutor().ActivityNamed("parent").Payload(json.RawMessage(`{}`)).Timeout(30 * time.Second).Execute(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive(t, firstRunning)
+	conn, err := pgx.Connect(ctx, os.Getenv("RUNNERQ_TEST_DSN"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	if _, err := conn.Exec(ctx, `UPDATE runnerq_activities SET lease_deadline_ms=(EXTRACT(EPOCH FROM NOW())*1000)::bigint-1000 WHERE id=$1`, fut.ActivityID()); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := rig.backend.RequeueExpired(ctx, 10); err != nil || n != 1 {
+		t.Fatalf("reaper %d %v", n, err)
+	}
+	for name, ch := range map[string]chan error{"cause": firstCause, "spawn": staleSpawn} {
+		if se, ok := storage.IsStorageError(receive(t, ch)); !ok || se.Kind != storage.ErrClaimLost {
+			t.Fatalf("superseded %s was not a lost claim", name)
+		}
+	}
+	if res := rig.await(t, fut.ActivityID(), 10*time.Second); string(res.Data) != `"replacement"` {
+		t.Fatalf("result=%s", res.Data)
+	}
+	var children int
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM runnerq_activities WHERE parent_activity_id=$1`, fut.ActivityID()).Scan(&children); err != nil || children != 0 {
+		t.Fatalf("children=%d err=%v", children, err)
+	}
+}
