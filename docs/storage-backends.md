@@ -69,6 +69,14 @@ optional `storage.ResultWaiter` (`WaitForResult`) — futures use it instead of
 polling, and it must work across processes. Without it, awaiting falls back to
 a 100ms poll.
 
+Two more optional interfaces bound what an execution that lost its lease can
+do. `storage.AttemptLeaseStorage` (`ExtendLeaseForWorker`) lets the engine
+heartbeat a running handler's claim and cancel the handler when the claim is
+gone. `storage.SpawnStorage` (`EnqueueForWorker`, `EnqueueIdempotentForWorker`)
+makes handler-issued spawns conditional on the claim, atomically with the
+insert. Without them the engine falls back to lease sizing alone and unfenced
+spawns.
+
 > **Caveat:** the interface — especially the parking/wakeup and atomicity
 > contracts behind durable execution — is non-trivial to get right. Unless you
 > have a strong reason to target another store, run the Postgres backend (or

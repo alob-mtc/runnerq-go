@@ -54,6 +54,31 @@ The lease covers the activity's whole timeout (`max(engine lease, timeout +
 out from under itself. Tune the floor with `postgres.WithConfig` — see
 [Configuration](configuration.md).
 
+### When a live execution loses its lease
+
+A lease can expire under a worker that is still alive: the process stalled
+(a VM freeze, a long GC or CPU-throttling pause) or was cut off from the
+database for longer than the lease. The reaper then hands the activity to
+another worker while the first may still be running. Three mechanisms bound
+what the superseded execution can do:
+
+- **Fencing.** Every write an execution makes — completion, failure, park,
+  checkpoint, dependency, and child spawn — is conditional on the claim token
+  it was issued at dequeue. A superseded execution's writes are rejected with
+  `ErrClaimLost`; it cannot complete the activity, publish a checkpoint, or add
+  children to the tree.
+- **Heartbeat.** While a handler runs, the engine renews its claim every 10s.
+  A renewal that finds the claim gone cancels the handler's `Ctx`;
+  `context.Cause(ctx.Ctx)` is then an `ErrClaimLost` error. The engine discards
+  whatever the handler returns and records `activity_claim_lost`.
+- **Checkpoint reads stop first.** `ctx.Run` does not start its function once
+  the context is cancelled or the claim is known lost.
+
+What the engine **cannot** do is interrupt a handler that ignores its context,
+or undo an external side effect already in flight. Handlers must return
+promptly when `ctx.Ctx` is done, and non-idempotent effects belong in `ctx.Run`
+with an idempotency key passed to the external system.
+
 ## The dead-letter queue
 
 When an activity exhausts its retries (or fails non-retryably) it moves to the

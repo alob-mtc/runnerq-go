@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -424,5 +425,113 @@ func TestDurableWaitsRecoverTransientCheckpointRead(t *testing.T) {
 				t.Fatalf("read recovery: reads=%d err=%v", reads, err)
 			}
 		})
+	}
+}
+
+// The heartbeat renews the claim while the handler runs; when a renewal finds
+// the claim gone the handler is cancelled with the cause and nothing is acked.
+func TestHeartbeatRenewsAndRevokesHandlerOnClaimLoss(t *testing.T) {
+	var renewals atomic.Int32
+	q := &recoveryQueue{complete: func(context.Context, *activity, json.RawMessage, string) error {
+		t.Error("superseded execution acknowledged")
+		return nil
+	}}
+	var cause error
+	e := recoveryEngine(q, &funcHandler{fn: func(c ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		<-c.Ctx.Done()
+		cause = context.Cause(c.Ctx)
+		return json.RawMessage(`"late"`), nil
+	}})
+	e.heartbeatInterval = 5 * time.Millisecond
+	e.backend = &leaseProbe{renew: func() (bool, error) {
+		switch renewals.Add(1) {
+		case 1:
+			return true, nil
+		case 2:
+			return false, storage.NewUnavailableError("blip")
+		}
+		return false, nil
+	}}
+	a := newActivity("test", nil, nil)
+	a.TimeoutSeconds = 30
+	e.processActivity(context.Background(), a, "claim", 0)
+	se, ok := storage.IsStorageError(cause)
+	m := e.metrics.(recoveryMetrics)
+	if !ok || se.Kind != storage.ErrClaimLost || renewals.Load() != 3 || m["activity_claim_lost"] != 1 || m["activity_heartbeat_failed"] != 1 {
+		t.Fatalf("cause=%v renewals=%d metrics=%v", cause, renewals.Load(), m)
+	}
+}
+
+// No beat may land after the handler returns: the ack releases the claim, and
+// a renewal racing it would misreport the execution as superseded.
+func TestHeartbeatStopsBeforeAcknowledgement(t *testing.T) {
+	var acking atomic.Bool
+	var renewals atomic.Int32
+	q := &recoveryQueue{complete: func(context.Context, *activity, json.RawMessage, string) error {
+		acking.Store(true)
+		time.Sleep(20 * time.Millisecond)
+		return nil
+	}}
+	e := recoveryEngine(q, &funcHandler{fn: func(ActivityContext, json.RawMessage) (json.RawMessage, error) {
+		time.Sleep(20 * time.Millisecond)
+		return nil, nil
+	}})
+	e.heartbeatInterval = time.Millisecond
+	e.backend = &leaseProbe{renew: func() (bool, error) {
+		renewals.Add(1)
+		if acking.Load() {
+			t.Error("renewal raced the acknowledgement")
+		}
+		return true, nil
+	}}
+	a := newActivity("test", nil, nil)
+	a.TimeoutSeconds = 30
+	e.processActivity(context.Background(), a, "claim", 0)
+	if !acking.Load() || renewals.Load() == 0 || e.metrics.(recoveryMetrics)["activity_completed"] != 1 {
+		t.Fatalf("acked=%v renewals=%d metrics=%v", acking.Load(), renewals.Load(), e.metrics)
+	}
+}
+
+type spawnProbe struct {
+	storage.Storage
+	owner  uuid.UUID
+	worker string
+	spawns int
+}
+
+func (b *spawnProbe) EnqueueForWorker(_ context.Context, _ storage.QueuedActivity, owner uuid.UUID, worker string) error {
+	b.owner, b.worker = owner, worker
+	b.spawns++
+	return nil
+}
+func (b *spawnProbe) EnqueueIdempotentForWorker(_ context.Context, _ *storage.QueuedActivity, owner uuid.UUID, worker string) (*storage.IdempotencyResult, error) {
+	b.owner, b.worker = owner, worker
+	b.spawns++
+	return nil, &storage.StorageError{Kind: storage.ErrClaimLost}
+}
+
+// Every spawn form a handler can issue carries the execution's claim, and a
+// fenced rejection reaches the engine as a lost claim rather than a failure.
+func TestHandlerSpawnsCarryTheExecutionClaim(t *testing.T) {
+	b := &spawnProbe{}
+	failed := false
+	q := &recoveryQueue{fail: func(bool) (bool, error) { failed = true; return false, nil }}
+	e := recoveryEngine(q, &funcHandler{fn: func(c ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
+		x := c.ActivityExecutor
+		if _, err := x.ActivityNamed("child").Payload(json.RawMessage(`{}`)).Execute(c.Ctx); err != nil {
+			return nil, err
+		}
+		if _, err := x.ActivityNamed("child").Payload(json.RawMessage(`{}`)).Delay(time.Hour).AsRoot().Execute(c.Ctx); err != nil {
+			return nil, err
+		}
+		_, err := x.ActivityNamed("child").Payload(json.RawMessage(`{}`)).Step("s").Execute(c.Ctx)
+		return nil, fmt.Errorf("spawn: %w", err)
+	}})
+	e.backend = b
+	a := newActivity("test", nil, nil)
+	a.TimeoutSeconds = 30
+	e.processActivity(context.Background(), a, "claim", 0)
+	if b.spawns != 3 || b.owner != a.ID || b.worker != "claim" || failed || e.metrics.(recoveryMetrics)["activity_claim_lost"] != 1 {
+		t.Fatalf("spawns=%d owner=%s worker=%s failed=%v metrics=%v", b.spawns, b.owner, b.worker, failed, e.metrics)
 	}
 }

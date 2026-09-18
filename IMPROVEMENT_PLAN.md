@@ -150,11 +150,12 @@ already exist (idempotency table, permanent results table, lineage columns):
 ### Also required for the category
 - **Cancellation API** — none exists at any layer (storage, inspector, engine). Add cancel with
   best-effort propagation to descendants via `root_activity_id`.
-- **`ctx.Heartbeat()` — deliberately deferred.** Dequeue already sets the lease to
-  `max(default, timeout+10s)`, so the lease never expires before the activity timeout and a
-  heartbeat that only extends the lease buys nothing today. It becomes meaningful only with a
-  rethought long-activity timeout model (heartbeat-refreshed deadlines instead of one fixed
-  timeout); do it then, with a worker-fence guard added to ExtendLease's WHERE clause.
+- ◐ **Attempt heartbeat — ownership half DONE.** The engine renews each running handler's claim
+  every 10s via the worker-fenced `ExtendLeaseForWorker`; a renewal that finds the claim gone
+  cancels the handler with an `ErrClaimLost` cause, and handler-issued spawns are fenced on the
+  claim (`storage.SpawnStorage`). Still open: a user-facing `ctx.Heartbeat()` with
+  heartbeat-refreshed deadlines instead of one fixed timeout, and retiring the unfenced
+  `ExtendLease` from `storage.Storage`.
 - **Engine-native cron/schedules** — the console Schedules tab only lists rows the user tagged
   `metadata.source='cron'` (postgres.go:1255-1274); nothing in core creates them.
 - ✅ **DONE — future rehydration**: `FutureFor(backend, id)`, `fut.ActivityID()`, and `WaitAll`.

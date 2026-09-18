@@ -88,3 +88,28 @@ func (b *PostgresBackend) StoreCheckpoint(ctx context.Context, id, owner uuid.UU
 	b.signalWork()
 	return nil
 }
+
+// spawnFence identifies the execution a handler-issued spawn must still own.
+type spawnFence struct {
+	owner  uuid.UUID
+	worker string
+}
+
+// verifySpawnFenceTx holds the spawner's row FOR UPDATE for the rest of the
+// transaction, so the reaper cannot hand the activity to another execution
+// between the claim check and the child's insert. A nil fence is an unfenced
+// spawn from outside a handler.
+func (b *PostgresBackend) verifySpawnFenceTx(ctx context.Context, tx pgx.Tx, fence *spawnFence) error {
+	if fence == nil {
+		return nil
+	}
+	return b.verifyClaimTx(ctx, tx, fence.owner, fence.worker)
+}
+
+func (b *PostgresBackend) EnqueueForWorker(ctx context.Context, a storage.QueuedActivity, ownerID uuid.UUID, workerID string) error {
+	return b.enqueue(ctx, a, &spawnFence{owner: ownerID, worker: workerID})
+}
+
+func (b *PostgresBackend) EnqueueIdempotentForWorker(ctx context.Context, a *storage.QueuedActivity, ownerID uuid.UUID, workerID string) (*storage.IdempotencyResult, error) {
+	return b.enqueueIdempotent(ctx, a, &spawnFence{owner: ownerID, worker: workerID})
+}

@@ -712,3 +712,61 @@ func TestCleanupAndKeyReuseOrderOnIdempotencyRow(t *testing.T) {
 		}
 	})
 }
+
+// A spawn issued by an execution that has since lost its claim must not add a
+// child: the replacement execution issues the same spawns.
+func TestHandlerSpawnsAreFencedAfterReclaim(t *testing.T) {
+	b := testBackend(t)
+	ctx := context.Background()
+	parent := testActivity(3)
+	claimTestActivity(t, b, parent, "old")
+	child := func(key string) storage.QueuedActivity {
+		c := testActivity(3)
+		c.ParentActivityID, c.RootActivityID, c.Depth = &parent.ID, parent.ID, 1
+		if key != "" {
+			c.IdempotencyKey = &storage.IdempotencyKeyConfig{Key: key, Behavior: storage.BehaviorReturnExisting}
+		}
+		return c
+	}
+	live, keyed := child(""), child("rq:step:fence:"+parent.ID.String())
+	if err := b.EnqueueForWorker(ctx, live, parent.ID, "old"); err != nil {
+		t.Fatalf("owned spawn: %v", err)
+	}
+	if existing, err := b.EnqueueIdempotentForWorker(ctx, &keyed, parent.ID, "old"); err != nil || existing != nil {
+		t.Fatalf("owned keyed spawn: %v %v", existing, err)
+	}
+	expireLease(t, b, parent.ID)
+	if n, err := b.RequeueExpired(ctx, 10); err != nil || n != 1 {
+		t.Fatalf("reaper %d %v", n, err)
+	}
+	if got, err := b.Dequeue(ctx, "new", 0, nil); err != nil || got == nil || got.ID != parent.ID {
+		t.Fatalf("reclaim: %v %v", got, err)
+	}
+	stale, staleKeyed, staleReuse := child(""), child("rq:step:fence:late:"+parent.ID.String()), child(keyed.IdempotencyKey.Key)
+	lost := func(err error) bool {
+		se, ok := storage.IsStorageError(err)
+		return ok && se.Kind == storage.ErrClaimLost
+	}
+	if err := b.EnqueueForWorker(ctx, stale, parent.ID, "old"); !lost(err) {
+		t.Fatalf("stale spawn: %v", err)
+	}
+	if _, err := b.EnqueueIdempotentForWorker(ctx, &staleKeyed, parent.ID, "old"); !lost(err) {
+		t.Fatalf("stale keyed spawn: %v", err)
+	}
+	if _, err := b.EnqueueIdempotentForWorker(ctx, &staleReuse, parent.ID, "old"); !lost(err) {
+		t.Fatalf("stale reattach: %v", err)
+	}
+	if existing, err := b.EnqueueIdempotentForWorker(ctx, &staleReuse, parent.ID, "new"); err != nil || existing == nil || existing.ExistingID != keyed.ID {
+		t.Fatalf("replacement reattach: %v %v", existing, err)
+	}
+	var children, keys int
+	if err := b.pool.QueryRow(ctx, `SELECT count(*) FROM runnerq_activities WHERE parent_activity_id=$1`, parent.ID).Scan(&children); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.pool.QueryRow(ctx, `SELECT count(*) FROM runnerq_idempotency WHERE queue_name=$1 AND idempotency_key=$2`, b.queueName, staleKeyed.IdempotencyKey.Key).Scan(&keys); err != nil {
+		t.Fatal(err)
+	}
+	if children != 2 || keys != 0 {
+		t.Fatalf("children=%d stale keys=%d", children, keys)
+	}
+}
