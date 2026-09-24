@@ -191,6 +191,61 @@ func TestSharedResultWakesAllConsumers(t *testing.T) {
 		})
 	}
 }
+
+func TestChildCompletionWakesOnlyItsActiveWaiters(t *testing.T) {
+	newChild := func(t *testing.T, b *PostgresBackend, parent storage.QueuedActivity, name string) storage.QueuedActivity {
+		t.Helper()
+		child := testActivity(3)
+		child.ActivityType = name
+		child.ParentActivityID = &parent.ID
+		child.RootActivityID = parent.ID
+		child.Depth = 1
+		claimTestActivity(t, b, child, name)
+		return child
+	}
+	t.Run("parent sleeping", func(t *testing.T) {
+		b := testBackend(t)
+		ctx := context.Background()
+		parent := testActivity(3)
+		parent.ActivityType = "parent"
+		claimTestActivity(t, b, parent, "parent")
+		child := newChild(t, b, parent, "child")
+		if err := b.Yield(ctx, parent.ID, time.Now().Add(time.Hour), "parent", "sleep", "later"); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.AckSuccess(ctx, child.ID, nil, "child"); err != nil {
+			t.Fatal(err)
+		}
+		if status, _ := activityStatus(t, b, parent.ID); status != "waiting" {
+			t.Fatalf("unawaited child woke sleeping parent: %s", status)
+		}
+	})
+	t.Run("different child", func(t *testing.T) {
+		b := testBackend(t)
+		ctx := context.Background()
+		parent := testActivity(3)
+		parent.ActivityType = "parent"
+		claimTestActivity(t, b, parent, "parent")
+		awaited := newChild(t, b, parent, "awaited")
+		other := newChild(t, b, parent, "other")
+		if err := b.YieldForResult(ctx, parent.ID, awaited.ID, &awaited.ID, time.Now().Add(time.Hour), "parent", "await", "awaited"); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.AckSuccess(ctx, other.ID, nil, "other"); err != nil {
+			t.Fatal(err)
+		}
+		if status, _ := activityStatus(t, b, parent.ID); status != "waiting" {
+			t.Fatalf("unawaited sibling woke parent: %s", status)
+		}
+		if err := b.AckSuccess(ctx, awaited.ID, nil, "awaited"); err != nil {
+			t.Fatal(err)
+		}
+		if status, _ := activityStatus(t, b, parent.ID); status != "pending" {
+			t.Fatalf("awaited child did not wake parent: %s", status)
+		}
+	})
+}
+
 func TestParkPublicationRaceAndLostReply(t *testing.T) {
 	b := testBackend(t)
 	ctx := context.Background()
@@ -483,7 +538,7 @@ func TestParkAndPublishOrderOnOwnerRowLock(t *testing.T) {
 
 	t.Run("consumer commits first, publisher waits", func(t *testing.T) {
 		b, producer, waiter := newPair(t)
-		// Hand-driven park: owner FOR SHARE, dependency, status 'waiting'.
+		// Hand-driven park: owner FOR SHARE, dependency, active result wait.
 		tx, commit := pinnedTx(t, b)
 		var one int
 		if err := tx.QueryRow(ctx, `SELECT 1 FROM runnerq_activities WHERE id = $1 AND queue_name = $2 FOR SHARE`, producer.ID, b.queueName).Scan(&one); err != nil {
@@ -492,7 +547,7 @@ func TestParkAndPublishOrderOnOwnerRowLock(t *testing.T) {
 		if _, err := tx.Exec(ctx, `INSERT INTO runnerq_dependencies (queue_name, waiter_activity_id, result_id, producer_activity_id) VALUES ($1, $2, $3, $3)`, b.queueName, waiter.ID, producer.ID); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := tx.Exec(ctx, `UPDATE runnerq_activities SET status = 'waiting', current_worker_id = NULL, lease_deadline_ms = NULL WHERE id = $1 AND queue_name = $2`, waiter.ID, b.queueName); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE runnerq_activities SET status = 'waiting', waiting_result_id = $3, current_worker_id = NULL, lease_deadline_ms = NULL WHERE id = $1 AND queue_name = $2`, waiter.ID, b.queueName, producer.ID); err != nil {
 			t.Fatal(err)
 		}
 		err := mustStayBlocked(t, commit, func() error {

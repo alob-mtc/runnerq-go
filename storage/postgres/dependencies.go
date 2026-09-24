@@ -111,8 +111,12 @@ func (b *PostgresBackend) RegisterDependency(ctx context.Context, waiter, result
 	return nil
 }
 func (b *PostgresBackend) wakeResultWaitersTx(ctx context.Context, tx pgx.Tx, result uuid.UUID) error {
-	_, err := tx.Exec(ctx, `UPDATE runnerq_activities a SET status='pending', scheduled_at=NULL
- WHERE a.queue_name=$1 AND a.status='waiting' AND EXISTS(
+	// Spawn links also live in runnerq_dependencies, so a dependency alone
+	// does not mean the activity is currently waiting for this result.
+	_, err := tx.Exec(ctx, `UPDATE runnerq_activities a
+ SET status='pending', scheduled_at=NULL, waiting_result_id=NULL
+ WHERE a.queue_name=$1 AND a.status='waiting' AND a.waiting_result_id=$2
+ AND EXISTS(
  SELECT 1 FROM runnerq_dependencies d WHERE d.queue_name=$1 AND d.result_id=$2 AND d.waiter_activity_id=a.id)`, b.queueName, result)
 	if err != nil {
 		return databaseError(err, "failed to wake result consumers")
@@ -161,8 +165,10 @@ func (b *PostgresBackend) YieldForResult(ctx context.Context, waiter, result uui
 		return databaseError(err, "failed to check park readiness")
 	}
 	_, err = tx.Exec(ctx, `UPDATE runnerq_activities SET status=CASE WHEN $5 THEN 'pending' ELSE 'waiting' END,
- scheduled_at=CASE WHEN $5 THEN NULL ELSE $3::timestamptz END, last_worker_id=$4,current_worker_id=NULL,lease_deadline_ms=NULL,started_at=NULL
- WHERE id=$1 AND queue_name=$2`, waiter, b.queueName, wakeAt, worker, ready)
+ scheduled_at=CASE WHEN $5 THEN NULL ELSE $3::timestamptz END,
+ waiting_result_id=CASE WHEN $5 THEN NULL ELSE $6::uuid END,
+ last_worker_id=$4,current_worker_id=NULL,lease_deadline_ms=NULL,started_at=NULL
+ WHERE id=$1 AND queue_name=$2`, waiter, b.queueName, wakeAt, worker, ready, result)
 	if err != nil {
 		return databaseError(err, "failed to park result consumer")
 	}

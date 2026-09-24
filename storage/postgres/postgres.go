@@ -833,7 +833,6 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 	defer tx.Rollback(ctx)
 
 	var actType *string
-	var parentID *uuid.UUID
 	err = tx.QueryRow(ctx, `
 		UPDATE runnerq_activities
 		SET status = 'completed',
@@ -844,8 +843,8 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 		WHERE id = $3 AND queue_name = $4
 		  AND status = 'processing'
 		  AND current_worker_id = $2
-		RETURNING activity_type, parent_activity_id`,
-		now, workerID, activityID, b.queueName).Scan(&actType, &parentID)
+		RETURNING activity_type`,
+		now, workerID, activityID, b.queueName).Scan(&actType)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			// The previous transaction may have committed but lost its reply.
@@ -893,11 +892,6 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 		return err
 	}
 
-	_, err = b.wakeWaitingParentTx(ctx, tx, parentID)
-	if err != nil {
-		return err
-	}
-
 	if err := tx.Commit(ctx); err != nil {
 		return databaseError(err, fmt.Sprintf("Failed to commit ack: %v", err))
 	}
@@ -906,27 +900,6 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 	b.signalResult(activityID)
 	b.signalWork()
 	return nil
-}
-
-// wakeWaitingParentTx makes a parked parent runnable when one of its children
-// reaches a terminal state (its result is now available). Atomic with the
-// child's transition: a crash can't complete the child without queueing the
-// parent's wake. Waking on ANY child's completion — not just the one the
-// parent awaits — costs at most one cheap replay-and-repark per completion;
-// parents in other states are untouched.
-func (b *PostgresBackend) wakeWaitingParentTx(ctx context.Context, tx pgx.Tx, parentID *uuid.UUID) (bool, error) {
-	if parentID == nil {
-		return false, nil
-	}
-	tag, err := tx.Exec(ctx, `
-		UPDATE runnerq_activities
-		SET status = 'pending', scheduled_at = NULL
-		WHERE id = $1 AND queue_name = $2 AND status = 'waiting'`,
-		*parentID, b.queueName)
-	if err != nil {
-		return false, databaseError(err, fmt.Sprintf("Failed to wake waiting parent: %v", err))
-	}
-	return tag.RowsAffected() > 0, nil
 }
 
 func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, failure storage.FailureKind, workerID string) (bool, error) {
@@ -940,14 +913,13 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 
 	// Lock the activity row
 	var ar activityRow
-	var parentID *uuid.UUID
 	err = tx.QueryRow(ctx, `
-		SELECT id, retry_count, max_retries, retry_delay_seconds, max_retry_delay_seconds, parent_activity_id
+		SELECT id, retry_count, max_retries, retry_delay_seconds, max_retry_delay_seconds
 		FROM runnerq_activities
 		WHERE id = $1 AND queue_name = $2 AND status = 'processing' AND current_worker_id = $3
 		FOR UPDATE`,
 		activityID, b.queueName, workerID).Scan(
-		&ar.id, &ar.retryCount, &ar.maxRetries, &ar.retryDelaySeconds, &ar.maxRetryDelaySeconds, &parentID)
+		&ar.id, &ar.retryCount, &ar.maxRetries, &ar.retryDelaySeconds, &ar.maxRetryDelaySeconds)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			var event string
@@ -995,11 +967,6 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		}
 		if err := b.recordEvent(ctx, tx, activityID, storage.EventFailed, &workerID,
 			toDetail(map[string]any{"retryable": false, "error": errorMessage})); err != nil {
-			return false, err
-		}
-
-		_, err = b.wakeWaitingParentTx(ctx, tx, parentID)
-		if err != nil {
 			return false, err
 		}
 
@@ -1113,11 +1080,6 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		return false, err
 	}
 
-	_, err = b.wakeWaitingParentTx(ctx, tx, parentID)
-	if err != nil {
-		return false, err
-	}
-
 	if err := tx.Commit(ctx); err != nil {
 		return false, databaseError(err, fmt.Sprintf("Failed to commit ack_failure DLQ: %v", err))
 	}
@@ -1177,7 +1139,7 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 			LIMIT $2
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id, status, retry_count, parent_activity_id`,
+		RETURNING id, status, retry_count`,
 		b.queueName, batchSize, now, leaseExpiredError)
 	if err != nil {
 		return 0, databaseError(err, fmt.Sprintf("Failed to requeue expired: %v", err))
@@ -1187,13 +1149,12 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 		id         uuid.UUID
 		deadLetter bool
 		retryCount int32
-		parentID   *uuid.UUID
 	}
 	var reaped []reapedRow
 	for rows.Next() {
 		var r reapedRow
 		var status string
-		if err := rows.Scan(&r.id, &status, &r.retryCount, &r.parentID); err != nil {
+		if err := rows.Scan(&r.id, &status, &r.retryCount); err != nil {
 			rows.Close()
 			return 0, databaseError(err, fmt.Sprintf("Failed to scan requeued row: %v", err))
 		}
@@ -1224,11 +1185,6 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 			}
 			if err := b.recordEvent(ctx, tx, r.id, storage.EventDeadLetter, nil,
 				toDetail(map[string]any{"error": leaseExpiredError, "reason": "lease_expired"})); err != nil {
-				return 0, err
-			}
-			// Dead-letter is terminal with a result stored — wake a parked
-			// parent so it observes the failure instead of waiting forever.
-			if _, err := b.wakeWaitingParentTx(ctx, tx, r.parentID); err != nil {
 				return 0, err
 			}
 			continue
@@ -1270,6 +1226,7 @@ func (b *PostgresBackend) Yield(ctx context.Context, activityID uuid.UUID, wakeA
 		UPDATE runnerq_activities
 		SET status = 'waiting',
 			scheduled_at = $1,
+			waiting_result_id = NULL,
 			last_worker_id = $2,
 			current_worker_id = NULL,
 			lease_deadline_ms = NULL,
@@ -1366,7 +1323,7 @@ func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UU
 	// dedicated 'waiting' park state is woken early.
 	tag, err := tx.Exec(ctx, `
 		UPDATE runnerq_activities
-		SET status = 'pending', scheduled_at = NULL
+		SET status = 'pending', scheduled_at = NULL, waiting_result_id = NULL
 		WHERE id = $1 AND queue_name = $2 AND status = 'waiting'`,
 		activityID, b.queueName)
 	if err != nil {
@@ -1405,7 +1362,7 @@ func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UU
 func (b *PostgresBackend) WakeWaiting(ctx context.Context, activityID uuid.UUID) (bool, error) {
 	tag, err := b.pool.Exec(ctx, `
 		UPDATE runnerq_activities
-		SET status = 'pending', scheduled_at = NULL
+		SET status = 'pending', scheduled_at = NULL, waiting_result_id = NULL
 		WHERE id = $1 AND queue_name = $2 AND status = 'waiting'`,
 		activityID, b.queueName)
 	if err != nil {
