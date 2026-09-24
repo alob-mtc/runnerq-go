@@ -311,8 +311,8 @@ type QueueStorage interface {
 	// counting a retry — the engine uses it when a durable Sleep's wake time
 	// doesn't fit the current attempt's timeout budget. Must be fenced on
 	// workerID like AckSuccess/AckFailure (only the claiming worker may
-	// yield) and return a not-found error when the row is no longer claimed
-	// by that worker. kind ("sleep"/"signal"/"await") and step (the step or
+	// yield) and return an ErrClaimLost error when the row is no longer
+	// claimed by that worker. kind ("sleep"/"signal"/"await") and step (the step or
 	// signal name) describe the wait for observability and are recorded on the
 	// Yielded event only; both may be empty and no row state depends on them.
 	Yield(ctx context.Context, activityID uuid.UUID, wakeAt time.Time, workerID, kind, step string) error
@@ -428,7 +428,9 @@ type WorkerPoolStorage interface {
 }
 
 // Storage combines the queue, inspection, and worker-pool surfaces a backend
-// must provide.
+// must provide. The conformance suite in storage/storagetest states the
+// behaviour the engine relies on as tests; a new backend runs it from its own
+// test file and passes before it can be trusted with durable execution.
 type Storage interface {
 	QueueStorage
 	InspectionStorage

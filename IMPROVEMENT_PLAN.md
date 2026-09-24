@@ -147,6 +147,11 @@ already exist (idempotency table, permanent results table, lineage columns):
    sequence-derived keys are fail-wrong under non-deterministic replay and payload-hash keys
    silently degrade — explicit `Step` names are the model (same conclusion as Inngest).
 
+- ✅ **DONE — backend conformance suite**: `storage/storagetest.Run(t, harness)` states the durable
+  contract (claim, ack fencing, lease recovery, checkpoints, dependencies, signals, spawns,
+  idempotency, retention, inspection) as backend-agnostic tests; Postgres runs it in
+  `storage/postgres/conformance_test.go`. A new backend passes it before it is trusted.
+
 ### Also required for the category
 - **Cancellation API** — none exists at any layer (storage, inspector, engine). Add cancel with
   best-effort propagation to descendants via `root_activity_id`.
