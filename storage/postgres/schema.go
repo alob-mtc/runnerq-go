@@ -61,7 +61,8 @@ ALTER TABLE runnerq_activities
 ALTER TABLE runnerq_activities
     ADD COLUMN IF NOT EXISTS parent_activity_id UUID,
     ADD COLUMN IF NOT EXISTS root_activity_id UUID,
-    ADD COLUMN IF NOT EXISTS depth SMALLINT NOT NULL DEFAULT 0;
+    ADD COLUMN IF NOT EXISTS depth SMALLINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS waiting_result_id UUID;
 
 CREATE INDEX IF NOT EXISTS idx_runnerq_parent_id
     ON runnerq_activities(parent_activity_id)
