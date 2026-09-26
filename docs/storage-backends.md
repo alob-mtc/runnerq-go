@@ -1,8 +1,9 @@
 # Storage Backends
 
 RunnerQ persists everything through a storage interface. PostgreSQL is the
-built-in, supported backend; the interface is exported so you *can* implement
-another, though that's an advanced undertaking (see the caveat below).
+built-in backend. The interface is exported so you *can* implement another,
+and the conformance suite tells you when you have (see "Proving a backend
+durable" below).
 
 ## PostgreSQL
 
@@ -77,9 +78,31 @@ makes handler-issued spawns conditional on the claim, atomically with the
 insert. Without them the engine falls back to lease sizing alone and unfenced
 spawns.
 
+### Proving a backend durable
+
+`storage/storagetest` is the conformance suite: it states every behaviour the
+engine relies on — claimed once under `SKIP LOCKED`-equivalent semantics,
+fenced acknowledgements, lost-reply reconciliation, lease recovery, parked
+parents woken by awaited results, checkpoints published by exactly one
+owner, atomic idempotency, whole-tree retention — as tests driven only through the storage
+interfaces. Run it from your backend's test file:
+
+```go
+type harness struct{}
+
+func (harness) Open(t *testing.T, queue string) storage.Storage { /* fresh backend on queue */ }
+func (harness) ExpireLease(ctx context.Context, b storage.Storage, id uuid.UUID) error { /* move the lease into the past */ }
+
+func TestConformance(t *testing.T) { storagetest.Run(t, harness{}) }
+```
+
+The harness supplies only what the interface cannot express: opening a
+backend on a named queue (two opens on one queue stand in for two processes)
+and forcing a lease to expire. A backend that passes the suite can replace
+Postgres without the engine noticing. The PostgreSQL backend runs it in CI.
+
 > **Caveat:** the interface — especially the parking/wakeup and atomicity
-> contracts behind durable execution — is non-trivial to get right. Unless you
-> have a strong reason to target another store, run the Postgres backend (or
-> wrap it). Read the doc comments in `storage/storage.go` before starting, and
-> lean on the integration tests in `storage/postgres` as a conformance
-> reference.
+> contracts behind durable execution — is non-trivial to get right. Read the
+> doc comments in `storage/storage.go` before starting, use the PostgreSQL
+> backend as a reference implementation, and treat a green conformance
+> run as the bar for "done".
