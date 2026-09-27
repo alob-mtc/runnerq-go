@@ -87,14 +87,17 @@ func (h *funcHandler) Handle(ctx ActivityContext, payload json.RawMessage) (json
 // Step(): a retried parent must reattach to the child it already spawned and
 // get its memoized result — the child runs exactly once.
 func TestStepSpawnMemoizedAcrossParentRetry(t *testing.T) {
-	var childRuns, parentRuns atomic.Int32
+	// resolved counts parent runs that got the child's result. Plain runs
+	// can be more: GetResult waits in-process for a couple of seconds, then
+	// parks the parent and runs it again when the child finishes (slow CI,
+	// -race), which is correct behaviour and not what this test is about.
+	var childRuns, resolved atomic.Int32
 
 	child := &funcHandler{fn: func(_ ActivityContext, _ json.RawMessage) (json.RawMessage, error) {
 		childRuns.Add(1)
 		return json.RawMessage(`{"reserved":true}`), nil
 	}}
 	parent := &funcHandler{fn: func(ctx ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
-		parentRuns.Add(1)
 		fut, err := ctx.ActivityExecutor.
 			ActivityNamed("reserve").
 			Step("reserve").
@@ -107,6 +110,7 @@ func TestStepSpawnMemoizedAcrossParentRetry(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
+		resolved.Add(1)
 		if ctx.RetryCount == 0 {
 			return nil, NewRetryError("forced crash after child completed")
 		}
@@ -130,8 +134,8 @@ func TestStepSpawnMemoizedAcrossParentRetry(t *testing.T) {
 	if res.State != storage.ResultOk {
 		t.Fatalf("parent result = %v %s, want Ok", res.State, res.Data)
 	}
-	if got := parentRuns.Load(); got != 2 {
-		t.Fatalf("parent ran %d times, want 2 (original + retry)", got)
+	if got := resolved.Load(); got != 2 {
+		t.Fatalf("parent got the child's result %d times, want 2 (original + retry)", got)
 	}
 	if got := childRuns.Load(); got != 1 {
 		t.Fatalf("child ran %d times, want exactly 1 — the retried parent must reattach, not respawn", got)
