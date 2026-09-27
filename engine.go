@@ -62,7 +62,7 @@ type WorkerEngine struct {
 	// inflight tracks the activities this engine is executing (id ->
 	// InFlightActivity) for live executor state.
 	inflight  sync.Map
-	revokers  sync.Map // id -> context.CancelCauseFunc of the running handler
+	revokers  sync.Map  // id -> context.CancelCauseFunc of the running handler
 	startedAt time.Time // guarded by mu; zero until Start
 }
 
