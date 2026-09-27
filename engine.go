@@ -107,6 +107,25 @@ func (e *WorkerEngine) MaxConcurrentActivities() int {
 	return e.config.MaxConcurrentActivities
 }
 
+// InstanceID is this engine's unique identity: a random id fixed at
+// construction that prefixes its claim tokens. RunnerQ Cloud uses it as the
+// executor id.
+func (e *WorkerEngine) InstanceID() string {
+	return e.instanceID
+}
+
+// ActivityTypes returns the registered activity types, sorted.
+func (e *WorkerEngine) ActivityTypes() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	types := make([]string, 0, len(e.handlers))
+	for t := range e.handlers {
+		types = append(types, t)
+	}
+	slices.Sort(types)
+	return types
+}
+
 // RegisterActivity registers a handler under an activity type derived from
 // its Go type name: &ResizeImage{} serves "ResizeImage". NameOf derives the
 // same string for spawns. Panics for handlers whose type has no name (use
