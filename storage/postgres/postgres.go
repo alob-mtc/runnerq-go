@@ -228,10 +228,11 @@ func acquireSchemaLock(ctx context.Context, conn *pgxpool.Conn) error {
 	}
 }
 
-// dequeueIndexes are the hot claim-path indexes, built CONCURRENTLY (outside
-// schemaSql) so their creation never takes the SHARE lock that would block
-// every write on runnerq_activities during the build. dropAfter names the
-// previous version, removed only once the replacement is valid.
+// dequeueIndexes are the indexes built CONCURRENTLY (outside schemaSql) so
+// their creation never takes the SHARE lock that would block every write on
+// runnerq_activities during the build: the hot claim-path indexes and the
+// QueryStorage indexes. dropAfter names the previous version, removed only
+// once the replacement is valid; empty when there is none.
 type dequeueIndex struct {
 	name      string
 	ddl       string
@@ -271,6 +272,24 @@ var dequeueIndexes = []dequeueIndex{
 			WHERE status IN ('pending', 'scheduled', 'retrying', 'waiting')`,
 		dropAfter: "idx_runnerq_dequeue_order",
 	},
+	// QueryStorage: cross-queue activity queries, newest first, optionally
+	// pinned to a status or type (the common console filters). The id
+	// tiebreaker matches the keyset cursor.
+	{
+		name: "idx_runnerq_query_created",
+		ddl: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_query_created
+			ON runnerq_activities (created_at DESC, id DESC)`,
+	},
+	{
+		name: "idx_runnerq_query_status_created",
+		ddl: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_query_status_created
+			ON runnerq_activities (status, created_at DESC, id DESC)`,
+	},
+	{
+		name: "idx_runnerq_query_type_created",
+		ddl: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_query_type_created
+			ON runnerq_activities (activity_type, created_at DESC, id DESC)`,
+	},
 }
 
 // ensureDequeueIndexes builds the versioned dequeue indexes concurrently and
@@ -303,6 +322,9 @@ func (b *PostgresBackend) ensureDequeueIndexes(ctx context.Context, conn *pgxpoo
 
 func (b *PostgresBackend) ensureDequeueIndex(ctx context.Context, conn *pgxpool.Conn, schema string, idx dequeueIndex) error {
 	dropIndex := func(name string) error {
+		if name == "" {
+			return nil
+		}
 		_, err := conn.Exec(ctx, "DROP INDEX IF EXISTS "+pgx.Identifier{schema, name}.Sanitize())
 		return err
 	}

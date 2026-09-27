@@ -59,7 +59,9 @@ var expectedSchema = sync.OnceValue(func() schemaExpectation {
 	}
 	for _, idx := range dequeueIndexes {
 		e.indexes = append(e.indexes, strings.ToLower(idx.name))
-		e.retired = append(e.retired, strings.ToLower(idx.dropAfter))
+		if idx.dropAfter != "" {
+			e.retired = append(e.retired, strings.ToLower(idx.dropAfter))
+		}
 	}
 	return e
 })

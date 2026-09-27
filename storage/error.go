@@ -22,6 +22,11 @@ const (
 	ErrClaimLost
 	// ErrCheckpointConflict means an immutable checkpoint has a different outcome.
 	ErrCheckpointConflict
+	// ErrInvalidArgument means malformed or out-of-range input; Field names it.
+	ErrInvalidArgument
+	// ErrUnsupported means the backend cannot evaluate the request (a query
+	// field, operator, sort or aggregate it does not support); Field names it.
+	ErrUnsupported
 )
 
 // StorageError represents a backend-agnostic error from storage operations.
@@ -29,6 +34,8 @@ type StorageError struct {
 	Kind    StorageErrorKind
 	Message string
 	Cause   error
+	// Field names the offending input for ErrInvalidArgument/ErrUnsupported.
+	Field string
 }
 
 func (e *StorageError) Error() string {
@@ -56,6 +63,10 @@ func (e *StorageError) Error() string {
 		prefix = "claim lost"
 	case ErrCheckpointConflict:
 		prefix = "checkpoint conflict"
+	case ErrInvalidArgument:
+		prefix = "invalid argument"
+	case ErrUnsupported:
+		prefix = "unsupported"
 	}
 	return fmt.Sprintf("%s: %s", prefix, e.Message)
 }

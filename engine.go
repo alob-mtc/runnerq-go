@@ -58,6 +58,50 @@ type WorkerEngine struct {
 	heartbeatInterval time.Duration
 
 	poolID uuid.UUID // identity used for worker_pools registration; zero if backend doesn't support it
+
+	// inflight tracks the activities this engine is executing (id ->
+	// InFlightActivity) for live executor state.
+	inflight  sync.Map
+	startedAt time.Time // guarded by mu; zero until Start
+}
+
+// InFlightActivity is an activity the engine is executing right now.
+type InFlightActivity struct {
+	ID        uuid.UUID
+	Type      string
+	Attempt   int
+	StartedAt time.Time
+}
+
+// InFlight returns the activities this engine is executing, oldest first.
+func (e *WorkerEngine) InFlight() []InFlightActivity {
+	var out []InFlightActivity
+	e.inflight.Range(func(_, v any) bool {
+		out = append(out, v.(InFlightActivity))
+		return true
+	})
+	slices.SortFunc(out, func(a, b InFlightActivity) int { return a.StartedAt.Compare(b.StartedAt) })
+	return out
+}
+
+// StartedAt is when Start was last called, or zero.
+func (e *WorkerEngine) StartedAt() time.Time {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.startedAt
+}
+
+// Draining reports whether a shutdown has begun: intake has stopped and
+// in-flight activities are finishing.
+func (e *WorkerEngine) Draining() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	select {
+	case <-e.shutdownCh:
+		return true
+	default:
+		return false
+	}
 }
 
 // NewWorkerEngineWithBackend creates a WorkerEngine from a custom backend.
@@ -105,6 +149,30 @@ func (e *WorkerEngine) Backend() storage.Storage {
 // MaxConcurrentActivities returns the max workers config for inspector use.
 func (e *WorkerEngine) MaxConcurrentActivities() int {
 	return e.config.MaxConcurrentActivities
+}
+
+// QueueName is the queue this engine serves.
+func (e *WorkerEngine) QueueName() string {
+	return e.config.QueueName
+}
+
+// InstanceID is this engine's unique identity: a random id fixed at
+// construction that prefixes its claim tokens. RunnerQ Cloud uses it as the
+// executor id.
+func (e *WorkerEngine) InstanceID() string {
+	return e.instanceID
+}
+
+// ActivityTypes returns the registered activity types, sorted.
+func (e *WorkerEngine) ActivityTypes() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	types := make([]string, 0, len(e.handlers))
+	for t := range e.handlers {
+		types = append(types, t)
+	}
+	slices.Sort(types)
+	return types
 }
 
 // RegisterActivity registers a handler under an activity type derived from
@@ -203,6 +271,7 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		q.setActivityTypes(types)
 	}
 	e.active = true
+	e.startedAt = time.Now().UTC()
 	e.running.Store(true)
 	// Parent cancellation stops intake below. Handler and persistence lifetime
 	// ends after the drain, including when the caller uses a signal context.
@@ -562,6 +631,11 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 		}
 		return
 	}
+
+	e.inflight.Store(activityID, InFlightActivity{
+		ID: activityID, Type: activityType, Attempt: int(act.RetryCount) + 1, StartedAt: time.Now().UTC(),
+	})
+	defer e.inflight.Delete(activityID)
 
 	activityTimeout := time.Duration(act.TimeoutSeconds) * time.Second
 	deadlineCtx, timeoutCancel := context.WithTimeout(ctx, activityTimeout)

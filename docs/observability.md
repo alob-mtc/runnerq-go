@@ -89,3 +89,43 @@ The default is `runnerq.NoopMetrics`. Counters currently emitted:
 > Duration/gauge instrumentation (`ObserveDuration`, queue-depth gauges,
 > per-type labels) is not yet wired — the metrics surface is counters only for
 > now. A richer Prometheus-shaped surface is on the roadmap.
+
+## RunnerQ Cloud (Conductor agent)
+
+The `conductor` package connects worker processes to RunnerQ Cloud. The agent
+dials out over a WebSocket and answers the Cloud's queries from your own
+database, so the Cloud never connects into your network or holds database
+credentials.
+
+```go
+import "github.com/alob-mtc/runnerq-go/conductor"
+
+agent, err := conductor.Start(ctx, engine, conductor.Config{
+    URL:    "wss://cloud.runnerq.dev",
+    APIKey: os.Getenv("RUNNERQ_CONDUCTOR_KEY"),
+    Labels: map[string]string{"region": "eu-west-1"},
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer agent.Close(context.Background()) // before the engine stops
+engine.Start(ctx)
+```
+
+- **Workers only.** Start one agent per engine. Each engine appears in the
+  Cloud as an executor, identified by `engine.InstanceID()`, with its live
+  in-flight activities pushed as periodic reports.
+- **Queries, not views.** The Cloud reads through the backend's
+  `storage.QueryStorage` (filters, keyset paging, counts, aggregates, events,
+  steps, trees). Backends without it serve only live executor state.
+- **Off the execution path.** `Start` returns immediately. If the Cloud is
+  unreachable the agent retries with backoff (1s → 30s, jittered) and your
+  activities are unaffected.
+- **Clean shutdowns.** `Close` tells the Cloud the executor is stopping, so a
+  deploy isn't reported as a crash.
+- **Metadata-only mode.** Set per app in the Cloud (applied live), or forced
+  locally with `MetadataOnly: true`, which the Cloud cannot relax. Payloads,
+  results, errors and event details are never sent.
+- **Bounded load.** At most `MaxConcurrentRequests` (default 16) requests run
+  at once, each limited by `RequestTimeout` (default 30s) or the Cloud's
+  deadline, whichever is sooner.

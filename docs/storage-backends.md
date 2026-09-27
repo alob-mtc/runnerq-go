@@ -78,6 +78,17 @@ makes handler-issued spawns conditional on the claim, atomically with the
 insert. Without them the engine falls back to lease sizing alone and unfenced
 spawns.
 
+`storage.QueryStorage` is optional too, and is what RunnerQ Cloud reads
+through (see the `conductor` package). It is a general query layer in the
+Cloud's canonical model: activity filters (`and`/`or`/`not` over fields such
+as `status`, `type`, `queue`, `root_id`, `parent_id`, `metadata.<key>` and the
+timestamps), one sort key with keyset cursors, heavy fields only on request,
+counts, grouped aggregates with time buckets and duration percentiles, event
+and step listings, and whole trees. Queries span every queue in the database.
+A backend advertises what it evaluates in `QueryCapabilities` and must reject
+anything else with `ErrUnsupported` rather than ignore it. Without it, a
+connected worker serves only its live executor state to the Cloud.
+
 ### Proving a backend durable
 
 `storage/storagetest` is the conformance suite: it states every behaviour the
