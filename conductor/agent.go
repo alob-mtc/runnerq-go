@@ -332,7 +332,9 @@ func (a *Agent) session(ctx context.Context) error {
 	}()
 	go a.pingLoop(sctx, conn)
 	go a.reportLoop(sctx, conn)
-	return a.readLoop(sctx, conn)
+	st := newStreams(a, conn)
+	defer st.close()
+	return a.readLoop(sctx, conn, st)
 }
 
 func (a *Agent) handshake(ctx context.Context, conn *websocket.Conn) (welcome, error) {
@@ -432,7 +434,13 @@ func (a *Agent) reportLoop(ctx context.Context, conn *websocket.Conn) {
 	}
 }
 
-func (a *Agent) readLoop(ctx context.Context, conn *websocket.Conn) error {
+func (a *Agent) readLoop(ctx context.Context, conn *websocket.Conn, st *streams) error {
+	// Stream requests are bound to this session's connection.
+	session := map[string]handlerFunc{}
+	if a.h.qs != nil {
+		session[typeEventsSubscribe] = st.subscribe
+		session[typeEventsUnsubscribe] = st.unsubscribe
+	}
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	// In-flight requests are abandoned once the connection is gone: nobody
@@ -466,14 +474,14 @@ func (a *Agent) readLoop(ctx context.Context, conn *websocket.Conn) error {
 		go func() {
 			defer wg.Done()
 			defer func() { <-a.sem }()
-			a.reply(ctx, conn, a.serve(ctx, req))
+			a.reply(ctx, conn, a.serve(ctx, req, session))
 		}()
 	}
 }
 
 // serve runs one request and builds its response. A panicking handler is
 // reported as an internal error; it never takes down the worker.
-func (a *Agent) serve(ctx context.Context, req envelope) (res envelope) {
+func (a *Agent) serve(ctx context.Context, req envelope, session map[string]handlerFunc) (res envelope) {
 	defer func() {
 		if p := recover(); p != nil {
 			a.log.Error("Conductor request handler panicked", "type", req.Type, "panic", p)
@@ -481,6 +489,9 @@ func (a *Agent) serve(ctx context.Context, req envelope) (res envelope) {
 		}
 	}()
 	h, ok := a.table[req.Type]
+	if !ok {
+		h, ok = session[req.Type]
+	}
 	if !ok {
 		return errorResponse(req, errorf(codeUnsupported, "this agent does not serve %q", req.Type))
 	}
