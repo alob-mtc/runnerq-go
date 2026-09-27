@@ -75,7 +75,11 @@ var activityFields = map[string]queryField{
 }
 
 var eventFields = map[string]queryField{
+	// seq is the event's position in the log (its cursor): increasing, so
+	// "seq > cursor" tails the log.
+	"seq":         {expr: "e.id", kind: kindInt},
 	"activity_id": {expr: "e.activity_id", kind: kindUUID},
+	"queue":       {expr: "e.queue_name", kind: kindString},
 	"type":        {expr: "e.event_type", kind: kindEventType},
 	"at":          {expr: "e.created_at", kind: kindTime},
 	"executor_id": {expr: "NULLIF(split_part(e.worker_id, ':', 1), '')", kind: kindString, nullable: true},

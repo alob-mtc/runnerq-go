@@ -89,6 +89,8 @@ func (h *handlers) capabilities() map[string]capability {
 	caps[typeEventsList] = capability{V: 1, Filters: qc.EventFilters, Sorts: []string{"at"}, Include: []string{"detail"}}
 	caps[typeResultsGet] = capability{V: 1}
 	caps[typeTreesGet] = capability{V: 1, Include: recordIncludes}
+	caps[typeEventsSubscribe] = capability{V: 1, Filters: qc.EventFilters}
+	caps[typeEventsUnsubscribe] = capability{V: 1}
 	return caps
 }
 

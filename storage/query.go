@@ -211,8 +211,12 @@ type AggregateRows struct {
 	Truncated bool
 }
 
-// EventQuery lists lifecycle events. Filterable fields are advertised in
-// QueryCapabilities.EventFilters.
+// EventQuery lists lifecycle events in log order. Filterable fields are
+// advertised in QueryCapabilities.EventFilters; "seq" is the event's position
+// in the log (EventRecord.ID), increasing in insertion order, so
+// seq > cursor tails it. A transaction that commits late can surface an
+// event below an already-seen seq; tailers rescan a window below their
+// cursor to catch those.
 type EventQuery struct {
 	Filter        *QueryFilter
 	Desc          bool // newest first
