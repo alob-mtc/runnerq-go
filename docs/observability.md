@@ -101,9 +101,10 @@ credentials.
 import "github.com/alob-mtc/runnerq-go/conductor"
 
 agent, err := conductor.Start(ctx, engine, conductor.Config{
-    URL:    "wss://cloud.runnerq.dev",
-    APIKey: os.Getenv("RUNNERQ_CONDUCTOR_KEY"),
-    Labels: map[string]string{"region": "eu-west-1"},
+    URL:          "wss://cloud.runnerq.dev",
+    APIKey:       os.Getenv("RUNNERQ_CONDUCTOR_KEY"),
+    Labels:       map[string]string{"region": "eu-west-1"},
+    AllowControl: true, // let operators run commands; omit for read-only
 })
 if err != nil {
     log.Fatal(err)
@@ -123,6 +124,14 @@ engine.Start(ctx)
   activities are unaffected.
 - **Clean shutdowns.** `Close` tells the Cloud the executor is stopping, so a
   deploy isn't reported as a crash.
+- **Commands are opt-in.** With `AllowControl: true` (and a backend
+  implementing `storage.CommandStorage`) operators can cancel, retry, run
+  now, reschedule, reprioritise, delete and signal activities from the Cloud.
+  Every command is idempotent and audited. Cancelling a running activity
+  stops its handler (immediately when it runs on the executor that received
+  the command, otherwise at the next claim heartbeat); anything awaiting it
+  receives a cancellation error. Without `AllowControl` the agent is
+  read-only and advertises no commands.
 - **Metadata-only mode.** Set per app in the Cloud (applied live), or forced
   locally with `MetadataOnly: true`, which the Cloud cannot relax. Payloads,
   results, errors and event details are never sent.

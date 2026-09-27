@@ -62,7 +62,24 @@ type WorkerEngine struct {
 	// inflight tracks the activities this engine is executing (id ->
 	// InFlightActivity) for live executor state.
 	inflight  sync.Map
+	revokers  sync.Map // id -> context.CancelCauseFunc of the running handler
 	startedAt time.Time // guarded by mu; zero until Start
+}
+
+// Interrupt stops the handler this engine is running for activityID, as if
+// its claim had been lost, and reports whether one was running here. Use it
+// right after the activity was cancelled in storage: the claim heartbeat
+// would notice within a heartbeat interval anyway; this makes it immediate
+// when the command lands on the executor running the activity.
+func (e *WorkerEngine) Interrupt(activityID uuid.UUID) bool {
+	v, ok := e.revokers.Load(activityID)
+	if !ok {
+		return false
+	}
+	v.(context.CancelCauseFunc)(&storage.StorageError{
+		Kind: storage.ErrClaimLost, Message: fmt.Sprintf("activity %s was cancelled", activityID),
+	})
+	return true
 }
 
 // InFlightActivity is an activity the engine is executing right now.
@@ -644,6 +661,8 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	// lost; context.Cause then reports the ErrClaimLost error.
 	timeoutCtx, revoke := context.WithCancelCause(deadlineCtx)
 	defer revoke(nil)
+	e.revokers.Store(activityID, revoke)
+	defer e.revokers.Delete(activityID)
 	// Mark the context as handler-scoped so in-handler GetResult calls may
 	// yield-park this activity; awaits outside a handler block normally.
 	timeoutCtx = withHandlerScope(timeoutCtx)

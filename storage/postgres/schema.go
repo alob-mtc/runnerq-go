@@ -155,6 +155,21 @@ CREATE TABLE IF NOT EXISTS runnerq_worker_pools (
 CREATE INDEX IF NOT EXISTS idx_runnerq_worker_pools_queue_alive
     ON runnerq_worker_pools(queue_name, last_seen_at);
 
+-- Command ledger: applied RunnerQ Cloud commands and their results, so a
+-- repeated command_id replays its result instead of applying twice. Rows are
+-- pruned after a week (commands must be replayable for at least 24 hours).
+CREATE TABLE IF NOT EXISTS runnerq_commands (
+    queue_name  TEXT NOT NULL,
+    command_id  TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    result      JSONB NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (queue_name, command_id)
+);
+CREATE INDEX IF NOT EXISTS idx_runnerq_commands_created
+    ON runnerq_commands(created_at);
+
 -- Durable references survive handler replay and are removed with consumer trees.
 CREATE TABLE IF NOT EXISTS runnerq_dependencies (
  queue_name TEXT NOT NULL,

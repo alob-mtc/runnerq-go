@@ -22,8 +22,8 @@
 // DependencyStorage, AttemptLeaseStorage, SpawnStorage — are required: their
 // tests fail when the backend lacks them. BatchQueueStorage and ResultWaiter
 // are optimisations the engine can do without; their tests are skipped.
-// QueryStorage serves RunnerQ Cloud; its tests are skipped for backends
-// without it.
+// QueryStorage and CommandStorage serve RunnerQ Cloud; their tests are
+// skipped for backends without them.
 package storagetest
 
 import (
@@ -71,6 +71,7 @@ func Run(t *testing.T, h Harness) {
 		{"Retention", retentionTests},
 		{"Inspection", inspectionTests},
 		{"Query", queryTests},
+		{"Commands", commandTests},
 	} {
 		t.Run(g.name, func(t *testing.T) {
 			for _, tc := range g.tests {
@@ -241,6 +242,7 @@ var snapshotStatus = map[string]string{
 	"completed":   "Completed",
 	"failed":      "Failed",
 	"dead_letter": "DeadLetter",
+	"cancelled":   "Cancelled",
 }
 
 // status returns the activity's row status (the filter vocabulary), derived

@@ -127,7 +127,7 @@ type StepRecord struct {
 type RetentionPolicy struct {
 	// Completed applies to trees whose root finished with status completed.
 	Completed time.Duration
-	// Failed applies to trees whose root is failed or dead_letter — kept on
+	// Failed applies to trees whose root is failed, dead_letter or cancelled — kept on
 	// a separate clock so operators can hold failures longer for inspection.
 	Failed time.Duration
 }
@@ -250,6 +250,13 @@ const (
 	// EventSpawnLinked records a secondary parent's link to an existing activity
 	// when an idempotency reuse causes a different parent to claim ownership.
 	EventSpawnLinked ActivityEventType = "SpawnLinked"
+	// Command events: operator actions applied through CommandStorage.
+	EventCancelled       ActivityEventType = "Cancelled"
+	EventRetried         ActivityEventType = "Retried"
+	EventRedriven        ActivityEventType = "Redriven"
+	EventRunNow          ActivityEventType = "RunNow"
+	EventRescheduled     ActivityEventType = "Rescheduled"
+	EventPriorityChanged ActivityEventType = "PriorityChanged"
 )
 
 // ActivityEvent records a lifecycle event.

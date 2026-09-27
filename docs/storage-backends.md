@@ -89,6 +89,17 @@ A backend advertises what it evaluates in `QueryCapabilities` and must reject
 anything else with `ErrUnsupported` rather than ignore it. Without it, a
 connected worker serves only its live executor state to the Cloud.
 
+`storage.CommandStorage` (also optional) applies RunnerQ Cloud's commands
+to the backend's own queue: cancel (non-terminal work; a running claim is
+fenced out, children are cancelled when asked, and a cancellation error
+result wakes anything awaiting the activity), retry and redrive (from
+checkpoints), run now, reschedule, set priority, whole-tree delete and
+signal. Targets are ids, a filter bounded by a maximum (narrowed to what the
+command can act on, so repeating it makes progress), or an idempotency key.
+Commands are idempotent by id: the backend records each applied command and
+its result, replays it on redelivery and rejects the id when reused with
+different input.
+
 ### Proving a backend durable
 
 `storage/storagetest` is the conformance suite: it states every behaviour the

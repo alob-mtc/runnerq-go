@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/alob-mtc/runnerq-go/storage"
 )
 
 // ActivityContext is provided to activity handlers during execution.
@@ -59,7 +61,7 @@ type ActivityContext struct {
 // handler find a previous attempt's stored value, and an external process
 // address a signal at a waiting activity.
 func deriveCheckpointID(activityID uuid.UUID, kind, name string) uuid.UUID {
-	return uuid.NewSHA1(activityID, []byte(kind+":"+name))
+	return storage.CheckpointID(activityID, kind, name)
 }
 
 func (c ActivityContext) checkpointID(kind, name string) uuid.UUID {

@@ -36,14 +36,16 @@ const metaDeadline = "deadline"
 type errorCode string
 
 const (
-	codeInvalidArgument   errorCode = "invalid_argument"
-	codeNotFound          errorCode = "not_found"
-	codeForbidden         errorCode = "forbidden"
-	codeUnsupported       errorCode = "unsupported"
-	codeResourceExhausted errorCode = "resource_exhausted"
-	codeDeadlineExceeded  errorCode = "deadline_exceeded"
-	codeUnavailable       errorCode = "unavailable"
-	codeInternal          errorCode = "internal"
+	codeInvalidArgument    errorCode = "invalid_argument"
+	codeNotFound           errorCode = "not_found"
+	codeFailedPrecondition errorCode = "failed_precondition"
+	codeConflict           errorCode = "conflict"
+	codeForbidden          errorCode = "forbidden"
+	codeUnsupported        errorCode = "unsupported"
+	codeResourceExhausted  errorCode = "resource_exhausted"
+	codeDeadlineExceeded   errorCode = "deadline_exceeded"
+	codeUnavailable        errorCode = "unavailable"
+	codeInternal           errorCode = "internal"
 )
 
 // wireError is a failed response. Handlers return it to choose the code; any
@@ -81,6 +83,14 @@ const (
 	typeResultsGet          = "results.get"
 	typeTreesGet            = "trees.get"
 	typeExecutorDescribe    = "executor.describe"
+
+	typeActivitiesCancel      = "activities.cancel"
+	typeActivitiesRetry       = "activities.retry"
+	typeActivitiesRunNow      = "activities.run_now"
+	typeActivitiesReschedule  = "activities.reschedule"
+	typeActivitiesSetPriority = "activities.set_priority"
+	typeActivitiesDelete      = "activities.delete"
+	typeActivitiesSignal      = "activities.signal"
 
 	typeExecutorReport = "executor.report"
 	typeConfigUpdate   = "config.update"
@@ -338,4 +348,46 @@ type executorState struct {
 	InFlight       int               `json:"in_flight"`
 	Running        []runningActivity `json:"running,omitempty"`
 	Draining       bool              `json:"draining"`
+}
+
+// --- commands ---
+
+type commandTarget struct {
+	IDs            []string    `json:"ids,omitempty"`
+	Filter         *wireFilter `json:"filter,omitempty"`
+	Max            int         `json:"max,omitempty"`
+	IdempotencyKey string      `json:"idempotency_key,omitempty"`
+	Type           string      `json:"type,omitempty"`
+	Queue          string      `json:"queue,omitempty"`
+}
+
+// commandRequest is every command's request; each command uses the fields
+// that apply to it and rejects the rest.
+type commandRequest struct {
+	CommandID     string          `json:"command_id"`
+	Target        commandTarget   `json:"target"`
+	DryRun        bool            `json:"dry_run,omitempty"`
+	Reason        string          `json:"reason,omitempty"`
+	Cascade       string          `json:"cascade,omitempty"`
+	ResetAttempts bool            `json:"reset_attempts,omitempty"`
+	At            string          `json:"at,omitempty"`
+	Priority      int             `json:"priority,omitempty"`
+	Name          string          `json:"name,omitempty"`
+	Payload       json.RawMessage `json:"payload,omitempty"`
+}
+
+type commandItem struct {
+	ID      string     `json:"id"`
+	Outcome string     `json:"outcome"`
+	Status  string     `json:"status,omitempty"`
+	Error   *wireError `json:"error,omitempty"`
+}
+
+type commandResult struct {
+	Matched  int           `json:"matched"`
+	Applied  int           `json:"applied"`
+	Cascaded int           `json:"cascaded,omitempty"`
+	More     bool          `json:"more"`
+	Replayed bool          `json:"replayed,omitempty"`
+	Results  []commandItem `json:"results"`
 }
