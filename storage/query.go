@@ -131,14 +131,17 @@ type RecordWait struct {
 
 // ActivityRecord is an activity in the canonical model.
 type ActivityRecord struct {
-	ID             uuid.UUID
-	Type           string
-	Queue          string
-	Status         string // canonical
-	Priority       int
-	RootID         uuid.UUID
-	ParentID       *uuid.UUID
-	Depth          int
+	ID       uuid.UUID
+	Type     string
+	Queue    string
+	Status   string // canonical
+	Priority int
+	RootID   uuid.UUID
+	ParentID *uuid.UUID
+	Depth    int
+	// IdempotencyKey is the key the application set (see
+	// ApplicationIdempotencyKey), never the stored encoding; empty when the
+	// application set none. Filters on "idempotency_key" match this form.
 	IdempotencyKey string
 	// Attempt is the attempt running or next to run, from 1; for a terminal
 	// activity, the number of attempts made.

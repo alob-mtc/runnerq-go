@@ -267,6 +267,9 @@ func (sb *sqlBuilder) predicate(f storage.QueryFilter, fields map[string]queryFi
 	if f.Field == "root_id" && fd.expr == "" {
 		return sb.eventRootPredicate(f)
 	}
+	if f.Field == "idempotency_key" && fields["id"].expr == "a.id" {
+		return sb.idempotencyKeyPredicate(f)
+	}
 
 	switch f.Op {
 	case storage.OpExists:
@@ -342,6 +345,64 @@ func (sb *sqlBuilder) predicate(f storage.QueryFilter, fields map[string]queryFi
 }
 
 // eventRootPredicate filters events to the trees rooted at the given ids.
+// idempotencyKeyPredicate matches the application's key (see
+// storage.ApplicationIdempotencyKey) against how it is stored: as a v2
+// business key for the row's own type, a legacy "<key>-<type>" key, or as is
+// (keys written directly through the storage API). Step-derived keys are not
+// application keys. Encoded keys can't be matched by prefix or substring.
+func (sb *sqlBuilder) idempotencyKeyPredicate(f storage.QueryFilter) (string, error) {
+	const stored = "a.idempotency_key"
+	hasKey := "(" + stored + " IS NOT NULL AND " + stored + " <> '' AND left(" + stored + ", " +
+		strconv.Itoa(len(storage.StepKeyPrefix)) + ") <> " + sb.arg(storage.StepKeyPrefix) + ")"
+	switch f.Op {
+	case storage.OpExists:
+		want := true
+		if f.Value != nil {
+			b, ok := f.Value.(bool)
+			if !ok {
+				return "", storage.NewInvalidQueryError(f.Field, "exists takes a boolean value")
+			}
+			want = b
+		}
+		if want {
+			return hasKey, nil
+		}
+		return "(NOT " + hasKey + ")", nil
+
+	case storage.OpEq, storage.OpNe, storage.OpIn, storage.OpNin:
+		raw := []any{f.Value}
+		if f.Op == storage.OpIn || f.Op == storage.OpNin {
+			list, ok := f.Value.([]any)
+			if !ok {
+				return "", storage.NewInvalidQueryError(f.Field, f.Op+" takes an array value")
+			}
+			if len(list) > maxInValues {
+				return "", storage.NewInvalidQueryError(f.Field, fmt.Sprintf("%s is limited to %d values", f.Op, maxInValues))
+			}
+			raw = list
+		}
+		keys := make([]string, 0, len(raw))
+		for _, v := range raw {
+			s, ok := v.(string)
+			if !ok {
+				return "", storage.NewInvalidQueryError(f.Field, "idempotency_key takes string values")
+			}
+			keys = append(keys, s)
+		}
+		// The v2 encoding, computed per row for its type: base64 without
+		// padding (Postgres wraps base64 at 76 characters, so drop newlines).
+		v2 := "'rq:key:v2:' || rtrim(translate(encode(convert_to(octet_length(k) || ':' || k || a.activity_type, 'UTF8'), 'base64'), E'\\n', ''), '=')"
+		match := "EXISTS (SELECT 1 FROM unnest(" + sb.arg(keys) + "::text[]) AS keys(k) WHERE " +
+			stored + " = " + v2 + " OR " + stored + " = k || '-' || a.activity_type OR (" + stored + " = k AND left(" + stored + ", 10) <> 'rq:key:v2:'))"
+		cond := "(" + hasKey + " AND " + match + ")"
+		if f.Op == storage.OpNe || f.Op == storage.OpNin {
+			return "(NOT " + cond + ")", nil
+		}
+		return cond, nil
+	}
+	return "", storage.NewUnsupportedQueryError(f.Field, "idempotency_key supports eq, ne, in, nin and exists: stored keys are encoded, so prefix and contains can't match")
+}
+
 func (sb *sqlBuilder) eventRootPredicate(f storage.QueryFilter) (string, error) {
 	var raw []any
 	switch f.Op {
@@ -553,7 +614,7 @@ func scanRecord(rows pgx.Rows, inc storage.RecordInclude, extra ...any) (storage
 	r.Priority = int(priority)
 	r.Depth = int(depth)
 	if idemKey != nil {
-		r.IdempotencyKey = *idemKey
+		r.IdempotencyKey = storage.ApplicationIdempotencyKey(*idemKey, r.Type)
 	}
 	r.Attempt = int(retryCount) + 1
 	r.MaxAttempts = int(maxRetry) + 1
