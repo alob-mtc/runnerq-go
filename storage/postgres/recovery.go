@@ -83,7 +83,6 @@ func (b *PostgresBackend) StoreCheckpoint(ctx context.Context, id, owner uuid.UU
 	if err := tx.Commit(ctx); err != nil {
 		return databaseError(err, "failed to commit checkpoint")
 	}
-	b.signalEvent()
 	b.signalResult(id)
 	b.signalWork()
 	return nil

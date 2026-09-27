@@ -178,7 +178,6 @@ func (b *PostgresBackend) YieldForResult(ctx context.Context, waiter, result uui
 	if err := tx.Commit(ctx); err != nil {
 		return databaseError(err, "failed to commit durable park")
 	}
-	b.signalEvent()
 	if ready || !wakeAt.After(time.Now()) {
 		b.signalWork()
 	}

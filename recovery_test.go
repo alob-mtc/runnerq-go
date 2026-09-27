@@ -234,11 +234,7 @@ type lifecycleBackend struct {
 func newLifecycleBackend() *lifecycleBackend {
 	return &lifecycleBackend{claims: make(chan storage.QueuedActivity, 4), dequeues: make(chan string, 8), filters: make(chan []string, 8), ack: make(chan error, 4)}
 }
-func (b *lifecycleBackend) RegisterWorkerPool(context.Context, storage.WorkerPoolInfo) error {
-	return nil
-}
-func (b *lifecycleBackend) DeregisterWorkerPool(context.Context, uuid.UUID) error { return nil }
-func (b *lifecycleBackend) SchedulesNatively() bool                               { return true }
+func (b *lifecycleBackend) SchedulesNatively() bool { return true }
 func (b *lifecycleBackend) Dequeue(ctx context.Context, w string, _ time.Duration, types []string) (*storage.QueuedActivity, error) {
 	b.dequeues <- w
 	b.filters <- append([]string(nil), types...)

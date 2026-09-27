@@ -50,5 +50,3 @@ can't run and fails it as `handler_not_found`, stealing work from the fleet
 that could have handled it. Register all handlers on a catch-all engine, or
 give every type a dedicated fleet (as this example does). See
 [docs/configuration.md](../../docs/configuration.md#workload-isolation).
-
-Next: [13 — The Console](../13-console/).

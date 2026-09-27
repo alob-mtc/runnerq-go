@@ -72,15 +72,13 @@ The "public API" surface includes:
 - The `runnerq` package: `Builder()`, `WorkerEngine`, `WorkerConfig`,
   `ActivityHandler`, `ActivityContext`, `ActivityExecutor`,
   `ActivityFuture`, `ActivityBuilder`, error types and constants.
-- The `storage` package: `Storage`, `QueueStorage`, `InspectionStorage`,
-  `WorkerPoolStorage`, `LeaseConfigurer` interfaces and the supporting
-  data types.
+- The `storage` package: `Storage`, `QueueStorage`, `ResultStorage`,
+  `QueryStorage`, `CommandStorage`, `LeaseConfigurer` interfaces and the
+  supporting data types.
+- The `storage/storagetest` package: `Run()`, `Harness`, `Reader`.
 - The `storage/postgres` package: `New()`, `WithConfig()`,
   `PostgresBackend`.
-- The `observability` package: `QueueInspector`,
-  `NewQueueInspector()`, `WithMaxWorkers()`.
-- The `observability/ui` package: `RunnerQUI()`, `ObservabilityAPI()`,
-  `ConsoleHTML`, `VendorAssets()`.
+- The `conductor` package: `Start()`, `Config`, `Agent`.
 
 Internal types (lowercase) and the `examples/` directory carry no
 stability guarantee.
@@ -89,8 +87,6 @@ stability guarantee.
 
 - Database schema columns added defensively for future use, where a
   breaking change to the column would also bump the major.
-- Console UI shape (HTML markup, CSS classes, JS internals). The
-  observability HTTP API in `observability/ui/routes.go` is stable.
 - The `ShutdownGraceSeconds` default (30s). Operational tuning, may
   change.
 - Exact wording of structured-log fields. Field *names* are stable;

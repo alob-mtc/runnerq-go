@@ -12,8 +12,7 @@
 //   - Comprehensive error handling with retryable and non-retryable types
 //   - Pluggable storage backends (PostgreSQL built-in)
 //   - Worker-level activity type filtering
-//   - Queue statistics and monitoring
-//   - Web-based observability console
+//   - Observability through RunnerQ Cloud (see the conductor package)
 //
 // # Quick Start
 //

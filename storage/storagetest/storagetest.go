@@ -41,7 +41,9 @@ import (
 
 // Harness adapts one backend implementation to the suite.
 type Harness interface {
-	// Open returns a backend serving queue, closed by t.Cleanup. Two calls
+	// Open returns a backend serving queue, closed by t.Cleanup. The backend
+	// must also implement Reader, which the suite uses to check what was
+	// stored. Two calls
 	// with the same queue must return independent handles that share the
 	// store — the suite uses that to stand in for two processes.
 	Open(t *testing.T, queue string) storage.Storage
@@ -69,7 +71,6 @@ func Run(t *testing.T, h Harness) {
 		{"Durable", durableTests},
 		{"Idempotency", idempotencyTests},
 		{"Retention", retentionTests},
-		{"Inspection", inspectionTests},
 		{"Query", queryTests},
 		{"Commands", commandTests},
 	} {
@@ -86,19 +87,38 @@ type conformanceTest struct {
 	fn   func(t *testing.T, h Harness)
 }
 
-// suite is the per-test environment: a queue name and the primary handle.
+// Reader is what the suite reads to check the state a backend stored. It
+// isn't part of storage.Storage, since the engine never reads these: a
+// backend provides it for its conformance run.
+type Reader interface {
+	GetActivity(ctx context.Context, activityID uuid.UUID) (*storage.ActivitySnapshot, error)
+	GetActivityEvents(ctx context.Context, activityID uuid.UUID, limit int) ([]storage.ActivityEvent, error)
+	GetActivitySteps(ctx context.Context, ownerActivityID uuid.UUID) ([]storage.StepRecord, error)
+	GetChildren(ctx context.Context, parentID uuid.UUID, offset, limit int) ([]storage.ActivitySnapshot, error)
+	GetSubtree(ctx context.Context, rootID uuid.UUID) ([]storage.ActivitySnapshot, error)
+	ListDeadLetter(ctx context.Context, offset, limit int) ([]storage.DeadLetterRecord, error)
+}
+
+// suite is the per-test environment: a queue name and the primary handle,
+// with its Reader for checking what was stored.
 type suite struct {
 	t     *testing.T
 	h     Harness
 	queue string
 	b     storage.Storage
+	r     Reader
 	ctx   context.Context
 }
 
 func newSuite(t *testing.T, h Harness) *suite {
 	t.Helper()
 	queue := "ct_" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
-	return &suite{t: t, h: h, queue: queue, b: h.Open(t, queue), ctx: context.Background()}
+	b := h.Open(t, queue)
+	r, ok := b.(Reader)
+	if !ok {
+		t.Fatalf("backend %T doesn't implement storagetest.Reader, which the suite reads to check stored state", b)
+	}
+	return &suite{t: t, h: h, queue: queue, b: b, r: r, ctx: context.Background()}
 }
 
 // another opens a second handle on the suite's queue: a separate process.
@@ -219,7 +239,7 @@ func (s *suite) enqueueClaimed(worker string, a storage.QueuedActivity) storage.
 
 func (s *suite) snapshot(id uuid.UUID) storage.ActivitySnapshot {
 	s.t.Helper()
-	snap, err := s.b.GetActivity(s.ctx, id)
+	snap, err := s.r.GetActivity(s.ctx, id)
 	if err != nil {
 		s.t.Fatalf("get activity %s: %v", id, err)
 	}
@@ -286,7 +306,7 @@ func (s *suite) wantResult(id uuid.UUID, state storage.ResultState) *storage.Act
 
 func (s *suite) events(id uuid.UUID) []storage.ActivityEvent {
 	s.t.Helper()
-	evs, err := s.b.GetActivityEvents(s.ctx, id, 100)
+	evs, err := s.r.GetActivityEvents(s.ctx, id, 100)
 	if err != nil {
 		s.t.Fatalf("events of %s: %v", id, err)
 	}

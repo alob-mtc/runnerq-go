@@ -278,12 +278,12 @@ func testDelete(t *testing.T, h Harness) {
 	if itemFor(t, dry, root.ID).Outcome != storage.CommandWouldApply {
 		t.Fatalf("dry run %+v", dry)
 	}
-	if sn, _ := s.b.GetActivity(s.ctx, root.ID); sn == nil {
+	if sn, _ := s.r.GetActivity(s.ctx, root.ID); sn == nil {
 		t.Fatal("dry run deleted the tree")
 	}
 	wantApplied(t, s.apply(onIDs(storage.CommandDelete, root.ID)), root.ID, "")
 	for _, id := range []uuid.UUID{root.ID, child.ID} {
-		if sn, err := s.b.GetActivity(s.ctx, id); err != nil || sn != nil {
+		if sn, err := s.r.GetActivity(s.ctx, id); err != nil || sn != nil {
 			t.Fatalf("activity %s survived delete: %+v %v", id, sn, err)
 		}
 	}
@@ -397,7 +397,7 @@ func testCancelledRetention(t *testing.T, h Harness) {
 	if err != nil || n != 1 {
 		t.Fatalf("retention swept %d cancelled trees (%v), want 1", n, err)
 	}
-	if sn, _ := s.b.GetActivity(s.ctx, root.ID); sn != nil {
+	if sn, _ := s.r.GetActivity(s.ctx, root.ID); sn != nil {
 		t.Fatal("cancelled tree survived retention")
 	}
 }

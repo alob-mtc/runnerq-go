@@ -38,17 +38,18 @@ On first connect the backend creates:
 | `runnerq_events` | append-only lifecycle event timeline |
 | `runnerq_results` | activity results and `Run`/`Sleep` checkpoints |
 | `runnerq_idempotency` | idempotency-key → activity mapping |
-| `runnerq_worker_pools` | live engine registry for capacity reporting |
+| `runnerq_worker_pools` | unused: the old inspector's engine registry, left in place for existing databases |
 
 Without [retention](configuration.md#retention) configured, these grow
 forever — turn it on for production.
 
 ## Implementing a custom backend
 
-A custom backend must implement `storage.Storage`, which composes
-`QueueStorage` (enqueue/dequeue/ack, leases, idempotency, results, signals,
-yield, retention), `InspectionStorage` (stats, listings, event stream), and
-`WorkerPoolStorage` (engine registry). It's a large surface — the durable
+A custom backend must implement `storage.Storage`: `QueueStorage`
+(enqueue/dequeue/ack, leases, idempotency, results, signals, yield,
+retention) and `ResultStorage`. To be read and commanded from RunnerQ Cloud it
+also implements `storage.QueryStorage` and `storage.CommandStorage`. It's a
+large surface — the durable
 primitives in particular (`Yield`, `WakeWaiting`, `SignalActivity`,
 `EnqueueIdempotent`, `CleanupExpired`, atomic `StoreResult` with an owner) each
 carry correctness requirements documented on the interface methods in
@@ -60,7 +61,7 @@ type MyBackend struct{ /* ... */ }
 func (b *MyBackend) Enqueue(ctx context.Context, a storage.QueuedActivity) error { /* ... */ }
 func (b *MyBackend) Dequeue(ctx context.Context, workerID string, timeout time.Duration, types []string) (*storage.QueuedActivity, error) { /* ... */ }
 func (b *MyBackend) AckSuccess(ctx context.Context, id uuid.UUID, result json.RawMessage, workerID string) error { /* ... */ }
-// ... and the rest of QueueStorage + InspectionStorage + WorkerPoolStorage
+// ... and the rest of QueueStorage + ResultStorage
 
 engine, _ := runnerq.Builder().Backend(&MyBackend{}).Build()
 ```
@@ -120,7 +121,11 @@ func TestConformance(t *testing.T) { storagetest.Run(t, harness{}) }
 
 The harness supplies only what the interface cannot express: opening a
 backend on a named queue (two opens on one queue stand in for two processes)
-and forcing a lease to expire. A backend that passes the suite can replace
+and forcing a lease to expire. To check what a backend stored, the suite also
+reads it back through `storagetest.Reader` (`GetActivity`,
+`GetActivityEvents`, `GetActivitySteps`, `GetChildren`, `GetSubtree`,
+`ListDeadLetter`), which the backend implements alongside `storage.Storage`;
+the engine never calls these. A backend that passes the suite can replace
 Postgres without the engine noticing. The PostgreSQL backend runs it in CI.
 
 > **Caveat:** the interface — especially the parking/wakeup and atomicity

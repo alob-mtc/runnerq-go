@@ -54,7 +54,7 @@ func testResultsAndSteps(t *testing.T, h Harness) {
 	if res := s.wantResult(run, storage.ResultOk); string(res.Data) != `"receipt"` {
 		t.Fatalf("checkpoint data = %s", res.Data)
 	}
-	steps, err := s.b.GetActivitySteps(s.ctx, a.ID)
+	steps, err := s.r.GetActivitySteps(s.ctx, a.ID)
 	if err != nil || len(steps) != 2 {
 		t.Fatalf("steps = %+v err=%v, want the two named checkpoints", steps, err)
 	}
@@ -340,11 +340,11 @@ func testSpawnFence(t *testing.T, h Harness) {
 	if _, err := s.b.LookupIdempotencyActivityID(s.ctx, "step-b"); err == nil {
 		t.Fatal("stale keyed spawn claimed its key")
 	}
-	children, err := s.b.GetChildren(s.ctx, parent.ID, 0, 10)
+	children, err := s.r.GetChildren(s.ctx, parent.ID, 0, 10)
 	if err != nil || len(children) != 2 {
 		t.Fatalf("children = %d err=%v, want the two live spawns", len(children), err)
 	}
-	if snap, err := s.b.GetActivity(s.ctx, stale.ID); err != nil || snap != nil {
+	if snap, err := s.r.GetActivity(s.ctx, stale.ID); err != nil || snap != nil {
 		t.Fatalf("stale spawn was inserted: %+v %v", snap, err)
 	}
 }

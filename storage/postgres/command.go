@@ -145,7 +145,6 @@ func (b *PostgresBackend) ApplyCommand(ctx context.Context, cmd storage.Command)
 		return nil, err
 	}
 	if !res.Replayed && !cmd.DryRun {
-		b.signalEvent()
 		for _, id := range post.results {
 			b.signalResult(id)
 		}

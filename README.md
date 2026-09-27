@@ -138,14 +138,12 @@ executor.ActivityNamed("send_email").
     Execute(ctx)
 ```
 
-### A built-in console
+### A console in RunnerQ Cloud
 
-An embedded web dashboard (no npm, no build step) with live queue stats,
-activity browsing, results, and lifecycle timelines over SSE.
-
-```go
-mux.Handle("/console/", http.StripPrefix("/console", ui.RunnerQUI(inspector)))
-```
+Connect your workers with the `conductor` agent and see every activity, its
+steps, events and results in RunnerQ Cloud, read live from your own database
+through the workers. Your data stays where it is. See
+[Observability](docs/observability.md).
 
 ## How it compares
 
@@ -259,7 +257,6 @@ own README. `docker compose up -d` once, then `go run .` in any of them.
 | 10 | [retries-and-dead-letter](examples/10-retries-and-dead-letter/) | backoff, the dead-letter queue, `OnDeadLetter` |
 | 11 | [retention](examples/11-retention/) | TTL cleanup of completed workflows |
 | 12 | [workload-isolation](examples/12-workload-isolation/) | many worker fleets sharing one queue |
-| 13 | [console](examples/13-console/) | the built-in observability dashboard |
 
 ## Documentation
 

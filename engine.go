@@ -21,12 +21,6 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// workerPoolHeartbeatInterval is how often the engine refreshes its
-// runnerq_worker_pools row when the backend supports registration. Should be
-// roughly 1/6 of the backend's liveness window so a single missed beat
-// doesn't drop the pool out of cluster-wide capacity reporting.
-const workerPoolHeartbeatInterval = 10 * time.Second
-
 // WorkerEngine is the main activity processing engine.
 type WorkerEngine struct {
 	queue    activityQueue
@@ -56,8 +50,6 @@ type WorkerEngine struct {
 
 	// heartbeatInterval overrides attemptHeartbeatInterval; zero uses it.
 	heartbeatInterval time.Duration
-
-	poolID uuid.UUID // identity used for worker_pools registration; zero if backend doesn't support it
 
 	// inflight tracks the activities this engine is executing (id ->
 	// InFlightActivity) for live executor state.
@@ -156,14 +148,12 @@ func (e *WorkerEngine) SetMetrics(sink MetricsSink) {
 	e.metrics = sink
 }
 
-// Inspector returns a QueueInspector for observability operations.
-// Import the observability package and use NewQueueInspector(backend) instead
-// for decoupled usage.
+// Backend returns the storage backend the engine runs on.
 func (e *WorkerEngine) Backend() storage.Storage {
 	return e.backend
 }
 
-// MaxConcurrentActivities returns the max workers config for inspector use.
+// MaxConcurrentActivities is how many activities the engine runs at once.
 func (e *WorkerEngine) MaxConcurrentActivities() int {
 	return e.config.MaxConcurrentActivities
 }
@@ -310,34 +300,7 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	defer engineCancel()
 	slog.Info("Starting worker engine", "max_concurrent_activities", e.config.MaxConcurrentActivities)
 
-	// Register this pool so cluster-wide capacity reporting stays accurate.
-	// Registration failure is non-fatal — the engine still runs, the KPI just
-	// under-reports until a later heartbeat re-establishes the row.
-	e.poolID = uuid.New()
-	info := storage.WorkerPoolInfo{
-		PoolID:        e.poolID,
-		QueueName:     e.config.QueueName,
-		MaxWorkers:    e.config.MaxConcurrentActivities,
-		ActivityTypes: types,
-	}
-	registrationCtx, registrationCancel := context.WithTimeout(intakeCtx, storageAttemptTimeout)
-	if err := e.backend.RegisterWorkerPool(registrationCtx, info); err != nil {
-		slog.Warn("Failed to register worker pool", "error", err, "pool_id", e.poolID)
-		e.poolID = uuid.Nil
-	} else {
-		slog.Info("Registered worker pool", "pool_id", e.poolID, "max_workers", info.MaxWorkers)
-	}
-
-	registrationCancel()
-
 	var wg sync.WaitGroup
-
-	// Heartbeat the worker_pools row so we keep counting toward cluster capacity.
-	if e.poolID != uuid.Nil {
-		wg.Go(func() {
-			e.runWorkerPoolHeartbeat(intakeCtx)
-		})
-	}
 
 	// Scheduled activities processor (skipped if backend handles it natively)
 	if !e.queue.SchedulesNatively() {
@@ -427,16 +390,6 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		// that wg.Add'd into the supervisor wg above. In-flight activities
 		// run inside the worker goroutines, so they're covered too.
 		{"workers", func() { wg.Wait() }},
-		// Best-effort pool deregister — uses graceCtx so it can't outlive
-		// the budget on its own.
-		{"deregister", func() {
-			if e.poolID == uuid.Nil {
-				return
-			}
-			if err := e.backend.DeregisterWorkerPool(graceCtx, e.poolID); err != nil && graceCtx.Err() == nil {
-				slog.Warn("Failed to deregister worker pool", "error", err, "pool_id", e.poolID)
-			}
-		}},
 	}
 
 	done := make(chan string, len(tasks))
@@ -940,25 +893,6 @@ func (e *WorkerEngine) runScheduledProcessor(ctx context.Context) {
 		}
 	}
 	slog.Debug("Scheduled activities processor stopped")
-}
-
-// runWorkerPoolHeartbeat keeps this engine's runnerq_worker_pools row marked
-// as alive so the cluster-wide MaxWorkers reported by Stats() stays accurate.
-// A failure to heartbeat is logged but doesn't shut down the engine — the row
-// will simply age out of the liveness window until the next successful beat.
-func (e *WorkerEngine) runWorkerPoolHeartbeat(ctx context.Context) {
-	ticker := time.NewTicker(workerPoolHeartbeatInterval)
-	defer ticker.Stop()
-	for e.running.Load() {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := e.backend.HeartbeatWorkerPool(ctx, e.poolID); err != nil {
-				slog.Warn("Worker pool heartbeat failed", "error", err, "pool_id", e.poolID)
-			}
-		}
-	}
 }
 
 func (e *WorkerEngine) runReaperProcessor(ctx context.Context) {

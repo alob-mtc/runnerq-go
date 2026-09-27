@@ -93,7 +93,7 @@ func (h *Charge) OnDeadLetter(ctx runnerq.ActivityContext, payload json.RawMessa
 
 A dead-lettered activity stores an error result, so any parent awaiting it
 resolves (with an error) instead of waiting forever. Dead-letter records are
-listable via the [inspector](observability.md) and the console.
+listable from code (`storage.QueryStorage`) and in [RunnerQ Cloud](observability.md).
 
 > `OnDeadLetter` fires for activities dead-lettered by a handler failure. An
 > activity dead-lettered by the **reaper** (repeated lease expiry — e.g. a

@@ -37,7 +37,7 @@ func testIdempotentReturnExisting(t *testing.T, h Harness) {
 	if err != nil || existing == nil || existing.ExistingID != first.ID || existing.ExistingParentID == nil || *existing.ExistingParentID != parent.ID {
 		t.Fatalf("duplicate: %+v %v", existing, err)
 	}
-	if snap, err := s.b.GetActivity(s.ctx, second.ID); err != nil || snap != nil {
+	if snap, err := s.r.GetActivity(s.ctx, second.ID); err != nil || snap != nil {
 		t.Fatalf("duplicate was enqueued: %+v %v", snap, err)
 	}
 	// A nil key is a plain enqueue.
@@ -62,7 +62,7 @@ func testIdempotentNoReuse(t *testing.T, h Harness) {
 	dup := activity(withKey("once", storage.BehaviorNoReuse))
 	_, err := s.b.EnqueueIdempotent(s.ctx, &dup)
 	wantKind(t, err, storage.ErrDuplicateActivity, "no-reuse duplicate")
-	if snap, err := s.b.GetActivity(s.ctx, dup.ID); err != nil || snap != nil {
+	if snap, err := s.r.GetActivity(s.ctx, dup.ID); err != nil || snap != nil {
 		t.Fatalf("rejected duplicate was enqueued: %+v %v", snap, err)
 	}
 }
@@ -151,7 +151,7 @@ func testIdempotentConcurrent(t *testing.T, h Harness) {
 	}
 	enqueued := 0
 	for id := range ids {
-		if snap, err := s.b.GetActivity(s.ctx, id); err != nil {
+		if snap, err := s.r.GetActivity(s.ctx, id); err != nil {
 			t.Fatal(err)
 		} else if snap != nil {
 			enqueued++
