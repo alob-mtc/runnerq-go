@@ -21,6 +21,7 @@ import (
 var queryTests = []conformanceTest{
 	{"CanonicalStatusesAndFields", testQueryCanonicalFields},
 	{"FiltersCombine", testQueryFilters},
+	{"IdempotencyKeysAreTheApplications", testQueryIdempotencyKeys},
 	{"KeysetPagingIsStable", testQueryPaging},
 	{"HeavyFieldsOnlyWhenIncluded", testQueryIncludes},
 	{"RejectsWhatItCannotEvaluate", testQueryRejects},
@@ -186,6 +187,45 @@ func testQueryFilters(t *testing.T, h Harness) {
 	sameIDs(t, "created range", all(storage.QueryFilter{Field: "created_at", Op: storage.OpLt,
 		Value: time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)}))
 	sameIDs(t, "id that is not a backend id", all(eq("id", "not-a-uuid")))
+}
+
+// Records report, and filters match, the key the application set, however
+// it is stored: a v2 business key, a legacy "<key>-<type>" key, or a key
+// written directly. Keys the engine derives for a step's child are not the
+// application's.
+func testQueryIdempotencyKeys(t *testing.T, h Harness) {
+	s := newSuite(t, h)
+	qs := s.query()
+	biz := s.enqueue(activity(withType("order.charge"), withKey(storage.BusinessIdempotencyKey("order-7", "order.charge"), storage.BehaviorReturnExisting)))
+	legacy := s.enqueue(activity(withType("order.charge"), withKey("order-8-order.charge", storage.BehaviorReturnExisting)))
+	raw := s.enqueue(activity(withType("invoice"), withKey("inv-9", storage.BehaviorReturnExisting)))
+	step := s.enqueue(activity(withType("order.ship"), withKey(storage.StepKeyPrefix+"root:parent:ship", storage.BehaviorReturnExisting)))
+	none := s.enqueue(activity(withType("invoice")))
+
+	for id, want := range map[uuid.UUID]string{biz.ID: "order-7", legacy.ID: "order-8", raw.ID: "inv-9", step.ID: "", none.ID: ""} {
+		if got := s.record(id, storage.RecordInclude{}).IdempotencyKey; got != want {
+			t.Errorf("record %s: idempotency key %q, want %q", id, got, want)
+		}
+	}
+
+	all := func(f storage.QueryFilter) []storage.ActivityRecord {
+		return s.records(storage.ActivityQuery{Filter: s.scoped(f)})
+	}
+	key := func(op string, v any) storage.QueryFilter {
+		return storage.QueryFilter{Field: "idempotency_key", Op: op, Value: v}
+	}
+	sameIDs(t, "eq business key", all(key(storage.OpEq, "order-7")), biz.ID)
+	sameIDs(t, "eq legacy key", all(key(storage.OpEq, "order-8")), legacy.ID)
+	sameIDs(t, "eq raw key", all(key(storage.OpEq, "inv-9")), raw.ID)
+	sameIDs(t, "eq stored encoding", all(key(storage.OpEq, storage.BusinessIdempotencyKey("order-7", "order.charge"))))
+	sameIDs(t, "in", all(key(storage.OpIn, []any{"order-7", "inv-9"})), biz.ID, raw.ID)
+	sameIDs(t, "ne", all(key(storage.OpNe, "order-7")), legacy.ID, raw.ID, step.ID, none.ID)
+	sameIDs(t, "nin", all(key(storage.OpNin, []any{"order-7", "order-8"})), raw.ID, step.ID, none.ID)
+	sameIDs(t, "exists", all(key(storage.OpExists, true)), biz.ID, legacy.ID, raw.ID)
+	sameIDs(t, "not exists", all(key(storage.OpExists, false)), step.ID, none.ID)
+
+	_, err := qs.QueryActivities(s.ctx, storage.ActivityQuery{Filter: s.scoped(key(storage.OpPrefix, "order-"))})
+	wantStorageErr(t, "prefix on an encoded key", err, storage.ErrUnsupported, "idempotency_key")
 }
 
 func testQueryPaging(t *testing.T, h Harness) {
