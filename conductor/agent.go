@@ -64,6 +64,10 @@ type Config struct {
 	// APIKey authenticates the app. It is sent in the Authorization header,
 	// never in the URL.
 	APIKey string
+	// AllowControl lets the Cloud run commands (cancel, retry, run now,
+	// reschedule, set priority, delete, signal). Off by default: the agent
+	// is read-only and advertises no commands.
+	AllowControl bool
 	// MetadataOnly strips payloads, results, errors and event details from
 	// every response, whatever mode the Cloud asks for.
 	MetadataOnly bool
@@ -156,7 +160,7 @@ func Start(ctx context.Context, engine *runnerq.WorkerEngine, cfg Config) (*Agen
 	if err != nil {
 		return nil, err
 	}
-	h := newHandlers(engine, cfg.MetadataOnly)
+	h := newHandlers(engine, cfg.MetadataOnly, cfg.AllowControl)
 	ctx, cancel := context.WithCancel(ctx)
 	a := &Agent{
 		cfg:    cfg,

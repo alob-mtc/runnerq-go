@@ -26,7 +26,10 @@ type handlerFunc func(ctx context.Context, data json.RawMessage) (any, error)
 type handlers struct {
 	engine  *runnerq.WorkerEngine
 	backend storage.Storage
-	qs      storage.QueryStorage // nil when the backend has no QueryStorage
+	qs      storage.QueryStorage   // nil when the backend has no QueryStorage
+	cs      storage.CommandStorage // nil when the backend has no CommandStorage
+	// allowControl lets the Cloud run commands.
+	allowControl bool
 	// forceMetadataOnly is the local setting; it always wins.
 	forceMetadataOnly bool
 	// cloudMetadataOnly is the Cloud's current setting (welcome/config.update).
@@ -34,10 +37,12 @@ type handlers struct {
 	started           time.Time
 }
 
-func newHandlers(engine *runnerq.WorkerEngine, forceMetadataOnly bool) *handlers {
+func newHandlers(engine *runnerq.WorkerEngine, forceMetadataOnly, allowControl bool) *handlers {
 	backend := engine.Backend()
 	qs, _ := backend.(storage.QueryStorage)
-	return &handlers{engine: engine, backend: backend, qs: qs, forceMetadataOnly: forceMetadataOnly, started: time.Now()}
+	cs, _ := backend.(storage.CommandStorage)
+	return &handlers{engine: engine, backend: backend, qs: qs, cs: cs, allowControl: allowControl,
+		forceMetadataOnly: forceMetadataOnly, started: time.Now()}
 }
 
 func (h *handlers) metadataOnly() bool { return h.forceMetadataOnly || h.cloudMetadataOnly.Load() }
@@ -54,6 +59,7 @@ func (h *handlers) table() map[string]handlerFunc {
 		t[typeResultsGet] = h.resultsGet
 		t[typeTreesGet] = h.treesGet
 	}
+	h.addCommands(t)
 	return t
 }
 
@@ -66,6 +72,7 @@ var (
 // query capabilities.
 func (h *handlers) capabilities() map[string]capability {
 	caps := map[string]capability{typeExecutorDescribe: {V: 1}}
+	h.commandCapabilities(caps)
 	if h.qs == nil {
 		return caps
 	}
@@ -559,6 +566,8 @@ func toWireError(err error) *wireError {
 			e = errorf(codeUnsupported, "%s", se.Message)
 		case storage.ErrNotFound:
 			e = errorf(codeNotFound, "%s", se.Message)
+		case storage.ErrConflict:
+			e = errorf(codeConflict, "%s", se.Message)
 		case storage.ErrUnavailable, storage.ErrTimeout:
 			e = errorf(codeUnavailable, "%s", se.Message)
 		default:

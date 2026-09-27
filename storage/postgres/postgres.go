@@ -1493,14 +1493,14 @@ func (b *PostgresBackend) CleanupExpired(ctx context.Context, policy storage.Ret
 			  AND (
 				(r.status = 'completed' AND $2::bigint > 0
 					AND r.completed_at < NOW() - make_interval(secs => $2))
-				OR (r.status IN ('failed', 'dead_letter') AND $3::bigint > 0
+				OR (r.status IN ('failed', 'dead_letter', 'cancelled') AND $3::bigint > 0
 					AND r.completed_at < NOW() - make_interval(secs => $3))
 			  )
 			  AND NOT EXISTS (
 				SELECT 1 FROM runnerq_activities c
 				WHERE c.queue_name = $1
 				  AND c.root_activity_id = r.id
-				  AND c.status NOT IN ('completed', 'failed', 'dead_letter')
+				  AND c.status NOT IN ('completed', 'failed', 'dead_letter', 'cancelled')
 			  )
 			ORDER BY r.completed_at ASC
 			LIMIT 1
@@ -1519,41 +1519,9 @@ func (b *PostgresBackend) CleanupExpired(ctx context.Context, policy storage.Ret
 			return 0, databaseError(err, "failed to select expired workflow root")
 		}
 
-		// Key reuse (BehaviorReturnExisting) registers a dependency on an
-		// existing child while holding that child's idempotency row FOR
-		// UPDATE, and never takes the root. The key rows this delete removes
-		// are therefore the ordering point with it: take them before the
-		// dependency check so a reuse in flight either commits first, and its
-		// dependency pins the tree below, or waits until this delete commits
-		// and then finds the key gone and claims it fresh. Ordering is
-		// root → keys here and key only there, so no cycle is possible.
-		if _, err := tx.Exec(ctx, `
-			SELECT 1 FROM runnerq_idempotency
-			WHERE queue_name = $1
-			  AND activity_id IN (
-				SELECT id FROM runnerq_activities
-				WHERE queue_name = $1 AND (id = $2 OR root_activity_id = $2))
-			FOR UPDATE`, b.queueName, rootID); err != nil {
-			return 0, databaseError(err, "failed to lock expired tree idempotency keys")
-		}
-
-		var pinned bool
-		if err := tx.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1
-				FROM runnerq_dependencies d
-				JOIN runnerq_activities producer ON producer.id = d.producer_activity_id AND producer.queue_name = $1
-				JOIN runnerq_activities waiter ON waiter.id = d.waiter_activity_id AND waiter.queue_name = $1
-				WHERE d.queue_name = $1
-				  AND COALESCE(producer.root_activity_id, producer.id) = $2
-				  AND COALESCE(waiter.root_activity_id, waiter.id) <> $2
-				  AND EXISTS (
-					SELECT 1 FROM runnerq_activities live
-					WHERE live.queue_name = $1
-					  AND COALESCE(live.root_activity_id, live.id) = COALESCE(waiter.root_activity_id, waiter.id)
-					  AND live.status NOT IN ('completed', 'failed', 'dead_letter'))
-			)`, b.queueName, rootID).Scan(&pinned); err != nil {
-			return 0, databaseError(err, "failed to recheck workflow retention dependency")
+		pinned, err := b.lockTreeForDeleteTx(ctx, tx, rootID)
+		if err != nil {
+			return 0, err
 		}
 		if pinned {
 			skippedRoots = append(skippedRoots, rootID)
@@ -1566,36 +1534,7 @@ func (b *PostgresBackend) CleanupExpired(ctx context.Context, policy storage.Ret
 			continue
 		}
 
-		var deleted int64
-		err = tx.QueryRow(ctx, `
-			WITH tree AS (
-				SELECT a.id FROM runnerq_activities a
-				WHERE a.queue_name = $1
-				  AND (a.id = $2 OR a.root_activity_id = $2)
-			),
-			del_dependencies AS (
-				DELETE FROM runnerq_dependencies WHERE queue_name = $1
-				  AND (waiter_activity_id IN (SELECT id FROM tree) OR producer_activity_id IN (SELECT id FROM tree))
-			),
-			del_results AS (
-				DELETE FROM runnerq_results
-				WHERE queue_name = $1
-				  AND (activity_id IN (SELECT id FROM tree) OR owner_activity_id IN (SELECT id FROM tree))
-				RETURNING activity_id
-			),
-			del_events AS (
-				DELETE FROM runnerq_events
-				WHERE queue_name = $1
-				  AND (activity_id IN (SELECT id FROM tree) OR activity_id IN (SELECT activity_id FROM del_results))
-			),
-			del_idem AS (
-				DELETE FROM runnerq_idempotency WHERE queue_name = $1 AND activity_id IN (SELECT id FROM tree)
-			),
-			del_act AS (
-				DELETE FROM runnerq_activities WHERE queue_name = $1 AND id IN (SELECT id FROM tree)
-				RETURNING id
-			)
-			SELECT count(*) FROM del_act`, b.queueName, rootID).Scan(&deleted)
+		deleted, err := b.deleteTreeTx(ctx, tx, rootID)
 		if err != nil {
 			return 0, databaseError(err, "failed to clean up expired workflow tree")
 		}
@@ -1879,7 +1818,7 @@ func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.Q
 		return reclaim()
 
 	case storage.BehaviorAllowReuseOnFailure:
-		if *status == "dead_letter" || *status == "failed" {
+		if *status == "dead_letter" || *status == "failed" || *status == "cancelled" {
 			return reclaim()
 		}
 		return nil, false, storage.NewIdempotencyConflictError(fmt.Sprintf("Idempotency key '%s' exists with status '%s'", key, *status))
@@ -2488,6 +2427,8 @@ func (r *activityRow) toSnapshot() storage.ActivitySnapshot {
 		status = "Failed"
 	case "dead_letter":
 		status = "DeadLetter"
+	case "cancelled":
+		status = "Cancelled"
 	default:
 		status = "Pending"
 	}

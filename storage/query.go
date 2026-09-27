@@ -63,6 +63,11 @@ const (
 	RecordEventResultStored    = "result.stored"
 	RecordEventChildLinked     = "child.linked"
 	RecordEventDeadLetter      = "dead_letter.entered"
+	RecordEventRedriven        = "dead_letter.redriven"
+	RecordEventRetried         = "activity.retried"
+	RecordEventRunNow          = "activity.run_now"
+	RecordEventRescheduled     = "activity.rescheduled"
+	RecordEventPriorityChanged = "activity.priority_changed"
 )
 
 // Filter operators.
