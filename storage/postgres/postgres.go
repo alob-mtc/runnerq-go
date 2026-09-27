@@ -1836,8 +1836,12 @@ func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.Q
 // ============================================================================
 
 func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error) {
+	return b.readStats(ctx, true)
+}
+
+func (b *PostgresBackend) readStats(ctx context.Context, useCache bool) (*storage.QueueStats, error) {
 	b.statsMu.Lock()
-	if b.statsCache != nil && time.Now().Before(b.statsExpiry) {
+	if useCache && b.statsCache != nil && time.Now().Before(b.statsExpiry) {
 		s := *b.statsCache
 		b.statsMu.Unlock()
 		return &s, nil

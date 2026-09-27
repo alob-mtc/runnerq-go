@@ -284,6 +284,14 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		e.mu.Unlock()
 		return &WorkerError{Kind: ErrConfiguration, Message: "retention values must be non-negative"}
 	}
+	managedMaintenance := false
+	if managed, ok := e.backend.(storage.ManagedMaintenanceStorage); ok {
+		managedMaintenance = managed.MaintenanceManaged()
+	}
+	if managedMaintenance && e.config.Retention != nil {
+		e.mu.Unlock()
+		return &WorkerError{Kind: ErrConfiguration, Message: "configure retention on the managed storage service"}
+	}
 	if q, ok := e.queue.(activityTypeFilter); ok {
 		q.setActivityTypes(types)
 	}
@@ -339,13 +347,15 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	}
 
 	// Reaper processor
-	wg.Go(func() {
-		e.runReaperProcessor(intakeCtx)
-	})
+	if !managedMaintenance {
+		wg.Go(func() {
+			e.runReaperProcessor(intakeCtx)
+		})
+	}
 
 	// Retention sweeper (opt-in). Safe to run on every engine: the backend
 	// elects one sweeper per queue via an advisory lock.
-	if e.config.Retention != nil {
+	if e.config.Retention != nil && !managedMaintenance {
 		wg.Go(func() {
 			e.runRetentionProcessor(intakeCtx)
 		})
