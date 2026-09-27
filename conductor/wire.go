@@ -5,6 +5,10 @@ import (
 	"fmt"
 )
 
+// Wire types for the RunnerQ Conductor protocol v1. The protocol spec lives
+// in the runnerq-cloud repository (docs/protocol.md) and is the contract;
+// these types encode it.
+
 // protocolVersion is the highest Conductor protocol version this agent speaks.
 const protocolVersion = 1
 
@@ -18,30 +22,36 @@ const (
 
 // envelope is one frame on the wire.
 type envelope struct {
-	V     int             `json:"v"`
-	Kind  kind            `json:"kind"`
-	ID    string          `json:"id,omitempty"`
-	Type  string          `json:"type"`
-	Data  json.RawMessage `json:"data,omitempty"`
-	Error *wireError      `json:"error,omitempty"`
+	V     int                        `json:"v"`
+	Kind  kind                       `json:"kind"`
+	ID    string                     `json:"id,omitempty"`
+	Type  string                     `json:"type"`
+	Data  json.RawMessage            `json:"data,omitempty"`
+	Error *wireError                 `json:"error,omitempty"`
+	Meta  map[string]json.RawMessage `json:"meta,omitempty"`
 }
+
+const metaDeadline = "deadline"
 
 type errorCode string
 
 const (
-	codeInvalidArgument errorCode = "invalid_argument"
-	codeNotFound        errorCode = "not_found"
-	codeForbidden       errorCode = "forbidden"
-	codeUnsupported     errorCode = "unsupported"
-	codeUnavailable     errorCode = "unavailable"
-	codeInternal        errorCode = "internal"
+	codeInvalidArgument   errorCode = "invalid_argument"
+	codeNotFound          errorCode = "not_found"
+	codeForbidden         errorCode = "forbidden"
+	codeUnsupported       errorCode = "unsupported"
+	codeResourceExhausted errorCode = "resource_exhausted"
+	codeDeadlineExceeded  errorCode = "deadline_exceeded"
+	codeUnavailable       errorCode = "unavailable"
+	codeInternal          errorCode = "internal"
 )
 
 // wireError is a failed response. Handlers return it to choose the code; any
-// other error is reported as internal.
+// other error is mapped by toWireError.
 type wireError struct {
-	Code    errorCode `json:"code"`
-	Message string    `json:"message"`
+	Code    errorCode      `json:"code"`
+	Message string         `json:"message"`
+	Details map[string]any `json:"details,omitempty"`
 }
 
 func (e *wireError) Error() string { return fmt.Sprintf("%s: %s", e.Code, e.Message) }
@@ -50,31 +60,37 @@ func errorf(code errorCode, format string, args ...any) *wireError {
 	return &wireError{Code: code, Message: fmt.Sprintf(format, args...)}
 }
 
+// fieldError is an error about one request field.
+func fieldError(code errorCode, field, format string, args ...any) *wireError {
+	e := errorf(code, format, args...)
+	e.Details = map[string]any{"field": field}
+	return e
+}
+
 // Message types.
 const (
 	typeHello   = "hello"
 	typeGoodbye = "goodbye"
 
-	typeStats             = "stats"
-	typeListActivities    = "list_activities"
-	typeListRoots         = "list_roots"
-	typeGetActivity       = "get_activity"
-	typeGetActivityEvents = "get_activity_events"
-	typeGetActivitySteps  = "get_activity_steps"
-	typeGetActivityResult = "get_activity_result"
-	typeGetChildren       = "get_children"
-	typeGetSubtree        = "get_subtree"
-	typeListDeadLetter    = "list_dead_letter"
+	typeActivitiesList      = "activities.list"
+	typeActivitiesGet       = "activities.get"
+	typeActivitiesCount     = "activities.count"
+	typeActivitiesAggregate = "activities.aggregate"
+	typeStepsList           = "steps.list"
+	typeEventsList          = "events.list"
+	typeResultsGet          = "results.get"
+	typeTreesGet            = "trees.get"
+	typeExecutorDescribe    = "executor.describe"
 
-	typeSignal = "signal"
+	typeExecutorReport = "executor.report"
+	typeConfigUpdate   = "config.update"
 )
 
 type dataMode string
 
-const (
-	dataModeFull         dataMode = "full"
-	dataModeMetadataOnly dataMode = "metadata_only"
-)
+const dataModeMetadataOnly dataMode = "metadata_only"
+
+// --- handshake ---
 
 type sdkInfo struct {
 	Name     string `json:"name"`
@@ -82,54 +98,244 @@ type sdkInfo struct {
 	Language string `json:"language"`
 }
 
+type executorInfo struct {
+	ID             string            `json:"id"`
+	Hostname       string            `json:"hostname,omitempty"`
+	Queues         []string          `json:"queues,omitempty"`
+	ActivityTypes  []string          `json:"activity_types,omitempty"`
+	MaxConcurrency int               `json:"max_concurrency,omitempty"`
+	StartedAt      string            `json:"started_at,omitempty"`
+	Labels         map[string]string `json:"labels,omitempty"`
+}
+
+type capability struct {
+	V       int      `json:"v"`
+	Filters []string `json:"filters,omitempty"`
+	Sorts   []string `json:"sorts,omitempty"`
+	Include []string `json:"include,omitempty"`
+	GroupBy []string `json:"group_by,omitempty"`
+	Buckets []string `json:"buckets,omitempty"`
+	Metrics []string `json:"metrics,omitempty"`
+	Targets []string `json:"targets,omitempty"`
+}
+
+type limits struct {
+	MaxFrameBytes         int `json:"max_frame_bytes,omitempty"`
+	MaxConcurrentRequests int `json:"max_concurrent_requests,omitempty"`
+}
+
 type hello struct {
-	ProtocolVersions []int    `json:"protocol_versions"`
-	SDK              sdkInfo  `json:"sdk"`
-	ExecutorID       string   `json:"executor_id"`
-	Hostname         string   `json:"hostname"`
-	ActivityTypes    []string `json:"activity_types,omitempty"`
-	MaxWorkers       int      `json:"max_workers"`
-	Capabilities     []string `json:"capabilities"`
+	ProtocolVersions []int                 `json:"protocol_versions"`
+	SDK              sdkInfo               `json:"sdk"`
+	Executor         executorInfo          `json:"executor"`
+	Capabilities     map[string]capability `json:"capabilities"`
+	Limits           limits                `json:"limits"`
+}
+
+type appRef struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type sessionConfig struct {
+	DataMode         dataMode `json:"data_mode,omitempty"`
+	ReportIntervalMS int64    `json:"report_interval_ms,omitempty"`
 }
 
 type welcome struct {
-	Version   int      `json:"version"`
-	SessionID string   `json:"session_id"`
-	App       string   `json:"app"`
-	DataMode  dataMode `json:"data_mode"`
+	Version   int           `json:"version"`
+	SessionID string        `json:"session_id"`
+	App       appRef        `json:"app"`
+	Config    sessionConfig `json:"config"`
+	Limits    limits        `json:"limits"`
 }
 
 type goodbye struct {
 	Reason string `json:"reason"`
 }
 
-type page struct {
-	Offset int `json:"offset,omitempty"`
-	Limit  int `json:"limit,omitempty"`
+// --- queries ---
+
+type wireFilter struct {
+	And   []wireFilter    `json:"and,omitempty"`
+	Or    []wireFilter    `json:"or,omitempty"`
+	Not   *wireFilter     `json:"not,omitempty"`
+	Field string          `json:"field,omitempty"`
+	Op    string          `json:"op,omitempty"`
+	Value json.RawMessage `json:"value,omitempty"`
 }
 
-type listRequest struct {
-	Status string `json:"status"`
-	page
+type wireSort struct {
+	Field string `json:"field"`
+	Order string `json:"order,omitempty"`
 }
 
-type activityRef struct {
-	ID string `json:"id"`
+type query struct {
+	Filter  *wireFilter `json:"filter,omitempty"`
+	Sort    []wireSort  `json:"sort,omitempty"`
+	Include []string    `json:"include,omitempty"`
+	Limit   int         `json:"limit,omitempty"`
+	Cursor  string      `json:"cursor,omitempty"`
 }
 
-type activityPage struct {
-	ID string `json:"id"`
-	page
+type page[T any] struct {
+	Items      []T    `json:"items"`
+	NextCursor string `json:"next_cursor,omitempty"`
 }
 
-type signalRequest struct {
-	ID           string          `json:"id,omitempty"`
-	Key          string          `json:"key,omitempty"`
-	ActivityType string          `json:"activity_type,omitempty"`
-	Name         string          `json:"name"`
-	Payload      json.RawMessage `json:"payload,omitempty"`
+type getRequest struct {
+	ID      string   `json:"id"`
+	Include []string `json:"include,omitempty"`
 }
 
-type controlResult struct {
-	Status string `json:"status,omitempty"`
+type countRequest struct {
+	Filter *wireFilter `json:"filter,omitempty"`
+}
+
+type countResult struct {
+	Count int64 `json:"count"`
+	Exact bool  `json:"exact"`
+}
+
+type stepsRequest struct {
+	ActivityID string   `json:"activity_id"`
+	Include    []string `json:"include,omitempty"`
+	Limit      int      `json:"limit,omitempty"`
+	Cursor     string   `json:"cursor,omitempty"`
+}
+
+type resultRequest struct {
+	ActivityID string `json:"activity_id"`
+}
+
+type treeRequest struct {
+	ID       string   `json:"id"`
+	Include  []string `json:"include,omitempty"`
+	MaxNodes int      `json:"max_nodes,omitempty"`
+}
+
+type bucket struct {
+	Field      string `json:"field"`
+	IntervalMS int64  `json:"interval_ms"`
+	From       string `json:"from,omitempty"`
+	To         string `json:"to,omitempty"`
+}
+
+type metric struct {
+	Name        string    `json:"name"`
+	Field       string    `json:"field,omitempty"`
+	Percentiles []float64 `json:"percentiles,omitempty"`
+}
+
+type aggregateRequest struct {
+	Filter  *wireFilter `json:"filter,omitempty"`
+	GroupBy []string    `json:"group_by,omitempty"`
+	Bucket  *bucket     `json:"bucket,omitempty"`
+	Metrics []metric    `json:"metrics"`
+	Limit   int         `json:"limit,omitempty"`
+}
+
+type aggregateGroup struct {
+	Key       map[string]string             `json:"key,omitempty"`
+	Bucket    string                        `json:"bucket,omitempty"`
+	Count     *int64                        `json:"count,omitempty"`
+	Durations map[string]map[string]float64 `json:"durations,omitempty"`
+}
+
+type aggregateResult struct {
+	Groups    []aggregateGroup `json:"groups"`
+	Truncated bool             `json:"truncated"`
+}
+
+// --- resources ---
+
+type errorInfo struct {
+	Message string `json:"message,omitempty"`
+	Kind    string `json:"kind,omitempty"`
+	At      string `json:"at,omitempty"`
+}
+
+type result struct {
+	State string          `json:"state"` // ok | error
+	Data  json.RawMessage `json:"data,omitempty"`
+	Error *errorInfo      `json:"error,omitempty"`
+}
+
+type wait struct {
+	Kind  string `json:"kind"`
+	Name  string `json:"name,omitempty"`
+	Until string `json:"until,omitempty"`
+}
+
+type activityView struct {
+	ID             string            `json:"id"`
+	Type           string            `json:"type"`
+	Queue          string            `json:"queue,omitempty"`
+	Status         string            `json:"status"`
+	Priority       int               `json:"priority"`
+	RootID         string            `json:"root_id,omitempty"`
+	ParentID       string            `json:"parent_id,omitempty"`
+	Depth          int               `json:"depth"`
+	IdempotencyKey string            `json:"idempotency_key,omitempty"`
+	Attempt        int               `json:"attempt"`
+	MaxAttempts    int               `json:"max_attempts"`
+	CreatedAt      string            `json:"created_at"`
+	ScheduledFor   string            `json:"scheduled_for,omitempty"`
+	StartedAt      string            `json:"started_at,omitempty"`
+	CompletedAt    string            `json:"completed_at,omitempty"`
+	UpdatedAt      string            `json:"updated_at,omitempty"`
+	TimeoutMS      int64             `json:"timeout_ms,omitempty"`
+	LeaseExpiresAt string            `json:"lease_expires_at,omitempty"`
+	ExecutorID     string            `json:"executor_id,omitempty"`
+	Wait           *wait             `json:"wait,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
+	LastError      *errorInfo        `json:"last_error,omitempty"`
+	Payload        json.RawMessage   `json:"payload,omitempty"`
+	Result         *result           `json:"result,omitempty"`
+	// Steps and Events are pointers so an included-but-empty list encodes as
+	// [] and a list that was not asked for is omitted.
+	Steps  *[]stepView  `json:"steps,omitempty"`
+	Events *[]eventView `json:"events,omitempty"`
+}
+
+type stepView struct {
+	ID         string  `json:"id"`
+	ActivityID string  `json:"activity_id"`
+	Name       string  `json:"name"`
+	Kind       string  `json:"kind"`
+	Status     string  `json:"status"`
+	CreatedAt  string  `json:"created_at"`
+	Result     *result `json:"result,omitempty"`
+}
+
+type eventView struct {
+	ID         string          `json:"id"`
+	Cursor     string          `json:"cursor"`
+	ActivityID string          `json:"activity_id"`
+	Type       string          `json:"type"`
+	At         string          `json:"at"`
+	ExecutorID string          `json:"executor_id,omitempty"`
+	Detail     json.RawMessage `json:"detail,omitempty"`
+}
+
+type treeView struct {
+	RootID    string         `json:"root_id"`
+	Items     []activityView `json:"items"`
+	Truncated bool           `json:"truncated"`
+}
+
+type runningActivity struct {
+	ActivityID string `json:"activity_id"`
+	Type       string `json:"type"`
+	Attempt    int    `json:"attempt"`
+	StartedAt  string `json:"started_at"`
+}
+
+type executorState struct {
+	ID             string            `json:"id"`
+	UptimeMS       int64             `json:"uptime_ms"`
+	MaxConcurrency int               `json:"max_concurrency"`
+	InFlight       int               `json:"in_flight"`
+	Running        []runningActivity `json:"running,omitempty"`
+	Draining       bool              `json:"draining"`
 }

@@ -26,12 +26,13 @@ const testKey = "rqk_test"
 
 // fakeGateway plays the Cloud side of the protocol.
 type fakeGateway struct {
-	t        *testing.T
-	srv      *httptest.Server
-	mode     dataMode
-	rejectN  atomic.Int32 // answer this many dials with 401 first
-	hellos   chan hello
-	goodbyes chan goodbye
+	t       *testing.T
+	srv     *httptest.Server
+	config  sessionConfig
+	frame   int
+	rejectN atomic.Int32 // answer this many dials with 401 first
+	hellos  chan hello
+	events  chan envelope
 
 	mu      sync.Mutex
 	conn    *websocket.Conn
@@ -39,12 +40,12 @@ type fakeGateway struct {
 	replies map[string]chan envelope
 }
 
-func newFakeGateway(t *testing.T, mode dataMode) *fakeGateway {
+func newFakeGateway(t *testing.T, cfg sessionConfig) *fakeGateway {
 	g := &fakeGateway{
-		t: t, mode: mode,
-		hellos:   make(chan hello, 16),
-		goodbyes: make(chan goodbye, 16),
-		replies:  map[string]chan envelope{},
+		t: t, config: cfg,
+		hellos:  make(chan hello, 16),
+		events:  make(chan envelope, 64),
+		replies: map[string]chan envelope{},
 	}
 	g.srv = httptest.NewServer(http.HandlerFunc(g.handle))
 	t.Cleanup(func() {
@@ -69,6 +70,7 @@ func (g *fakeGateway) handle(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	conn.SetReadLimit(16 << 20)
 	ctx := context.Background()
 	var req envelope
 	if err := wsjson.Read(ctx, conn, &req); err != nil {
@@ -76,7 +78,10 @@ func (g *fakeGateway) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	var h hello
 	_ = json.Unmarshal(req.Data, &h)
-	res, _ := json.Marshal(welcome{Version: 1, SessionID: uuid.NewString(), App: "test-app", DataMode: g.mode})
+	res, _ := json.Marshal(welcome{
+		Version: 1, SessionID: uuid.NewString(), App: appRef{ID: "app-1", Name: "test-app"},
+		Config: g.config, Limits: limits{MaxFrameBytes: g.frame},
+	})
 	if err := wsjson.Write(ctx, conn, envelope{V: 1, Kind: kindResponse, ID: req.ID, Type: typeHello, Data: res}); err != nil {
 		return
 	}
@@ -99,17 +104,28 @@ func (g *fakeGateway) handle(w http.ResponseWriter, r *http.Request) {
 				ch <- env
 			}
 		case kindEvent:
-			if env.Type == typeGoodbye {
-				var gb goodbye
-				_ = json.Unmarshal(env.Data, &gb)
-				g.goodbyes <- gb
+			select {
+			case g.events <- env:
+			default:
 			}
 		}
 	}
 }
 
-// call sends a request to the connected agent and waits for its reply.
-func (g *fakeGateway) call(msgType string, data any) envelope {
+// send writes a one-way event to the agent.
+func (g *fakeGateway) send(msgType string, data any) {
+	g.t.Helper()
+	raw, _ := json.Marshal(data)
+	g.mu.Lock()
+	conn := g.conn
+	g.mu.Unlock()
+	if err := wsjson.Write(context.Background(), conn, envelope{V: 1, Kind: kindEvent, Type: msgType, Data: raw}); err != nil {
+		g.t.Fatalf("send %s: %v", msgType, err)
+	}
+}
+
+// callMeta sends a request with meta and waits for the reply.
+func (g *fakeGateway) callMeta(msgType string, data any, meta map[string]json.RawMessage) envelope {
 	g.t.Helper()
 	raw, _ := json.Marshal(data)
 	g.mu.Lock()
@@ -124,7 +140,7 @@ func (g *fakeGateway) call(msgType string, data any) envelope {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := wsjson.Write(ctx, conn, envelope{V: 1, Kind: kindRequest, ID: id, Type: msgType, Data: raw}); err != nil {
+	if err := wsjson.Write(ctx, conn, envelope{V: 1, Kind: kindRequest, ID: id, Type: msgType, Data: raw, Meta: meta}); err != nil {
 		g.t.Fatalf("send %s: %v", msgType, err)
 	}
 	select {
@@ -135,6 +151,8 @@ func (g *fakeGateway) call(msgType string, data any) envelope {
 		return envelope{}
 	}
 }
+
+func (g *fakeGateway) call(msgType string, data any) envelope { return g.callMeta(msgType, data, nil) }
 
 // ok asserts a successful reply and decodes it into out.
 func (g *fakeGateway) ok(msgType string, data, out any) {
@@ -150,13 +168,14 @@ func (g *fakeGateway) ok(msgType string, data, out any) {
 	}
 }
 
-// fails asserts a failed reply with the given code.
-func (g *fakeGateway) fails(msgType string, data any, code errorCode) {
+// fails asserts a failed reply with the given code and returns the error.
+func (g *fakeGateway) fails(msgType string, data any, code errorCode) *wireError {
 	g.t.Helper()
 	res := g.call(msgType, data)
 	if res.Error == nil || res.Error.Code != code {
 		g.t.Fatalf("%s: got error %v (data %s), want code %s", msgType, res.Error, res.Data, code)
 	}
+	return res.Error
 }
 
 func (g *fakeGateway) waitHello() hello {
@@ -167,6 +186,23 @@ func (g *fakeGateway) waitHello() hello {
 	case <-time.After(10 * time.Second):
 		g.t.Fatal("agent never connected")
 		return hello{}
+	}
+}
+
+// waitEvent returns the next event of msgType.
+func (g *fakeGateway) waitEvent(msgType string) envelope {
+	g.t.Helper()
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case e := <-g.events:
+			if e.Type == msgType {
+				return e
+			}
+		case <-deadline:
+			g.t.Fatalf("no %s event", msgType)
+			return envelope{}
+		}
 	}
 }
 
@@ -183,12 +219,12 @@ func (Echo) Handle(_ runnerq.ActivityContext, payload json.RawMessage) (json.Raw
 
 func nopEngine(t *testing.T) *runnerq.WorkerEngine {
 	t.Helper()
-	e := runnerq.NewWorkerEngineWithBackend(nopStorage{}, runnerq.WorkerConfig{MaxConcurrentActivities: 3})
+	e := runnerq.NewWorkerEngineWithBackend(nopStorage{}, runnerq.WorkerConfig{QueueName: "q1", MaxConcurrentActivities: 3})
 	e.RegisterActivity(&Echo{})
 	return e
 }
 
-func pgEngine(t *testing.T) (*runnerq.WorkerEngine, *postgres.PostgresBackend) {
+func pgEngine(t *testing.T) (*runnerq.WorkerEngine, *postgres.PostgresBackend, string) {
 	t.Helper()
 	dsn := os.Getenv("RUNNERQ_TEST_DSN")
 	if dsn == "" {
@@ -202,7 +238,7 @@ func pgEngine(t *testing.T) (*runnerq.WorkerEngine, *postgres.PostgresBackend) {
 	t.Cleanup(b.Close)
 	e := runnerq.NewWorkerEngineWithBackend(b, runnerq.WorkerConfig{QueueName: queue, MaxConcurrentActivities: 2})
 	e.RegisterActivity(&Echo{})
-	return e, b
+	return e, b, queue
 }
 
 func startAgent(t *testing.T, e *runnerq.WorkerEngine, g *fakeGateway, cfg Config) *Agent {
@@ -224,18 +260,30 @@ func startAgent(t *testing.T, e *runnerq.WorkerEngine, g *fakeGateway, cfg Confi
 }
 
 // enqueue adds a root activity directly through the backend.
-func enqueue(t *testing.T, b *postgres.PostgresBackend, payload string) uuid.UUID {
+func enqueue(t *testing.T, b *postgres.PostgresBackend, payload string, opts ...func(*storage.QueuedActivity)) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
-	err := b.Enqueue(context.Background(), storage.QueuedActivity{
+	a := storage.QueuedActivity{
 		ID: id, ActivityType: "Echo", Payload: json.RawMessage(payload),
 		Priority: storage.PriorityNormal, MaxRetries: 3, TimeoutSeconds: 60,
 		RetryDelaySeconds: 1, CreatedAt: time.Now().UTC(), RootActivityID: id,
-	})
-	if err != nil {
+	}
+	for _, o := range opts {
+		o(&a)
+	}
+	if err := b.Enqueue(context.Background(), a); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
 	return id
+}
+
+// inQueue scopes a query to the test's queue (queries span all queues).
+func inQueue(queue string, terms ...map[string]any) map[string]any {
+	and := []any{map[string]any{"field": "queue", "op": "eq", "value": queue}}
+	for _, t := range terms {
+		and = append(and, t)
+	}
+	return map[string]any{"and": and}
 }
 
 func TestConfigValidation(t *testing.T) {
@@ -254,7 +302,6 @@ func TestConfigValidation(t *testing.T) {
 	if _, err := Start(ctx, nil, Config{URL: "wss://x", APIKey: "k"}); err == nil {
 		t.Fatal("Start accepted a nil engine")
 	}
-
 	c := Config{URL: "https://cloud.example.com/base/", APIKey: "k"}
 	u, err := c.validate()
 	if err != nil || u.String() != "wss://cloud.example.com/base/v1/agent" {
@@ -263,31 +310,24 @@ func TestConfigValidation(t *testing.T) {
 }
 
 func TestHelloDescribesExecutor(t *testing.T) {
-	g := newFakeGateway(t, dataModeFull)
+	g := newFakeGateway(t, sessionConfig{})
 	e := nopEngine(t)
-	a := startAgent(t, e, g, Config{AllowControl: true})
+	a := startAgent(t, e, g, Config{Labels: map[string]string{"region": "eu"}})
 
 	h := g.waitHello()
-	if h.ExecutorID != e.InstanceID() || h.MaxWorkers != 3 || h.SDK.Name != "runnerq-go" || h.SDK.Language != "go" {
-		t.Fatalf("unexpected hello %+v", h)
+	ex := h.Executor
+	if ex.ID != e.InstanceID() || ex.MaxConcurrency != 3 || len(ex.Queues) != 1 || ex.Queues[0] != "q1" ||
+		ex.Labels["region"] != "eu" || len(ex.ActivityTypes) != 1 || ex.ActivityTypes[0] != "Echo" {
+		t.Fatalf("executor %+v", ex)
 	}
-	if len(h.ActivityTypes) != 1 || h.ActivityTypes[0] != "Echo" {
-		t.Fatalf("activity types %v", h.ActivityTypes)
+	if h.SDK.Name != "runnerq-go" || h.SDK.Language != "go" || h.Limits.MaxFrameBytes != maxMessageBytes {
+		t.Fatalf("hello %+v", h)
 	}
-	if len(h.ProtocolVersions) != 1 || h.ProtocolVersions[0] != protocolVersion {
-		t.Fatalf("versions %v", h.ProtocolVersions)
+	// A backend without QueryStorage serves only executor-scoped messages.
+	if _, ok := h.Capabilities[typeExecutorDescribe]; !ok || len(h.Capabilities) != 1 {
+		t.Fatalf("capabilities %+v", h.Capabilities)
 	}
-	for _, want := range []string{typeStats, typeGetActivity, typeSignal} {
-		found := false
-		for _, c := range h.Capabilities {
-			found = found || c == want
-		}
-		if !found {
-			t.Fatalf("capability %q missing from %v", want, h.Capabilities)
-		}
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for !a.Connected() || a.SessionID() == "" {
+	for deadline := time.Now().Add(5 * time.Second); !a.Connected() || a.SessionID() == ""; {
 		if time.Now().After(deadline) {
 			t.Fatal("agent never reported connected")
 		}
@@ -295,37 +335,40 @@ func TestHelloDescribesExecutor(t *testing.T) {
 	}
 }
 
-func TestUnknownTypeAndBadInput(t *testing.T) {
-	g := newFakeGateway(t, dataModeFull)
+func TestExecutorDescribeAndReports(t *testing.T) {
+	g := newFakeGateway(t, sessionConfig{ReportIntervalMS: 60_000}) // the first report is sent on connect
+	e := nopEngine(t)
+	startAgent(t, e, g, Config{})
+	g.waitHello()
+
+	var st executorState
+	g.ok(typeExecutorDescribe, struct{}{}, &st)
+	if st.ID != e.InstanceID() || st.MaxConcurrency != 3 || st.InFlight != 0 || st.Draining {
+		t.Fatalf("state %+v", st)
+	}
+	evt := g.waitEvent(typeExecutorReport)
+	if err := json.Unmarshal(evt.Data, &st); err != nil || st.ID != e.InstanceID() {
+		t.Fatalf("report %s: %v", evt.Data, err)
+	}
+}
+
+func TestProtocolErrors(t *testing.T) {
+	g := newFakeGateway(t, sessionConfig{})
 	startAgent(t, nopEngine(t), g, Config{})
 	g.waitHello()
 
 	g.fails("launch_missiles", nil, codeUnsupported)
-	g.fails(typeGetActivity, activityRef{ID: "not-a-uuid"}, codeInvalidArgument)
-	g.fails(typeListActivities, listRequest{Status: "bogus"}, codeInvalidArgument)
-	g.fails(typeListRoots, listRequest{Status: "cron"}, codeInvalidArgument)
-	g.fails(typeGetActivity, json.RawMessage(`{"id":`), codeInvalidArgument)
-}
-
-func TestSignalNeedsAllowControl(t *testing.T) {
-	g := newFakeGateway(t, dataModeFull)
-	startAgent(t, nopEngine(t), g, Config{AllowControl: false})
-	g.waitHello()
-	g.fails(typeSignal, signalRequest{ID: uuid.NewString(), Name: "go"}, codeForbidden)
-}
-
-func TestSignalValidation(t *testing.T) {
-	g := newFakeGateway(t, dataModeFull)
-	startAgent(t, nopEngine(t), g, Config{AllowControl: true})
-	g.waitHello()
-	g.fails(typeSignal, signalRequest{ID: uuid.NewString()}, codeInvalidArgument)
-	g.fails(typeSignal, signalRequest{Name: "go"}, codeInvalidArgument)
-	g.fails(typeSignal, signalRequest{ID: uuid.NewString(), Key: "k", Name: "go"}, codeInvalidArgument)
-	g.fails(typeSignal, signalRequest{Key: "k", Name: "go"}, codeInvalidArgument) // no activity_type
+	g.fails(typeActivitiesList, nil, codeUnsupported) // backend lacks QueryStorage
+	res := g.callMeta(typeExecutorDescribe, struct{}{}, map[string]json.RawMessage{
+		metaDeadline: json.RawMessage(`"` + time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano) + `"`),
+	})
+	if res.Error == nil || res.Error.Code != codeDeadlineExceeded {
+		t.Fatalf("expired deadline: %+v", res)
+	}
 }
 
 func TestReconnectsAfterRejectionAndDrop(t *testing.T) {
-	g := newFakeGateway(t, dataModeFull)
+	g := newFakeGateway(t, sessionConfig{})
 	g.rejectN.Store(2) // two 401s before the key is accepted
 	startAgent(t, nopEngine(t), g, Config{})
 	first := g.waitHello()
@@ -334,14 +377,13 @@ func TestReconnectsAfterRejectionAndDrop(t *testing.T) {
 	g.conn.CloseNow() // gateway crash
 	g.mu.Unlock()
 
-	second := g.waitHello()
-	if first.ExecutorID != second.ExecutorID {
-		t.Fatalf("executor id changed across reconnects: %s -> %s", first.ExecutorID, second.ExecutorID)
+	if second := g.waitHello(); first.Executor.ID != second.Executor.ID {
+		t.Fatalf("executor id changed across reconnects: %s -> %s", first.Executor.ID, second.Executor.ID)
 	}
 }
 
 func TestCloseSendsGoodbye(t *testing.T) {
-	g := newFakeGateway(t, dataModeFull)
+	g := newFakeGateway(t, sessionConfig{})
 	a := startAgent(t, nopEngine(t), g, Config{})
 	g.waitHello()
 
@@ -350,13 +392,9 @@ func TestCloseSendsGoodbye(t *testing.T) {
 	if err := a.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case gb := <-g.goodbyes:
-		if gb.Reason != "shutdown" {
-			t.Fatalf("goodbye reason %q", gb.Reason)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("no goodbye received")
+	var gb goodbye
+	if err := json.Unmarshal(g.waitEvent(typeGoodbye).Data, &gb); err != nil || gb.Reason != "shutdown" {
+		t.Fatalf("goodbye %+v %v", gb, err)
 	}
 	if a.Connected() {
 		t.Fatal("agent still connected after Close")
@@ -368,8 +406,27 @@ func TestCloseSendsGoodbye(t *testing.T) {
 	}
 }
 
-func TestRequestLimitAnswersUnavailable(t *testing.T) {
-	g := newFakeGateway(t, dataModeFull)
+func TestCancelledContextSaysGoodbye(t *testing.T) {
+	g := newFakeGateway(t, sessionConfig{})
+	ctx, cancel := context.WithCancel(context.Background())
+	a, err := Start(ctx, nopEngine(t), Config{URL: g.url(), APIKey: testKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.waitHello()
+	cancel() // e.g. a signal.NotifyContext firing on SIGTERM
+	if e := g.waitEvent(typeGoodbye); e.Type != typeGoodbye {
+		t.Fatalf("got %s", e.Type)
+	}
+	cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer ccancel()
+	if err := a.Close(cctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRequestLimit(t *testing.T) {
+	g := newFakeGateway(t, sessionConfig{})
 	a := startAgent(t, nopEngine(t), g, Config{MaxConcurrentRequests: 1})
 	g.waitHello()
 
@@ -383,141 +440,166 @@ func TestRequestLimitAnswersUnavailable(t *testing.T) {
 	done := make(chan envelope, 1)
 	go func() { done <- g.call("block", nil) }()
 	<-started
-	g.fails(typeStats, nil, codeUnavailable)
+	g.fails(typeExecutorDescribe, nil, codeResourceExhausted)
 	close(release)
 	if res := <-done; res.Error != nil {
 		t.Fatalf("blocked request failed: %v", res.Error)
 	}
 }
 
-func TestHandlerPanicIsContained(t *testing.T) {
-	g := newFakeGateway(t, dataModeFull)
+func TestHandlerPanicAndOversizedReplies(t *testing.T) {
+	g := newFakeGateway(t, sessionConfig{})
+	g.frame = 64 << 10
 	a := startAgent(t, nopEngine(t), g, Config{})
 	g.waitHello()
 	a.table["boom"] = func(context.Context, json.RawMessage) (any, error) { panic("boom") }
+	a.table["huge"] = func(context.Context, json.RawMessage) (any, error) { return strings.Repeat("x", 128<<10), nil }
 	g.fails("boom", nil, codeInternal)
-	g.fails("launch_missiles", nil, codeUnsupported) // still serving
+	g.fails("huge", nil, codeResourceExhausted)
+	g.ok(typeExecutorDescribe, struct{}{}, nil) // still serving
 }
 
 // --- against Postgres ---
 
-func TestReadsFromStorage(t *testing.T) {
-	e, b := pgEngine(t)
-	g := newFakeGateway(t, dataModeFull)
+func TestQueriesFromStorage(t *testing.T) {
+	e, b, queue := pgEngine(t)
+	g := newFakeGateway(t, sessionConfig{})
 	startAgent(t, e, g, Config{})
-	g.waitHello()
+	h := g.waitHello()
+	for _, want := range []string{typeActivitiesList, typeActivitiesGet, typeActivitiesCount, typeActivitiesAggregate,
+		typeStepsList, typeEventsList, typeResultsGet, typeTreesGet} {
+		if _, ok := h.Capabilities[want]; !ok {
+			t.Fatalf("capability %q missing", want)
+		}
+	}
+	if c := h.Capabilities[typeActivitiesList]; len(c.Filters) == 0 || len(c.Sorts) == 0 {
+		t.Fatalf("list capability without sub-features: %+v", c)
+	}
 
 	id := enqueue(t, b, `{"n":1}`)
-	enqueue(t, b, `{"n":2}`)
-
-	var stats struct {
-		Pending    uint64 `json:"pending_activities"`
-		MaxWorkers *int   `json:"max_workers"`
-	}
-	g.ok(typeStats, struct{}{}, &stats)
-	if stats.Pending != 2 {
-		t.Fatalf("stats pending %d, want 2", stats.Pending)
+	child := enqueue(t, b, `{"n":2}`, func(a *storage.QueuedActivity) { a.ParentActivityID, a.RootActivityID, a.Depth = &id, id, 1 })
+	for range 3 {
+		enqueue(t, b, `{}`, func(a *storage.QueuedActivity) { a.ActivityType = "Other" })
 	}
 
-	var list []map[string]any
-	g.ok(typeListActivities, listRequest{Status: "pending", page: page{Limit: 1}}, &list)
-	if len(list) != 1 {
-		t.Fatalf("limit ignored: %d items", len(list))
+	var list page[activityView]
+	g.ok(typeActivitiesList, query{Filter: mustFilter(inQueue(queue, map[string]any{"field": "type", "op": "eq", "value": "Echo"})), Limit: 1}, &list)
+	if len(list.Items) != 1 || list.NextCursor == "" || list.Items[0].Payload != nil {
+		t.Fatalf("first page %+v", list)
 	}
-	g.ok(typeListRoots, listRequest{}, &list)
-	if len(list) != 2 {
-		t.Fatalf("roots: %d items", len(list))
+	var second page[activityView]
+	g.ok(typeActivitiesList, query{Filter: mustFilter(inQueue(queue, map[string]any{"field": "type", "op": "eq", "value": "Echo"})), Limit: 1, Cursor: list.NextCursor}, &second)
+	if len(second.Items) != 1 || second.NextCursor != "" || second.Items[0].ID == list.Items[0].ID {
+		t.Fatalf("second page %+v", second)
 	}
 
-	var act map[string]any
-	g.ok(typeGetActivity, activityRef{ID: id.String()}, &act)
-	if act["id"] != id.String() || act["activity_type"] != "Echo" {
-		t.Fatalf("get_activity %+v", act)
+	var act activityView
+	g.ok(typeActivitiesGet, getRequest{ID: id.String(), Include: []string{"payload", "events", "steps"}}, &act)
+	if act.ID != id.String() || act.Status != "pending" || act.Type != "Echo" || string(act.Payload) != `{"n": 1}` && string(act.Payload) != `{"n":1}` {
+		t.Fatalf("activity %+v (payload %s)", act, act.Payload)
 	}
-	if p, _ := json.Marshal(act["payload"]); string(p) != `{"n":1}` {
-		t.Fatalf("payload %s", p)
+	if act.Events == nil || len(*act.Events) == 0 || (*act.Events)[0].Type != storage.RecordEventCreated || act.Steps == nil || len(*act.Steps) != 0 {
+		t.Fatalf("embedded events/steps %+v %+v", act.Events, act.Steps)
 	}
-	g.fails(typeGetActivity, activityRef{ID: uuid.NewString()}, codeNotFound)
+	g.fails(typeActivitiesGet, getRequest{ID: uuid.NewString()}, codeNotFound)
+	g.fails(typeActivitiesGet, getRequest{ID: "not-an-id"}, codeNotFound)
 
-	var events []map[string]any
-	g.ok(typeGetActivityEvents, activityPage{ID: id.String()}, &events)
-	if len(events) == 0 || events[0]["event_type"] != storage.EventEnqueued {
+	var count countResult
+	g.ok(typeActivitiesCount, countRequest{Filter: mustFilter(inQueue(queue))}, &count)
+	if count.Count != 5 || !count.Exact {
+		t.Fatalf("count %+v", count)
+	}
+
+	var agg aggregateResult
+	g.ok(typeActivitiesAggregate, aggregateRequest{Filter: mustFilter(inQueue(queue)), GroupBy: []string{"type"},
+		Metrics: []metric{{Name: "count"}}}, &agg)
+	counts := map[string]int64{}
+	for _, gr := range agg.Groups {
+		counts[gr.Key["type"]] = *gr.Count
+	}
+	if counts["Echo"] != 2 || counts["Other"] != 3 {
+		t.Fatalf("aggregate %+v", agg)
+	}
+
+	var tree treeView
+	g.ok(typeTreesGet, treeRequest{ID: child.String()}, &tree)
+	if tree.RootID != id.String() || len(tree.Items) != 2 {
+		t.Fatalf("tree %+v", tree)
+	}
+	var events page[eventView]
+	g.ok(typeEventsList, query{Filter: mustFilter(map[string]any{"field": "root_id", "op": "eq", "value": id.String()}),
+		Sort: []wireSort{{Field: "at", Order: "desc"}}}, &events)
+	if len(events.Items) != 2 || events.Items[0].ActivityID != child.String() {
 		t.Fatalf("events %+v", events)
 	}
+	g.fails(typeResultsGet, resultRequest{ActivityID: id.String()}, codeNotFound)
 
-	var tree []map[string]any
-	g.ok(typeGetSubtree, activityRef{ID: id.String()}, &tree)
-	if len(tree) != 1 {
-		t.Fatalf("subtree %+v", tree)
+	// Errors carry the offending field.
+	e1 := g.fails(typeActivitiesList, query{Filter: mustFilter(map[string]any{"field": "colour", "op": "eq", "value": "red"})}, codeUnsupported)
+	if e1.Details["field"] != "colour" {
+		t.Fatalf("details %+v", e1.Details)
 	}
-	g.ok(typeGetChildren, activityPage{ID: id.String()}, &tree)
-	if len(tree) != 0 {
-		t.Fatalf("children %+v", tree)
-	}
-	var steps []any
-	g.ok(typeGetActivitySteps, activityRef{ID: id.String()}, &steps)
-	var dl []any
-	g.ok(typeListDeadLetter, page{}, &dl)
-	g.fails(typeGetActivityResult, activityRef{ID: id.String()}, codeNotFound)
+	g.fails(typeActivitiesList, query{Filter: mustFilter(map[string]any{"field": "status", "op": "eq", "value": "exploded"})}, codeInvalidArgument)
+	g.fails(typeActivitiesList, query{Include: []string{"secrets"}}, codeUnsupported)
+	g.fails(typeActivitiesList, query{Sort: []wireSort{{Field: "created_at"}, {Field: "priority"}}}, codeUnsupported)
+	g.fails(typeActivitiesList, json.RawMessage(`{"filter":null,"surprise":1}`), codeInvalidArgument)
+	g.fails(typeActivitiesAggregate, aggregateRequest{Metrics: []metric{{Name: "vibes"}}}, codeUnsupported)
 }
 
-func TestSignalDelivered(t *testing.T) {
-	e, b := pgEngine(t)
-	g := newFakeGateway(t, dataModeFull)
-	startAgent(t, e, g, Config{AllowControl: true})
-	g.waitHello()
-
-	id := enqueue(t, b, `{}`)
-	g.ok(typeSignal, signalRequest{ID: id.String(), Name: "approve", Payload: json.RawMessage(`{"ok":true}`)}, nil)
-	g.fails(typeSignal, signalRequest{ID: uuid.NewString(), Name: "approve"}, codeNotFound)
-	g.fails(typeSignal, signalRequest{Key: "nobody", ActivityType: "Echo", Name: "approve"}, codeNotFound)
-
-	events, err := b.GetActivityEvents(context.Background(), id, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, ev := range events {
-		found = found || ev.EventType == storage.EventSignaled
-	}
-	if !found {
-		t.Fatalf("no Signaled event after signal: %+v", events)
-	}
-}
-
-func TestMetadataOnlyRedacts(t *testing.T) {
+func TestMetadataOnly(t *testing.T) {
 	for name, tc := range map[string]struct {
-		gateway dataMode
-		local   bool
+		cloud sessionConfig
+		local bool
 	}{
-		"cloud asks":   {gateway: dataModeMetadataOnly},
-		"agent forces": {gateway: dataModeFull, local: true},
+		"cloud asks":   {cloud: sessionConfig{DataMode: dataModeMetadataOnly}},
+		"agent forces": {cloud: sessionConfig{DataMode: "full"}, local: true},
 	} {
 		t.Run(name, func(t *testing.T) {
-			e, b := pgEngine(t)
-			g := newFakeGateway(t, tc.gateway)
+			e, b, _ := pgEngine(t)
+			g := newFakeGateway(t, tc.cloud)
 			startAgent(t, e, g, Config{MetadataOnly: tc.local})
 			g.waitHello()
 
 			id := enqueue(t, b, `{"secret":"pii"}`)
-			var act map[string]any
-			g.ok(typeGetActivity, activityRef{ID: id.String()}, &act)
-			if p, ok := act["payload"]; ok && p != nil {
-				t.Fatalf("payload leaked: %v", p)
+			g.fails(typeActivitiesGet, getRequest{ID: id.String(), Include: []string{"payload"}}, codeForbidden)
+			g.fails(typeActivitiesList, query{Include: []string{"last_error"}}, codeForbidden)
+			g.fails(typeEventsList, query{Include: []string{"detail"}}, codeForbidden)
+			g.fails(typeResultsGet, resultRequest{ActivityID: id.String()}, codeForbidden)
+			var act activityView
+			g.ok(typeActivitiesGet, getRequest{ID: id.String(), Include: []string{"events"}}, &act)
+			if raw, _ := json.Marshal(act); strings.Contains(string(raw), "pii") {
+				t.Fatalf("customer data leaked: %s", raw)
 			}
-			var list []map[string]any
-			g.ok(typeListActivities, listRequest{Status: "pending"}, &list)
-			if raw, _ := json.Marshal(list); strings.Contains(string(raw), "pii") {
-				t.Fatalf("payload leaked in list: %s", raw)
-			}
-			var events []map[string]any
-			g.ok(typeGetActivityEvents, activityPage{ID: id.String()}, &events)
-			for _, ev := range events {
-				if d, ok := ev["detail"]; ok && d != nil {
-					t.Fatalf("event detail leaked: %v", d)
-				}
-			}
-			g.fails(typeGetActivityResult, activityRef{ID: id.String()}, codeForbidden)
 		})
 	}
+}
+
+func TestConfigUpdateChangesDataMode(t *testing.T) {
+	e, b, _ := pgEngine(t)
+	g := newFakeGateway(t, sessionConfig{DataMode: "full"})
+	startAgent(t, e, g, Config{})
+	g.waitHello()
+	id := enqueue(t, b, `{}`)
+
+	g.ok(typeActivitiesGet, getRequest{ID: id.String(), Include: []string{"payload"}}, nil)
+	g.send(typeConfigUpdate, sessionConfig{DataMode: dataModeMetadataOnly})
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		res := g.call(typeActivitiesGet, getRequest{ID: id.String(), Include: []string{"payload"}})
+		if res.Error != nil && res.Error.Code == codeForbidden {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("config.update never applied")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func mustFilter(m map[string]any) *wireFilter {
+	raw, _ := json.Marshal(m)
+	var f wireFilter
+	if err := json.Unmarshal(raw, &f); err != nil {
+		panic(err)
+	}
+	return &f
 }

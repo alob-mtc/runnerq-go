@@ -49,8 +49,10 @@ const (
 	handshakeTimeout = 10 * time.Second
 	pingInterval     = 20 * time.Second
 	writeTimeout     = 10 * time.Second
-	maxMessageBytes  = 1 << 20
-	sdkModulePath    = "github.com/alob-mtc/runnerq-go"
+	maxMessageBytes  = 4 << 20
+	// defaultReportInterval applies until the Cloud sets one.
+	defaultReportInterval = 15 * time.Second
+	sdkModulePath         = "github.com/alob-mtc/runnerq-go"
 )
 
 // Config configures the agent.
@@ -62,15 +64,14 @@ type Config struct {
 	// APIKey authenticates the app. It is sent in the Authorization header,
 	// never in the URL.
 	APIKey string
-	// AllowControl lets the Cloud run state-changing actions such as
-	// signals. When false the agent is read-only and answers every control
-	// request with "forbidden".
-	AllowControl bool
-	// MetadataOnly strips payloads, results, errors and step data from every
-	// response, whatever mode the Cloud asks for.
+	// MetadataOnly strips payloads, results, errors and event details from
+	// every response, whatever mode the Cloud asks for.
 	MetadataOnly bool
+	// Labels are free-form executor tags (region, deploy version) the Cloud
+	// can filter and group executors by.
+	Labels map[string]string
 	// MaxConcurrentRequests bounds requests served at once (default 16).
-	// Requests beyond it are answered "unavailable" instead of queueing.
+	// Requests beyond it are answered "resource_exhausted" instead of queueing.
 	MaxConcurrentRequests int
 	// RequestTimeout bounds one request (default 30s).
 	RequestTimeout time.Duration
@@ -138,6 +139,10 @@ type Agent struct {
 	closing   bool
 
 	connected atomic.Bool
+	// reportEvery is the executor.report interval the Cloud asked for.
+	reportEvery atomic.Int64
+	// peerFrameLimit is the Cloud's max frame size for this session.
+	peerFrameLimit atomic.Int64
 }
 
 // Start validates cfg and connects in the background. It returns without
@@ -151,7 +156,7 @@ func Start(ctx context.Context, engine *runnerq.WorkerEngine, cfg Config) (*Agen
 	if err != nil {
 		return nil, err
 	}
-	h := newHandlers(engine, cfg.AllowControl)
+	h := newHandlers(engine, cfg.MetadataOnly)
 	ctx, cancel := context.WithCancel(ctx)
 	a := &Agent{
 		cfg:    cfg,
@@ -164,6 +169,7 @@ func Start(ctx context.Context, engine *runnerq.WorkerEngine, cfg Config) (*Agen
 		cancel: cancel,
 		done:   make(chan struct{}),
 	}
+	a.reportEvery.Store(int64(defaultReportInterval))
 	go a.run(ctx)
 	return a, nil
 }
@@ -177,18 +183,27 @@ func (a *Agent) Connected() bool { return a.connected.Load() }
 func (a *Agent) Close(ctx context.Context) error {
 	a.mu.Lock()
 	a.closing = true
-	conn := a.conn
 	a.mu.Unlock()
-
-	if conn != nil {
-		sayGoodbye(ctx, conn)
-	}
+	a.goodbye(ctx)
 	a.cancel()
 	select {
 	case <-a.done:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// goodbye ends the current session cleanly, once: whichever of Close and a
+// cancelled Start context gets here first takes the connection.
+func (a *Agent) goodbye(ctx context.Context) {
+	a.mu.Lock()
+	a.closing = true
+	conn := a.conn
+	a.conn = nil
+	a.mu.Unlock()
+	if conn != nil {
+		sayGoodbye(ctx, conn)
 	}
 }
 
@@ -273,7 +288,12 @@ func (a *Agent) session(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	a.h.setMetadataOnly(a.cfg.MetadataOnly || w.DataMode == dataModeMetadataOnly)
+	a.applyConfig(w.Config)
+	frame := int64(maxMessageBytes)
+	if w.Limits.MaxFrameBytes > 0 {
+		frame = min(frame, int64(w.Limits.MaxFrameBytes))
+	}
+	a.peerFrameLimit.Store(frame)
 
 	a.mu.Lock()
 	if a.closing {
@@ -286,7 +306,7 @@ func (a *Agent) session(ctx context.Context) error {
 	a.conn, a.sessionID = conn, w.SessionID
 	a.mu.Unlock()
 	a.connected.Store(true)
-	a.log.Info("Connected to RunnerQ Cloud", "app", w.App, "session", w.SessionID, "data_mode", w.DataMode)
+	a.log.Info("Connected to RunnerQ Cloud", "app", w.App.Name, "session", w.SessionID, "metadata_only", a.h.metadataOnly())
 	defer func() {
 		a.connected.Store(false)
 		a.mu.Lock()
@@ -294,22 +314,42 @@ func (a *Agent) session(ctx context.Context) error {
 		a.mu.Unlock()
 	}()
 
-	sctx, stop := context.WithCancel(ctx)
+	// The session outlives ctx just long enough to say goodbye: a read whose
+	// context ends closes the connection at once, which the Cloud would
+	// record as a crash rather than a clean stop.
+	sctx, stop := context.WithCancel(context.WithoutCancel(ctx))
 	defer stop()
+	go func() {
+		select {
+		case <-ctx.Done():
+			a.goodbye(context.WithoutCancel(ctx))
+		case <-sctx.Done():
+		}
+	}()
 	go a.pingLoop(sctx, conn)
+	go a.reportLoop(sctx, conn)
 	return a.readLoop(sctx, conn)
 }
 
 func (a *Agent) handshake(ctx context.Context, conn *websocket.Conn) (welcome, error) {
 	host, _ := os.Hostname()
+	ex := executorInfo{
+		ID:             a.engine.InstanceID(),
+		Hostname:       host,
+		Queues:         []string{a.engine.QueueName()},
+		ActivityTypes:  a.engine.ActivityTypes(),
+		MaxConcurrency: a.engine.MaxConcurrentActivities(),
+		Labels:         a.cfg.Labels,
+	}
+	if started := a.engine.StartedAt(); !started.IsZero() {
+		ex.StartedAt = ts(started)
+	}
 	req, err := newRequest("hello", typeHello, hello{
 		ProtocolVersions: []int{protocolVersion},
 		SDK:              sdkInfo{Name: "runnerq-go", Version: sdkVersion(), Language: "go"},
-		ExecutorID:       a.engine.InstanceID(),
-		Hostname:         host,
-		ActivityTypes:    a.engine.ActivityTypes(),
-		MaxWorkers:       a.engine.MaxConcurrentActivities(),
+		Executor:         ex,
 		Capabilities:     a.h.capabilities(),
+		Limits:           limits{MaxFrameBytes: maxMessageBytes, MaxConcurrentRequests: a.cfg.MaxConcurrentRequests},
 	})
 	if err != nil {
 		return welcome{}, err
@@ -358,6 +398,36 @@ func (a *Agent) pingLoop(ctx context.Context, conn *websocket.Conn) {
 	}
 }
 
+// applyConfig applies the Cloud's session settings. The local MetadataOnly
+// setting cannot be relaxed by the Cloud.
+func (a *Agent) applyConfig(c sessionConfig) {
+	if c.DataMode != "" {
+		a.h.cloudMetadataOnly.Store(c.DataMode == dataModeMetadataOnly)
+	}
+	if c.ReportIntervalMS > 0 {
+		a.reportEvery.Store(int64(max(time.Duration(c.ReportIntervalMS)*time.Millisecond, time.Second)))
+	}
+}
+
+// reportLoop pushes executor.report on connect and then at the interval the
+// Cloud asked for, so dashboards do not poll.
+func (a *Agent) reportLoop(ctx context.Context, conn *websocket.Conn) {
+	for {
+		if evt, err := newEvent(typeExecutorReport, a.h.state(false)); err == nil {
+			wctx, cancel := context.WithTimeout(ctx, writeTimeout)
+			_ = wsjson.Write(wctx, conn, evt)
+			cancel()
+		}
+		t := time.NewTimer(time.Duration(a.reportEvery.Load()))
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+	}
+}
+
 func (a *Agent) readLoop(ctx context.Context, conn *websocket.Conn) error {
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -370,13 +440,22 @@ func (a *Agent) readLoop(ctx context.Context, conn *websocket.Conn) error {
 		if err := wsjson.Read(ctx, conn, &req); err != nil {
 			return err
 		}
+		if req.Kind == kindEvent {
+			if req.Type == typeConfigUpdate {
+				var c sessionConfig
+				if json.Unmarshal(req.Data, &c) == nil {
+					a.applyConfig(c)
+				}
+			}
+			continue // unknown events are ignored
+		}
 		if req.Kind != kindRequest {
-			continue // the gateway sends no events yet
+			continue
 		}
 		select {
 		case a.sem <- struct{}{}:
 		default:
-			a.reply(ctx, conn, errorResponse(req, errorf(codeUnavailable, "agent is at its request limit")))
+			a.reply(ctx, conn, errorResponse(req, errorf(codeResourceExhausted, "agent is at its request limit")))
 			continue
 		}
 		wg.Add(1)
@@ -401,19 +480,31 @@ func (a *Agent) serve(ctx context.Context, req envelope) (res envelope) {
 	if !ok {
 		return errorResponse(req, errorf(codeUnsupported, "this agent does not serve %q", req.Type))
 	}
-	rctx, cancel := context.WithTimeout(ctx, a.cfg.RequestTimeout)
+	deadline := time.Now().Add(a.cfg.RequestTimeout)
+	if raw, ok := req.Meta[metaDeadline]; ok {
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			if d, err := time.Parse(time.RFC3339Nano, s); err == nil && d.Before(deadline) {
+				deadline = d
+			}
+		}
+	}
+	if !time.Now().Before(deadline) {
+		return errorResponse(req, errorf(codeDeadlineExceeded, "the request expired before it started"))
+	}
+	rctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	out, err := h(rctx, req.Data)
 	if err != nil {
-		var we *wireError
-		if !errors.As(err, &we) {
-			we = errorf(codeInternal, "%s", errorMessage(err))
-		}
-		return errorResponse(req, we)
+		return errorResponse(req, toWireError(err))
 	}
 	data, err := json.Marshal(out)
 	if err != nil {
 		return errorResponse(req, errorf(codeInternal, "encode response: %v", err))
+	}
+	if limit := a.peerFrameLimit.Load(); limit > 0 && int64(len(data)) > limit-1024 {
+		return errorResponse(req, errorf(codeResourceExhausted,
+			"the reply is %d bytes, over the %d-byte frame limit; ask for fewer rows or fields", len(data), limit))
 	}
 	return envelope{V: req.V, Kind: kindResponse, ID: req.ID, Type: req.Type, Data: data}
 }

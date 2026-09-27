@@ -3,387 +3,579 @@ package conductor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/alob-mtc/runnerq-go"
-	"github.com/alob-mtc/runnerq-go/observability"
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-const (
-	defaultLimit = 50
-	maxLimit     = 1000
-)
+// maxEmbedded bounds steps and events embedded in activities.get.
+const maxEmbedded = 1000
 
 // handlerFunc serves one request type. Returning a *wireError picks the error
-// code; any other error is reported as internal.
+// code; other errors are mapped by toWireError.
 type handlerFunc func(ctx context.Context, data json.RawMessage) (any, error)
 
-// handlers serves the Conductor request types from the engine's storage.
+// handlers serves protocol requests from the engine's storage.
 type handlers struct {
-	engine       *runnerq.WorkerEngine
-	backend      storage.Storage
-	inspector    *observability.QueueInspector
-	allowControl bool
-	// metadataOnly strips payloads, results, errors and step data from
-	// responses. Set from the gateway's welcome on every connection.
-	metadataOnly atomic.Bool
+	engine  *runnerq.WorkerEngine
+	backend storage.Storage
+	qs      storage.QueryStorage // nil when the backend has no QueryStorage
+	// forceMetadataOnly is the local setting; it always wins.
+	forceMetadataOnly bool
+	// cloudMetadataOnly is the Cloud's current setting (welcome/config.update).
+	cloudMetadataOnly atomic.Bool
+	started           time.Time
 }
 
-func newHandlers(engine *runnerq.WorkerEngine, allowControl bool) *handlers {
+func newHandlers(engine *runnerq.WorkerEngine, forceMetadataOnly bool) *handlers {
 	backend := engine.Backend()
-	return &handlers{
-		engine:       engine,
-		backend:      backend,
-		inspector:    observability.NewQueueInspector(backend).WithMaxWorkers(engine.MaxConcurrentActivities()),
-		allowControl: allowControl,
-	}
+	qs, _ := backend.(storage.QueryStorage)
+	return &handlers{engine: engine, backend: backend, qs: qs, forceMetadataOnly: forceMetadataOnly, started: time.Now()}
 }
+
+func (h *handlers) metadataOnly() bool { return h.forceMetadataOnly || h.cloudMetadataOnly.Load() }
 
 func (h *handlers) table() map[string]handlerFunc {
-	return map[string]handlerFunc{
-		typeStats:             h.stats,
-		typeListActivities:    h.listActivities,
-		typeListRoots:         h.listRoots,
-		typeGetActivity:       h.getActivity,
-		typeGetActivityEvents: h.getActivityEvents,
-		typeGetActivitySteps:  h.getActivitySteps,
-		typeGetActivityResult: h.getActivityResult,
-		typeGetChildren:       h.getChildren,
-		typeGetSubtree:        h.getSubtree,
-		typeListDeadLetter:    h.listDeadLetter,
-		typeSignal:            h.signal,
+	t := map[string]handlerFunc{typeExecutorDescribe: h.executorDescribe}
+	if h.qs != nil {
+		t[typeActivitiesList] = h.activitiesList
+		t[typeActivitiesGet] = h.activitiesGet
+		t[typeActivitiesCount] = h.activitiesCount
+		t[typeActivitiesAggregate] = h.activitiesAggregate
+		t[typeStepsList] = h.stepsList
+		t[typeEventsList] = h.eventsList
+		t[typeResultsGet] = h.resultsGet
+		t[typeTreesGet] = h.treesGet
 	}
+	return t
 }
 
-// capabilities lists the request types this agent serves, sorted.
-func (h *handlers) capabilities() []string {
-	caps := make([]string, 0, len(h.table()))
-	for t := range h.table() {
-		caps = append(caps, t)
+var (
+	recordIncludes = []string{"last_error", "payload", "result"}
+	getIncludes    = []string{"events", "last_error", "payload", "result", "steps"}
+)
+
+// capabilities describes what this agent serves, from the backend's own
+// query capabilities.
+func (h *handlers) capabilities() map[string]capability {
+	caps := map[string]capability{typeExecutorDescribe: {V: 1}}
+	if h.qs == nil {
+		return caps
 	}
-	slices.Sort(caps)
+	qc := h.qs.QueryCapabilities()
+	caps[typeActivitiesList] = capability{V: 1, Filters: qc.ActivityFilters, Sorts: qc.ActivitySorts, Include: recordIncludes}
+	caps[typeActivitiesGet] = capability{V: 1, Include: getIncludes}
+	caps[typeActivitiesCount] = capability{V: 1, Filters: qc.ActivityFilters}
+	metrics := []string{"count"}
+	for _, d := range qc.Durations {
+		metrics = append(metrics, "duration."+d)
+	}
+	caps[typeActivitiesAggregate] = capability{V: 1, Filters: qc.ActivityFilters, GroupBy: qc.GroupBy, Buckets: qc.Buckets, Metrics: metrics}
+	caps[typeStepsList] = capability{V: 1, Include: []string{"result"}}
+	caps[typeEventsList] = capability{V: 1, Filters: qc.EventFilters, Sorts: []string{"at"}, Include: []string{"detail"}}
+	caps[typeResultsGet] = capability{V: 1}
+	caps[typeTreesGet] = capability{V: 1, Include: recordIncludes}
 	return caps
 }
+
+// --- decoding and mapping ---
 
 func decode[T any](data json.RawMessage) (T, error) {
 	var v T
 	if len(data) == 0 {
 		return v, nil
 	}
-	if err := json.Unmarshal(data, &v); err != nil {
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec.DisallowUnknownFields() // an unknown request field could change meaning
+	if err := dec.Decode(&v); err != nil {
 		return v, errorf(codeInvalidArgument, "decode request: %v", err)
 	}
 	return v, nil
 }
 
-func parseID(s string) (uuid.UUID, error) {
+// toStorageFilter converts a wire filter; values keep their JSON types.
+func toStorageFilter(f *wireFilter) (*storage.QueryFilter, error) {
+	if f == nil {
+		return nil, nil
+	}
+	out := &storage.QueryFilter{Field: f.Field, Op: f.Op}
+	if len(f.Value) > 0 {
+		if err := json.Unmarshal(f.Value, &out.Value); err != nil {
+			return nil, fieldError(codeInvalidArgument, f.Field, "invalid filter value")
+		}
+	}
+	for _, t := range f.And {
+		c, err := toStorageFilter(&t)
+		if err != nil {
+			return nil, err
+		}
+		out.And = append(out.And, *c)
+	}
+	for _, t := range f.Or {
+		c, err := toStorageFilter(&t)
+		if err != nil {
+			return nil, err
+		}
+		out.Or = append(out.Or, *c)
+	}
+	if f.Not != nil {
+		c, err := toStorageFilter(f.Not)
+		if err != nil {
+			return nil, err
+		}
+		out.Not = c
+	}
+	return out, nil
+}
+
+// includes validates an include list against what the message allows.
+// Anything carrying customer data is refused in metadata-only mode.
+func (h *handlers) includes(list, allowed []string) (map[string]bool, error) {
+	out := map[string]bool{}
+	for _, inc := range list {
+		if !slices.Contains(allowed, inc) {
+			return nil, fieldError(codeUnsupported, "include", "cannot include %q", inc)
+		}
+		if h.metadataOnly() && (inc == "payload" || inc == "result" || inc == "last_error" || inc == "detail") {
+			return nil, fieldError(codeForbidden, "include", "%s is not sent in metadata-only mode", inc)
+		}
+		out[inc] = true
+	}
+	return out, nil
+}
+
+func recordInclude(inc map[string]bool) storage.RecordInclude {
+	return storage.RecordInclude{Payload: inc["payload"], Result: inc["result"], LastError: inc["last_error"]}
+}
+
+// parseID parses an activity id. Ids are opaque on the wire; one this
+// backend could not have issued simply does not exist.
+func parseID(s string) (uuid.UUID, bool) {
 	id, err := uuid.Parse(s)
-	if err != nil {
-		return uuid.Nil, errorf(codeInvalidArgument, "id must be a uuid")
+	return id, err == nil
+}
+
+func ts(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000Z07:00") }
+
+func tsp(t *time.Time) string {
+	if t == nil {
+		return ""
 	}
-	return id, nil
+	return ts(*t)
 }
 
-func (p page) window() (offset, limit int) {
-	offset, limit = max(p.Offset, 0), p.Limit
-	if limit <= 0 {
-		limit = defaultLimit
+func toResult(r *storage.ActivityResult) *result {
+	if r == nil {
+		return nil
 	}
-	return offset, min(limit, maxLimit)
+	if r.State == storage.ResultOk {
+		return &result{State: "ok", Data: r.Data}
+	}
+	var e struct {
+		Error string `json:"error"`
+		Type  string `json:"type"`
+	}
+	if json.Unmarshal(r.Data, &e) == nil && e.Error != "" {
+		return &result{State: "error", Error: &errorInfo{Message: e.Error, Kind: e.Type}}
+	}
+	return &result{State: "error", Data: r.Data}
 }
 
-func (h *handlers) setMetadataOnly(on bool) { h.metadataOnly.Store(on) }
-
-// --- reads ---
-
-func (h *handlers) stats(ctx context.Context, _ json.RawMessage) (any, error) {
-	return h.inspector.Stats(ctx)
+func toActivity(r storage.ActivityRecord) activityView {
+	v := activityView{
+		ID: r.ID.String(), Type: r.Type, Queue: r.Queue, Status: r.Status, Priority: r.Priority,
+		RootID: r.RootID.String(), Depth: r.Depth, IdempotencyKey: r.IdempotencyKey,
+		Attempt: r.Attempt, MaxAttempts: r.MaxAttempts, CreatedAt: ts(r.CreatedAt),
+		ScheduledFor: tsp(r.ScheduledFor), StartedAt: tsp(r.StartedAt), CompletedAt: tsp(r.CompletedAt),
+		UpdatedAt: ts(r.UpdatedAt), TimeoutMS: r.Timeout.Milliseconds(), LeaseExpiresAt: tsp(r.LeaseExpiresAt),
+		ExecutorID: r.ExecutorID, Metadata: r.Metadata, Payload: r.Payload, Result: toResult(r.Result),
+	}
+	if r.ParentID != nil {
+		v.ParentID = r.ParentID.String()
+	}
+	if r.Wait != nil {
+		v.Wait = &wait{Kind: r.Wait.Kind, Name: r.Wait.Name, Until: tsp(r.Wait.Until)}
+	}
+	if r.LastError != nil {
+		v.LastError = &errorInfo{Message: r.LastError.Message, Kind: r.LastError.Kind, At: tsp(r.LastError.At)}
+	}
+	return v
 }
 
-func (h *handlers) listActivities(ctx context.Context, data json.RawMessage) (any, error) {
-	req, err := decode[listRequest](data)
+func toActivities(items []storage.ActivityRecord) []activityView {
+	out := make([]activityView, 0, len(items))
+	for _, r := range items {
+		out = append(out, toActivity(r))
+	}
+	return out
+}
+
+func toStep(s storage.StepEntry) stepView {
+	v := stepView{
+		ID: s.ID.String(), ActivityID: s.ActivityID.String(), Name: s.Name, Kind: s.Kind,
+		Status: "completed", CreatedAt: ts(s.CreatedAt),
+	}
+	if s.State != storage.ResultOk {
+		v.Status = "failed"
+	}
+	if s.Data != nil {
+		v.Result = toResult(&storage.ActivityResult{State: s.State, Data: s.Data})
+	}
+	return v
+}
+
+func toEvent(e storage.EventRecord) eventView {
+	return eventView{
+		ID: e.Cursor, Cursor: e.Cursor, ActivityID: e.ActivityID.String(), Type: e.Type,
+		At: ts(e.At), ExecutorID: e.ExecutorID, Detail: e.Detail,
+	}
+}
+
+// --- queries ---
+
+func (h *handlers) activitiesList(ctx context.Context, data json.RawMessage) (any, error) {
+	q, err := decode[query](data)
 	if err != nil {
 		return nil, err
 	}
-	offset, limit := req.window()
-	var items []observability.ActivitySnapshot
-	switch req.Status {
-	case "pending":
-		items, err = h.inspector.ListPending(ctx, offset, limit)
-	case "processing":
-		items, err = h.inspector.ListProcessing(ctx, offset, limit)
-	case "scheduled":
-		items, err = h.inspector.ListScheduled(ctx, offset, limit)
-	case "completed":
-		items, err = h.inspector.ListCompleted(ctx, offset, limit)
-	case "cron":
-		items, err = h.inspector.ListCronCompleted(ctx, offset, limit)
-	case "dead_letter":
-		var records []observability.DeadLetterRecord
-		records, err = h.inspector.ListDeadLetter(ctx, offset, limit)
-		for _, r := range records {
-			items = append(items, r.Activity)
-		}
+	filter, err := toStorageFilter(q.Filter)
+	if err != nil {
+		return nil, err
+	}
+	inc, err := h.includes(q.Include, recordIncludes)
+	if err != nil {
+		return nil, err
+	}
+	sq := storage.ActivityQuery{Filter: filter, Include: recordInclude(inc), Limit: q.Limit, Cursor: q.Cursor}
+	if sort, err := oneSort(q.Sort); err != nil {
+		return nil, err
+	} else if sort != nil {
+		sq.Sort = sort
+	}
+	res, err := h.qs.QueryActivities(ctx, sq)
+	if err != nil {
+		return nil, err
+	}
+	return page[activityView]{Items: toActivities(res.Items), NextCursor: res.NextCursor}, nil
+}
+
+// oneSort accepts at most one sort key (the backend adds the tiebreaker).
+func oneSort(sorts []wireSort) (*storage.QuerySort, error) {
+	switch len(sorts) {
+	case 0:
+		return nil, nil
+	case 1:
 	default:
-		return nil, errorf(codeInvalidArgument, "unknown status %q", req.Status)
+		return nil, fieldError(codeUnsupported, "sort", "only one sort key is supported")
 	}
-	if err != nil {
-		return nil, err
+	s := sorts[0]
+	switch s.Order {
+	case "", "desc":
+		return &storage.QuerySort{Field: s.Field, Desc: true}, nil
+	case "asc":
+		return &storage.QuerySort{Field: s.Field}, nil
 	}
-	return h.snapshots(items), nil
+	return nil, fieldError(codeInvalidArgument, "sort", "order must be asc or desc")
 }
 
-// rootStatuses mirrors the console's filter allowlist; "" means no filter.
-var rootStatuses = map[string]bool{
-	"": true, "pending": true, "processing": true, "scheduled": true,
-	"retrying": true, "completed": true, "failed": true, "dead_letter": true,
+func (h *handlers) activitiesGet(ctx context.Context, data json.RawMessage) (any, error) {
+	req, err := decode[getRequest](data)
+	if err != nil {
+		return nil, err
+	}
+	inc, err := h.includes(req.Include, getIncludes)
+	if err != nil {
+		return nil, err
+	}
+	id, ok := parseID(req.ID)
+	if !ok {
+		return nil, errorf(codeNotFound, "activity %q not found", req.ID)
+	}
+	res, err := h.qs.QueryActivities(ctx, storage.ActivityQuery{
+		Filter:  &storage.QueryFilter{Field: "id", Op: storage.OpEq, Value: id.String()},
+		Include: recordInclude(inc), Limit: 1,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(res.Items) == 0 {
+		return nil, errorf(codeNotFound, "activity %q not found", req.ID)
+	}
+	v := toActivity(res.Items[0])
+	if inc["steps"] {
+		steps, err := h.qs.ListStepEntries(ctx, id, false, maxEmbedded, "")
+		if err != nil {
+			return nil, err
+		}
+		list := make([]stepView, 0, len(steps.Items))
+		for _, s := range steps.Items {
+			list = append(list, toStep(s))
+		}
+		v.Steps = &list
+	}
+	if inc["events"] {
+		events, err := h.qs.QueryEvents(ctx, storage.EventQuery{
+			Filter: &storage.QueryFilter{Field: "activity_id", Op: storage.OpEq, Value: id.String()},
+			Limit:  maxEmbedded,
+		})
+		if err != nil {
+			return nil, err
+		}
+		list := make([]eventView, 0, len(events.Items))
+		for _, e := range events.Items {
+			list = append(list, toEvent(e))
+		}
+		v.Events = &list
+	}
+	return v, nil
 }
 
-func (h *handlers) listRoots(ctx context.Context, data json.RawMessage) (any, error) {
-	req, err := decode[listRequest](data)
+func (h *handlers) activitiesCount(ctx context.Context, data json.RawMessage) (any, error) {
+	req, err := decode[countRequest](data)
 	if err != nil {
 		return nil, err
 	}
-	if !rootStatuses[req.Status] {
-		return nil, errorf(codeInvalidArgument, "unknown status %q", req.Status)
-	}
-	offset, limit := req.window()
-	items, err := h.inspector.ListRecentRoots(ctx, req.Status, offset, limit)
+	filter, err := toStorageFilter(req.Filter)
 	if err != nil {
 		return nil, err
 	}
-	return h.snapshots(items), nil
+	n, exact, err := h.qs.CountActivities(ctx, filter, 100_000)
+	if err != nil {
+		return nil, err
+	}
+	return countResult{Count: n, Exact: exact}, nil
 }
 
-// activity loads one activity or fails with not_found.
-func (h *handlers) activity(ctx context.Context, rawID string) (*observability.ActivitySnapshot, error) {
-	id, err := parseID(rawID)
+func parseTime(field, s string) (*time.Time, error) {
+	if s == "" {
+		return nil, nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil {
-		return nil, err
+		return nil, fieldError(codeInvalidArgument, field, "expected an RFC 3339 timestamp")
 	}
-	act, err := h.inspector.GetActivity(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if act == nil {
-		return nil, errorf(codeNotFound, "activity %s not found", id)
-	}
-	return act, nil
+	return &t, nil
 }
 
-func (h *handlers) getActivity(ctx context.Context, data json.RawMessage) (any, error) {
-	req, err := decode[activityRef](data)
+func (h *handlers) activitiesAggregate(ctx context.Context, data json.RawMessage) (any, error) {
+	req, err := decode[aggregateRequest](data)
 	if err != nil {
 		return nil, err
 	}
-	act, err := h.activity(ctx, req.ID)
+	filter, err := toStorageFilter(req.Filter)
 	if err != nil {
 		return nil, err
 	}
-	return h.snapshot(*act), nil
-}
-
-func (h *handlers) getActivityEvents(ctx context.Context, data json.RawMessage) (any, error) {
-	req, err := decode[activityPage](data)
-	if err != nil {
-		return nil, err
-	}
-	id, err := parseID(req.ID)
-	if err != nil {
-		return nil, err
-	}
-	_, limit := req.window()
-	events, err := h.inspector.RecentEvents(ctx, id, limit)
-	if err != nil {
-		return nil, err
-	}
-	if h.metadataOnly.Load() {
-		for i := range events {
-			events[i].Detail = nil
+	q := storage.AggregateQuery{Filter: filter, GroupBy: req.GroupBy, Limit: req.Limit}
+	for _, m := range req.Metrics {
+		switch m.Name {
+		case "count":
+			q.Count = true
+		case "duration":
+			q.Durations = append(q.Durations, storage.DurationMetric{Field: m.Field, Percentiles: m.Percentiles})
+		default:
+			return nil, fieldError(codeUnsupported, "metrics", "unknown metric %q", m.Name)
 		}
 	}
-	return nonNil(events), nil
-}
-
-func (h *handlers) getActivitySteps(ctx context.Context, data json.RawMessage) (any, error) {
-	req, err := decode[activityRef](data)
-	if err != nil {
-		return nil, err
-	}
-	id, err := parseID(req.ID)
-	if err != nil {
-		return nil, err
-	}
-	steps, err := h.inspector.GetActivitySteps(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if h.metadataOnly.Load() {
-		for i := range steps {
-			steps[i].Data = nil
+	if b := req.Bucket; b != nil {
+		from, err := parseTime("bucket.from", b.From)
+		if err != nil {
+			return nil, err
 		}
+		to, err := parseTime("bucket.to", b.To)
+		if err != nil {
+			return nil, err
+		}
+		q.Bucket = &storage.AggregateBucket{Field: b.Field, Interval: time.Duration(b.IntervalMS) * time.Millisecond, From: from, To: to}
 	}
-	return nonNil(steps), nil
+	rows, err := h.qs.AggregateActivities(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	out := aggregateResult{Groups: make([]aggregateGroup, 0, len(rows.Rows)), Truncated: rows.Truncated}
+	for _, r := range rows.Rows {
+		g := aggregateGroup{Key: r.Key, Bucket: tsp(r.Bucket), Durations: r.Durations}
+		if q.Count {
+			n := r.Count
+			g.Count = &n
+		}
+		out.Groups = append(out.Groups, g)
+	}
+	return out, nil
 }
 
-// activityResult is an activity's stored result on the wire.
-type activityResult struct {
-	State string          `json:"state"` // "Ok" | "Err"
-	Data  json.RawMessage `json:"data,omitempty"`
+func (h *handlers) stepsList(ctx context.Context, data json.RawMessage) (any, error) {
+	req, err := decode[stepsRequest](data)
+	if err != nil {
+		return nil, err
+	}
+	inc, err := h.includes(req.Include, []string{"result"})
+	if err != nil {
+		return nil, err
+	}
+	id, ok := parseID(req.ActivityID)
+	if !ok {
+		return page[stepView]{Items: []stepView{}}, nil
+	}
+	res, err := h.qs.ListStepEntries(ctx, id, inc["result"], req.Limit, req.Cursor)
+	if err != nil {
+		return nil, err
+	}
+	out := page[stepView]{Items: make([]stepView, 0, len(res.Items)), NextCursor: res.NextCursor}
+	for _, s := range res.Items {
+		out.Items = append(out.Items, toStep(s))
+	}
+	return out, nil
 }
 
-func (h *handlers) getActivityResult(ctx context.Context, data json.RawMessage) (any, error) {
-	if h.metadataOnly.Load() {
+func (h *handlers) eventsList(ctx context.Context, data json.RawMessage) (any, error) {
+	q, err := decode[query](data)
+	if err != nil {
+		return nil, err
+	}
+	filter, err := toStorageFilter(q.Filter)
+	if err != nil {
+		return nil, err
+	}
+	inc, err := h.includes(q.Include, []string{"detail"})
+	if err != nil {
+		return nil, err
+	}
+	eq := storage.EventQuery{Filter: filter, Limit: q.Limit, Cursor: q.Cursor, IncludeDetail: inc["detail"]}
+	if sort, err := oneSort(q.Sort); err != nil {
+		return nil, err
+	} else if sort != nil {
+		if sort.Field != "at" {
+			return nil, fieldError(codeUnsupported, "sort", "events sort by at only")
+		}
+		eq.Desc = sort.Desc
+	}
+	res, err := h.qs.QueryEvents(ctx, eq)
+	if err != nil {
+		return nil, err
+	}
+	out := page[eventView]{Items: make([]eventView, 0, len(res.Items)), NextCursor: res.NextCursor}
+	for _, e := range res.Items {
+		out.Items = append(out.Items, toEvent(e))
+	}
+	return out, nil
+}
+
+func (h *handlers) resultsGet(ctx context.Context, data json.RawMessage) (any, error) {
+	if h.metadataOnly() {
 		return nil, errorf(codeForbidden, "results are not sent in metadata-only mode")
 	}
-	req, err := decode[activityRef](data)
+	req, err := decode[resultRequest](data)
 	if err != nil {
 		return nil, err
 	}
-	id, err := parseID(req.ID)
-	if err != nil {
-		return nil, err
+	id, ok := parseID(req.ActivityID)
+	if !ok {
+		return nil, errorf(codeNotFound, "no result for activity %q", req.ActivityID)
 	}
 	res, err := h.backend.GetResult(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	if res == nil {
-		return nil, errorf(codeNotFound, "no result stored for activity %s", id)
+		return nil, errorf(codeNotFound, "no result for activity %q", req.ActivityID)
 	}
-	state := "Ok"
-	if res.State == storage.ResultErr {
-		state = "Err"
-	}
-	return activityResult{State: state, Data: res.Data}, nil
+	return toResult(res), nil
 }
 
-func (h *handlers) getChildren(ctx context.Context, data json.RawMessage) (any, error) {
-	req, err := decode[activityPage](data)
+func (h *handlers) treesGet(ctx context.Context, data json.RawMessage) (any, error) {
+	req, err := decode[treeRequest](data)
 	if err != nil {
 		return nil, err
 	}
-	id, err := parseID(req.ID)
+	inc, err := h.includes(req.Include, recordIncludes)
 	if err != nil {
 		return nil, err
 	}
-	offset, limit := req.window()
-	items, err := h.inspector.GetChildren(ctx, id, offset, limit)
+	id, ok := parseID(req.ID)
+	if !ok {
+		return nil, errorf(codeNotFound, "activity %q not found", req.ID)
+	}
+	tree, err := h.qs.GetActivityTree(ctx, id, recordInclude(inc), req.MaxNodes)
 	if err != nil {
 		return nil, err
 	}
-	return h.snapshots(items), nil
+	return treeView{RootID: tree.RootID.String(), Items: toActivities(tree.Items), Truncated: tree.Truncated}, nil
 }
 
-// getSubtree returns the whole tree the activity belongs to, resolving a
-// child to its root first.
-func (h *handlers) getSubtree(ctx context.Context, data json.RawMessage) (any, error) {
-	req, err := decode[activityRef](data)
-	if err != nil {
-		return nil, err
-	}
-	act, err := h.activity(ctx, req.ID)
-	if err != nil {
-		return nil, err
-	}
-	root := act.ID
-	if act.RootActivityID != nil {
-		root = *act.RootActivityID
-	}
-	items, err := h.inspector.GetSubtree(ctx, root)
-	if err != nil {
-		return nil, err
-	}
-	return h.snapshots(items), nil
-}
+// --- executor ---
 
-func (h *handlers) listDeadLetter(ctx context.Context, data json.RawMessage) (any, error) {
-	req, err := decode[page](data)
-	if err != nil {
-		return nil, err
+// state is this executor's live state. withRunning adds the in-flight list
+// (describe) rather than just its size (periodic reports).
+func (h *handlers) state(withRunning bool) executorState {
+	inflight := h.engine.InFlight()
+	started := h.engine.StartedAt()
+	if started.IsZero() {
+		started = h.started
 	}
-	offset, limit := req.window()
-	records, err := h.inspector.ListDeadLetter(ctx, offset, limit)
-	if err != nil {
-		return nil, err
+	st := executorState{
+		ID:             h.engine.InstanceID(),
+		UptimeMS:       time.Since(started).Milliseconds(),
+		MaxConcurrency: h.engine.MaxConcurrentActivities(),
+		InFlight:       len(inflight),
+		Draining:       h.engine.Draining(),
 	}
-	for i := range records {
-		records[i].Activity = h.snapshot(records[i].Activity)
-		if h.metadataOnly.Load() {
-			records[i].Error = ""
+	if withRunning {
+		for _, a := range inflight {
+			st.Running = append(st.Running, runningActivity{
+				ActivityID: a.ID.String(), Type: a.Type, Attempt: a.Attempt, StartedAt: ts(a.StartedAt),
+			})
 		}
 	}
-	return nonNil(records), nil
+	return st
 }
 
-// --- control ---
+func (h *handlers) executorDescribe(context.Context, json.RawMessage) (any, error) {
+	return h.state(true), nil
+}
 
-func (h *handlers) signal(ctx context.Context, data json.RawMessage) (any, error) {
-	if !h.allowControl {
-		return nil, errorf(codeForbidden, "control actions are disabled on this agent")
+// --- errors ---
+
+// toWireError maps a handler error onto a protocol error.
+func toWireError(err error) *wireError {
+	var we *wireError
+	if errors.As(err, &we) {
+		return we
 	}
-	req, err := decode[signalRequest](data)
-	if err != nil {
-		return nil, err
-	}
-	if req.Name == "" {
-		return nil, errorf(codeInvalidArgument, "signal name is required")
-	}
-	switch {
-	case req.ID != "" && req.Key == "":
-		id, perr := parseID(req.ID)
-		if perr != nil {
-			return nil, perr
+	var se *storage.StorageError
+	if errors.As(err, &se) {
+		var e *wireError
+		switch se.Kind {
+		case storage.ErrInvalidArgument:
+			e = errorf(codeInvalidArgument, "%s", se.Message)
+		case storage.ErrUnsupported:
+			e = errorf(codeUnsupported, "%s", se.Message)
+		case storage.ErrNotFound:
+			e = errorf(codeNotFound, "%s", se.Message)
+		case storage.ErrUnavailable, storage.ErrTimeout:
+			e = errorf(codeUnavailable, "%s", se.Message)
+		default:
+			e = errorf(codeInternal, "%s", errorMessage(err))
 		}
-		err = h.engine.Signal(ctx, id, req.Name, req.Payload)
-	case req.Key != "" && req.ID == "":
-		if req.ActivityType == "" {
-			return nil, errorf(codeInvalidArgument, "activity_type is required to signal by key")
+		if se.Field != "" {
+			e.Details = map[string]any{"field": se.Field}
 		}
-		err = h.engine.SignalByKey(ctx, req.ActivityType, req.Key, req.Name, req.Payload)
-	default:
-		return nil, errorf(codeInvalidArgument, "set exactly one of id or key")
+		return e
 	}
-	if runnerq.IsActivityNotFound(err) {
-		return nil, errorf(codeNotFound, "no activity to signal")
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errorf(codeDeadlineExceeded, "the request ran past its deadline")
 	}
-	if err != nil {
-		return nil, err
-	}
-	return controlResult{}, nil
+	return errorf(codeInternal, "%s", errorMessage(err))
 }
 
-// --- redaction ---
-
-func (h *handlers) snapshot(s observability.ActivitySnapshot) observability.ActivitySnapshot {
-	if h.metadataOnly.Load() {
-		s.Payload = nil
-		s.LastError = nil
-	}
-	return s
-}
-
-func (h *handlers) snapshots(items []observability.ActivitySnapshot) []observability.ActivitySnapshot {
-	out := make([]observability.ActivitySnapshot, 0, len(items))
-	for _, s := range items {
-		out = append(out, h.snapshot(s))
-	}
-	return out
-}
-
-func nonNil[T any](s []T) []T {
-	if s == nil {
-		return []T{}
-	}
-	return s
-}
-
-// errorMessage keeps internal error text short on the wire.
+// errorMessage keeps internal error text to one line on the wire.
 func errorMessage(err error) string {
 	msg := err.Error()
 	if i := strings.IndexByte(msg, '\n'); i >= 0 {
