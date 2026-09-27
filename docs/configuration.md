@@ -65,7 +65,7 @@ For durable, in-workflow waits use `ctx.Sleep` instead — see
 
 There is no built-in cron scheduler. To run activities on a schedule, drive
 enqueues from your own cron/ticker and tag them with
-`Metadata("source", "cron")` so the console's Schedules view groups them. Use
+`Metadata("source", "cron")` so you can find them by that tag. Use
 an idempotency key like `cron:<job>:<tick-time>` to make each tick
 exactly-once across a cluster.
 

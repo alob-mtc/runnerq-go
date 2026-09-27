@@ -58,7 +58,7 @@ engine.Start(ctx)
 Backends that implement `storage.QueryStorage` (the built-in Postgres backend
 does) answer the same queries the Cloud uses: filtered and paged activity
 lists, counts, aggregates, events, steps and trees. For example, how many
-activities are in each status right now:
+activities are pending, running, waiting or dead-lettered right now:
 
 ```go
 qs, ok := backend.(storage.QueryStorage)

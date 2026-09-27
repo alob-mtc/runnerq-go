@@ -22,9 +22,9 @@ What the backend gives you:
   expired leases are reaped and requeued.
 - **Atomic durability** — results are stored in the same transaction as
   completion; idempotency claim and enqueue are one atomic step.
-- **Event-driven wakeups** — `LISTEN/NOTIFY` drives blocking dequeue, future
-  resolution, and the console stream, with table re-checks as a lossless
-  fallback. No busy-polling.
+- **Event-driven wakeups** — `LISTEN/NOTIFY` drives blocking dequeue and
+  future resolution, with table re-checks as a lossless fallback. No
+  busy-polling.
 - **Self-managing schema** — created idempotently on connect (advisory-locked
   so concurrent boots don't race; hot indexes built `CONCURRENTLY`).
 

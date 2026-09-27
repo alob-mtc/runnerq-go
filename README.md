@@ -267,7 +267,7 @@ Full reference in [`docs/`](docs/):
 - [Durable Execution](docs/durable-execution.md) — `Step`, `Run`, `Sleep`, signals, versioning
 - [Retries & Dead Letter](docs/retries-and-dead-letter.md)
 - [Configuration](docs/configuration.md) — tuning, scheduling, workload isolation, retention
-- [Observability](docs/observability.md) — console, stats, metrics
+- [Observability](docs/observability.md) — RunnerQ Cloud, reading activities from code, metrics
 - [Storage Backends](docs/storage-backends.md)
 
 ## Status
