@@ -308,12 +308,20 @@ func encodedSize(v any) int {
 	return len(b)
 }
 
+// push writes one frame for the subscription. The write doesn't take the
+// subscription's context: coder/websocket closes the whole connection when a
+// write's context ends mid-write, so an unsubscribe landing during a push
+// would drop the session. A subscription that has ended stops before
+// writing; the write itself is bounded by writeTimeout.
 func (t *tailer) push(ctx context.Context, msgType string, data any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	evt, err := newEvent(msgType, data)
 	if err != nil {
 		return err
 	}
-	wctx, cancel := context.WithTimeout(ctx, writeTimeout)
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
 	defer cancel()
 	return wsjson.Write(wctx, t.s.conn, evt)
 }
