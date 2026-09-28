@@ -3,11 +3,17 @@ package conductor
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
@@ -238,5 +244,73 @@ func TestStreamSplitsBatchesToTheFrameLimit(t *testing.T) {
 	}
 	if frames < 3 {
 		t.Fatalf("36KB of events arrived in %d frames under a 16KB limit", frames)
+	}
+}
+
+// A subscription can end while its tailer is writing a frame (the Cloud
+// unsubscribes when the last viewer leaves). That must not take the session
+// down: coder/websocket closes the whole connection when a write's context
+// ends mid-write, so pushes don't write under the subscription's context.
+func TestStreamUnsubscribeMidWriteKeepsTheConnection(t *testing.T) {
+	read := make(chan struct{})
+	got := make(chan string, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		c.SetReadLimit(64 << 20)
+		<-read // hold the push mid-write until the subscription has ended
+		for {
+			var env envelope
+			if err := wsjson.Read(context.Background(), c, &env); err != nil {
+				return
+			}
+			got <- env.Type
+		}
+	}))
+	defer srv.Close()
+	conn, _, err := websocket.Dial(context.Background(), srv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+
+	tl := &tailer{s: &streams{conn: conn}, id: "sub_test"}
+	ctx, cancel := context.WithCancel(context.Background())
+	pushed := make(chan error, 1)
+	go func() {
+		// Far more than the socket buffers hold, so the write blocks.
+		pushed <- tl.push(ctx, typeStreamEvents, map[string]string{"blob": strings.Repeat("x", 32<<20)})
+	}()
+	time.Sleep(300 * time.Millisecond)
+	cancel() // the Cloud unsubscribed while the frame was being written
+	time.Sleep(100 * time.Millisecond)
+	close(read)
+
+	select {
+	case err := <-pushed:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("push: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("push never returned")
+	}
+	evt, _ := newEvent("after", struct{}{})
+	wctx, done := context.WithTimeout(context.Background(), 5*time.Second)
+	defer done()
+	if err := wsjson.Write(wctx, conn, evt); err != nil {
+		t.Fatalf("the connection died with the subscription: %v", err)
+	}
+	for {
+		select {
+		case typ := <-got:
+			if typ == "after" {
+				return
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("nothing arrived after the subscription ended")
+		}
 	}
 }
