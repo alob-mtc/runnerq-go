@@ -18,6 +18,9 @@ type attemptQueue struct {
 	worker         string
 	persistenceCtx context.Context
 	metrics        MetricsSink
+	// awaitGrace overrides awaitParkGrace for awaits in this attempt; zero
+	// uses it.
+	awaitGrace time.Duration
 }
 
 // attemptHeartbeatInterval is how often a running handler's claim is renewed
