@@ -46,6 +46,10 @@ engine.Start(ctx)
   the command, otherwise at the next claim heartbeat); anything awaiting it
   receives a cancellation error. Without `AllowControl` the agent is
   read-only and advertises no commands.
+- **Live events.** The Cloud subscribes to one executor per app and streams
+  its event log (`events.subscribe`), resuming from the last cursor on
+  another executor if that one goes away. Events whose transaction commits
+  late are caught by rescanning just below the cursor.
 - **Metadata-only mode.** Set per app in the Cloud (applied live), or forced
   locally with `MetadataOnly: true`, which the Cloud cannot relax. Payloads,
   results, errors and event details are never sent.

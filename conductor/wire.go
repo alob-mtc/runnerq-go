@@ -391,3 +391,37 @@ type commandResult struct {
 	Replayed bool          `json:"replayed,omitempty"`
 	Results  []commandItem `json:"results"`
 }
+
+// --- streams ---
+
+const (
+	typeEventsSubscribe   = "events.subscribe"
+	typeEventsUnsubscribe = "events.unsubscribe"
+	typeStreamEvents      = "stream.events"
+	typeStreamGap         = "stream.gap"
+)
+
+type subscribeRequest struct {
+	Filter      *wireFilter `json:"filter,omitempty"`
+	AfterCursor string      `json:"after_cursor,omitempty"`
+	MaxBatch    int         `json:"max_batch,omitempty"`
+	MaxDelayMS  int         `json:"max_delay_ms,omitempty"`
+}
+
+type subscription struct {
+	SubscriptionID string `json:"subscription_id"`
+	// Cursor is where the stream starts: the request's after_cursor, or the
+	// log's current end.
+	Cursor string `json:"cursor,omitempty"`
+}
+
+type streamEvents struct {
+	SubscriptionID string      `json:"subscription_id"`
+	Items          []eventView `json:"items"`
+	Cursor         string      `json:"cursor"`
+}
+
+type streamGap struct {
+	SubscriptionID string `json:"subscription_id"`
+	SinceCursor    string `json:"since_cursor"`
+}
