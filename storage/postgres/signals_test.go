@@ -154,42 +154,6 @@ func TestWaitForResultAlreadyStored(t *testing.T) {
 	}
 }
 
-// The event stream must deliver lifecycle events committed after the
-// subscription, fed by the table tailer (writers no longer notify in-tx).
-func TestEventStreamTailsCommittedEvents(t *testing.T) {
-	queueName := sharedQueueName()
-	consumer := testBackendNamed(t, queueName)
-	producer := testBackendNamed(t, queueName)
-
-	streamCtx := t.Context()
-	events, err := consumer.EventStream(streamCtx)
-	if err != nil {
-		t.Fatalf("event stream: %v", err)
-	}
-	// Give the tailer a beat to anchor its cursor before producing.
-	time.Sleep(300 * time.Millisecond)
-
-	a := testActivity(3)
-	if err := producer.Enqueue(context.Background(), a); err != nil {
-		t.Fatalf("enqueue: %v", err)
-	}
-
-	deadline := time.After(5 * time.Second)
-	for {
-		select {
-		case ev, ok := <-events:
-			if !ok {
-				t.Fatal("event stream closed unexpectedly")
-			}
-			if ev.ActivityID == a.ID && ev.EventType == storage.EventEnqueued {
-				return // success
-			}
-		case <-deadline:
-			t.Fatal("Enqueued event never arrived on the stream")
-		}
-	}
-}
-
 // The three dequeue query forms must each claim the right rows.
 func TestDequeueTypeFilters(t *testing.T) {
 	b := testBackend(t)

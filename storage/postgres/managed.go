@@ -7,12 +7,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// FreshStats bypasses the process-local display cache for service reads that
-// must reflect the caller's preceding committed operation.
-func (b *PostgresBackend) FreshStats(ctx context.Context) (*storage.QueueStats, error) {
-	return b.readStats(ctx, false)
-}
-
 // OpenExisting opens a pre-provisioned backend without DDL. Managed services
 // can run WithConfig during provisioning/migration and use this on API boot.
 func OpenExisting(ctx context.Context, databaseURL, queueName string, leaseMS int64, poolSize int32) (*PostgresBackend, error) {

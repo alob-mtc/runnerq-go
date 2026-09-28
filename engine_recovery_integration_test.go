@@ -265,11 +265,22 @@ func TestSupersededExecutionIsCancelledAndCannotSpawn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close(ctx)
-	if _, err := conn.Exec(ctx, `UPDATE runnerq_activities SET lease_deadline_ms=(EXTRACT(EPOCH FROM NOW())*1000)::bigint-1000 WHERE id=$1`, fut.ActivityID()); err != nil {
-		t.Fatal(err)
-	}
-	if n, err := rig.backend.RequeueExpired(ctx, 10); err != nil || n != 1 {
-		t.Fatalf("reaper %d %v", n, err)
+	// The engine renews the lease every 50ms, so a renewal can land between
+	// expiring it and reaping. Expire and reap again until the reaper takes it.
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		if _, err := conn.Exec(ctx, `UPDATE runnerq_activities SET lease_deadline_ms=(EXTRACT(EPOCH FROM NOW())*1000)::bigint-1000 WHERE id=$1 AND status='processing'`, fut.ActivityID()); err != nil {
+			t.Fatal(err)
+		}
+		n, err := rig.backend.RequeueExpired(ctx, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the reaper never requeued the expired activity")
+		}
 	}
 	for name, ch := range map[string]chan error{"cause": firstCause, "spawn": staleSpawn} {
 		if se, ok := storage.IsStorageError(receive(t, ch)); !ok || se.Kind != storage.ErrClaimLost {

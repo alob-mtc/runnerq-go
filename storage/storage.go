@@ -154,49 +154,8 @@ func NewTimeoutFailure() FailureKind {
 	return FailureKind{Retryable: true, Reason: "Activity execution timed out", IsTimeout: true}
 }
 
-// QueueStats holds queue-level statistics.
-type QueueStats struct {
-	Pending    uint64
-	Processing uint64
-	Scheduled  uint64
-	Retrying   uint64
-	// Waiting counts yield-parked activities: durable sleeps, signal waits,
-	// and parents awaiting children.
-	Waiting       uint64
-	Failed        uint64
-	DeadLetter    uint64
-	ByPriority    PriorityBreakdown
-	MaxWorkers    *int
-	ActiveWorkers uint64 // distinct current_worker_id across processing rows
-	// Roots is the same status breakdown but limited to root activities
-	// (parent_activity_id IS NULL). Drives pill counts on the workflows list.
-	Roots RootStatusBreakdown
-}
-
-// RootStatusBreakdown counts root activities per status.
-type RootStatusBreakdown struct {
-	Pending    uint64
-	Processing uint64
-	Scheduled  uint64
-	Retrying   uint64
-	Waiting    uint64
-	Completed  uint64
-	Failed     uint64
-	DeadLetter uint64
-}
-
-// PriorityBreakdown counts activities by priority level.
-type PriorityBreakdown struct {
-	Critical uint64
-	High     uint64
-	Normal   uint64
-	Low      uint64
-}
-
-// ActivitySnapshot is the canonical activity-state view returned by
-// InspectionStorage. The observability package mirrors this struct in
-// observability/models.go so it can ship the type to its consumers without
-// importing storage (which would create a circular dependency).
+// ActivitySnapshot is an activity's stored state, as the conformance suite
+// reads it back (storagetest.Reader).
 type ActivitySnapshot struct {
 	ID                uuid.UUID         `json:"id"`
 	ActivityType      string            `json:"activity_type"`
@@ -387,74 +346,19 @@ type QueueStorage interface {
 	SchedulesNatively() bool
 }
 
-// InspectionStorage provides read-only access to queue state for monitoring.
-type InspectionStorage interface {
-	ResultStorage
-
-	Stats(ctx context.Context) (*QueueStats, error)
-	ListPending(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
-	ListProcessing(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
-	ListScheduled(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
-	ListCompletedNonCron(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
-	ListCompletedCron(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
-	ListCompleted(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
-	ListDeadLetter(ctx context.Context, offset, limit int) ([]DeadLetterRecord, error)
-	GetActivity(ctx context.Context, activityID uuid.UUID) (*ActivitySnapshot, error)
-	GetActivityEvents(ctx context.Context, activityID uuid.UUID, limit int) ([]ActivityEvent, error)
-	// GetActivitySteps returns the durable checkpoint rows owned by an activity
-	// (its ctx.Run / ctx.Sleep steps), oldest first — the workflow's step
-	// history for the console. Rows without a step identity (the activity's own
-	// result) are excluded. Reads by owner via the existing owner index.
-	GetActivitySteps(ctx context.Context, ownerActivityID uuid.UUID) ([]StepRecord, error)
-	// GetChildren returns direct children of a parent activity.
-	GetChildren(ctx context.Context, parentID uuid.UUID, offset, limit int) ([]ActivitySnapshot, error)
-	// GetSubtree returns all activities in the tree rooted at rootID, including the root itself.
-	GetSubtree(ctx context.Context, rootID uuid.UUID) ([]ActivitySnapshot, error)
-	// ListRecentRoots returns top-level activities (no parent), newest first. When
-	// status is non-empty, results are filtered to that status (raw column value
-	// — e.g. 'processing', 'completed', 'dead_letter').
-	ListRecentRoots(ctx context.Context, status string, offset, limit int) ([]ActivitySnapshot, error)
-	// ListRecentActivities returns all activities (regardless of lineage), newest
-	// first. Status filter behaves the same way as ListRecentRoots.
-	ListRecentActivities(ctx context.Context, status string, offset, limit int) ([]ActivitySnapshot, error)
-	// ListCronActivities returns recent activities tagged with metadata.source='cron',
-	// regardless of status. Used by the console Schedules page to group cron runs.
-	ListCronActivities(ctx context.Context, offset, limit int) ([]ActivitySnapshot, error)
-	// EventStream returns a channel that yields real-time activity events.
-	EventStream(ctx context.Context) (<-chan ActivityEvent, error)
-}
-
-// WorkerPoolStorage tracks live engine instances for cluster-wide capacity
-// reporting. Engines call Register on Start, Heartbeat periodically, and
-// Deregister on graceful shutdown. Crashed pools age out of Stats() once
-// their last_seen_at falls outside the backend's liveness window.
-type WorkerPoolStorage interface {
-	RegisterWorkerPool(ctx context.Context, pool WorkerPoolInfo) error
-	HeartbeatWorkerPool(ctx context.Context, poolID uuid.UUID) error
-	DeregisterWorkerPool(ctx context.Context, poolID uuid.UUID) error
-}
-
-// Storage combines the queue, inspection, and worker-pool surfaces a backend
-// must provide. The conformance suite in storage/storagetest states the
-// behaviour the engine relies on as tests; a new backend runs it from its own
-// test file and passes before it can be trusted with durable execution.
+// Storage is the surface a backend must provide: the queue and its results.
+// The conformance suite in storage/storagetest states the behaviour the
+// engine relies on as tests; a new backend runs it from its own test file and
+// passes before it can be trusted with durable execution. Reading and
+// commanding activities from outside the engine is QueryStorage and
+// CommandStorage, both optional.
 type Storage interface {
 	QueueStorage
-	InspectionStorage
-	WorkerPoolStorage
+	ResultStorage
 }
 
 // LeaseConfigurer is an optional interface backends can implement to accept
 // the lease duration from the engine configuration at startup.
 type LeaseConfigurer interface {
 	SetLeaseMS(leaseMS int64)
-}
-
-// WorkerPoolInfo describes one engine instance's worker pool for cluster-wide
-// liveness tracking.
-type WorkerPoolInfo struct {
-	PoolID        uuid.UUID
-	QueueName     string
-	MaxWorkers    int
-	ActivityTypes []string
 }

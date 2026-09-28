@@ -20,18 +20,6 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// statsCacheTTL bounds how often Stats() actually hits the database.
-// Stats() runs ~14 COUNT subqueries per call and is polled by every
-// connected SSE client; without this the dashboard amplifies into real
-// load on the activities table.
-const statsCacheTTL = time.Second
-
-// workerPoolLivenessWindow is how stale a worker_pools row can be before
-// Stats() stops counting it toward cluster-wide max-workers. Engines should
-// heartbeat at roughly 1/6 this interval so a single missed heartbeat doesn't
-// drop them out.
-const workerPoolLivenessWindow = 60 * time.Second
-
 // PostgresBackend is a PostgreSQL-based storage backend for RunnerQ.
 type PostgresBackend struct {
 	pool           *pgxpool.Pool
@@ -43,16 +31,12 @@ type PostgresBackend struct {
 	sig       *signaler
 	watcherMu sync.Mutex
 	watch     *watcher
-
-	statsMu     sync.Mutex
-	statsCache  *storage.QueueStats
-	statsExpiry time.Time
 }
 
 // New creates a new PostgresBackend with default pool size 25 and lease 30s.
 // In multi-process deployments the operator should still pick a size that
 // matches the worker count via WithConfig (rule of thumb: maxWorkers + ~5
-// for reaper/stats/scheduled-processor headroom).
+// for reaper and scheduled-processor headroom).
 func New(ctx context.Context, databaseURL, queueName string) (*PostgresBackend, error) {
 	return WithConfig(ctx, databaseURL, queueName, 30_000, 25)
 }
@@ -381,9 +365,8 @@ func intToPriority(val int32) storage.ActivityPriority {
 // recordEvent inserts the lifecycle event row — and ONLY the row. It must
 // never NOTIFY: this runs inside the hot-path transactions, and Postgres
 // serializes the commit of every NOTIFY-carrying transaction on one global
-// lock, capping cluster-wide throughput. Live consumers are fed by the
-// post-commit signaler + event tailer instead (signals.go); callers emit
-// b.signalEvent() after their transaction commits.
+// lock, capping cluster-wide throughput. Readers query the table
+// (QueryEvents), so no notification is needed.
 func (b *PostgresBackend) recordEvent(ctx context.Context, tx pgx.Tx, activityID uuid.UUID, eventType string, workerID *string, detail json.RawMessage) error {
 	_, err := tx.Exec(ctx, `
 		INSERT INTO runnerq_events (activity_id, queue_name, event_type, worker_id, detail, created_at)
@@ -496,7 +479,6 @@ func (b *PostgresBackend) enqueue(ctx context.Context, a storage.QueuedActivity,
 // runnable (future-scheduled rows are picked up by the blocked dequeuers'
 // periodic probes when they come due).
 func (b *PostgresBackend) signalEnqueued(a *storage.QueuedActivity) {
-	b.signalEvent()
 	if a.ScheduledAt == nil || !a.ScheduledAt.After(time.Now().UTC()) {
 		b.signalWork()
 	}
@@ -772,8 +754,6 @@ func (b *PostgresBackend) dequeueOnce(ctx context.Context, workerID string, acti
 		return nil, databaseError(err, fmt.Sprintf("Failed to commit dequeue: %v", err))
 	}
 
-	b.signalEvent()
-
 	slog.Debug("Activity claimed",
 		"activity_id", a.ID,
 		"activity_type", a.ActivityType,
@@ -837,8 +817,6 @@ func (b *PostgresBackend) dequeueBatchOnce(ctx context.Context, workerIDPrefix s
 	if err := tx.Commit(ctx); err != nil {
 		return nil, databaseError(err, fmt.Sprintf("Failed to commit batch dequeue: %v", err))
 	}
-
-	b.signalEvent()
 
 	slog.Debug("Activities claimed", "count", len(claims), "limit", limit)
 
@@ -918,7 +896,6 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 		return databaseError(err, fmt.Sprintf("Failed to commit ack: %v", err))
 	}
 
-	b.signalEvent()
 	b.signalResult(activityID)
 	b.signalWork()
 	return nil
@@ -995,7 +972,6 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		if err := tx.Commit(ctx); err != nil {
 			return false, databaseError(err, fmt.Sprintf("Failed to commit ack_failure: %v", err))
 		}
-		b.signalEvent()
 		b.signalResult(activityID)
 		b.signalWork()
 		return false, nil
@@ -1064,7 +1040,6 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		if err := tx.Commit(ctx); err != nil {
 			return false, databaseError(err, fmt.Sprintf("Failed to commit ack_failure retry: %v", err))
 		}
-		b.signalEvent()
 		if retryDelay == 0 {
 			// Immediate retry is runnable right now; delayed retries are
 			// picked up by blocked dequeuers' periodic probes when due.
@@ -1106,7 +1081,6 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		return false, databaseError(err, fmt.Sprintf("Failed to commit ack_failure DLQ: %v", err))
 	}
 
-	b.signalEvent()
 	b.signalResult(activityID)
 	b.signalWork()
 	return true, nil
@@ -1221,7 +1195,6 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 		return 0, databaseError(err, fmt.Sprintf("Failed to commit requeue expired: %v", err))
 	}
 
-	b.signalEvent()
 	for _, r := range reaped {
 		if r.deadLetter {
 			b.signalResult(r.id)
@@ -1290,7 +1263,6 @@ func (b *PostgresBackend) Yield(ctx context.Context, activityID uuid.UUID, wakeA
 		return databaseError(err, fmt.Sprintf("Failed to commit yield: %v", err))
 	}
 
-	b.signalEvent()
 	// A wake time that is already due makes the row immediately runnable —
 	// wake blocked dequeuers now instead of leaving it to their next probe
 	// (mirrors signalEnqueued's fast-path for due scheduled inserts).
@@ -1366,7 +1338,6 @@ func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UU
 		return databaseError(err, fmt.Sprintf("Failed to commit signal: %v", err))
 	}
 
-	b.signalEvent()
 	// Wake in-process waiters (WaitForResult on the signal's checkpoint ID —
 	// possibly in a different process) and, if we flipped a parked row to
 	// pending, blocked dequeuers.
@@ -1588,7 +1559,6 @@ func (b *PostgresBackend) ExtendLease(ctx context.Context, activityID uuid.UUID,
 	if err := tx.Commit(ctx); err != nil {
 		return false, databaseError(err, fmt.Sprintf("Failed to commit extend_lease: %v", err))
 	}
-	b.signalEvent()
 	return true, nil
 }
 
@@ -1607,7 +1577,6 @@ func (b *PostgresBackend) RecordSpawnLinked(ctx context.Context, childID, parent
 	if err := tx.Commit(ctx); err != nil {
 		return databaseError(err, fmt.Sprintf("Failed to commit spawn_linked: %v", err))
 	}
-	b.signalEvent()
 	return nil
 }
 
@@ -1652,7 +1621,6 @@ func (b *PostgresBackend) StoreResult(ctx context.Context, activityID uuid.UUID,
 		return databaseError(err, fmt.Sprintf("Failed to commit store_result: %v", err))
 	}
 
-	b.signalEvent()
 	b.signalResult(activityID)
 	b.signalWork()
 
@@ -1832,217 +1800,8 @@ func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.Q
 }
 
 // ============================================================================
-// InspectionStorage Implementation
+// Reads for the conformance suite (storagetest.Reader)
 // ============================================================================
-
-func (b *PostgresBackend) Stats(ctx context.Context) (*storage.QueueStats, error) {
-	return b.readStats(ctx, true)
-}
-
-func (b *PostgresBackend) readStats(ctx context.Context, useCache bool) (*storage.QueueStats, error) {
-	b.statsMu.Lock()
-	if useCache && b.statsCache != nil && time.Now().Before(b.statsExpiry) {
-		s := *b.statsCache
-		b.statsMu.Unlock()
-		return &s, nil
-	}
-	b.statsMu.Unlock()
-
-	// One round trip, but each scalar subquery is planned independently so the
-	// matching partial index handles its own count. A single FILTER aggregate
-	// over the whole table would force a full scan and degrade as completed
-	// history accumulates — this form keeps each count cheap.
-	stats := &storage.QueueStats{}
-	err := b.pool.QueryRow(ctx, `
-		SELECT
-			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'pending')                                                                AS pending,
-			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'processing')                                                             AS processing,
-			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'scheduled')                                                              AS scheduled,
-			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'retrying')                                                               AS retrying,
-			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'waiting')                                                                AS waiting,
-			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'failed')                                                                 AS failed,
-			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND status = 'dead_letter')                                                            AS dead_letter,
-			(SELECT COUNT(DISTINCT current_worker_id) FROM runnerq_activities WHERE queue_name = $1 AND status = 'processing' AND current_worker_id IS NOT NULL) AS active_workers,
-			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'pending')     AS root_pending,
-			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'processing')  AS root_processing,
-			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'scheduled')   AS root_scheduled,
-			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'retrying')    AS root_retrying,
-			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'waiting')     AS root_waiting,
-			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'completed')   AS root_completed,
-			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'failed')      AS root_failed,
-			(SELECT COUNT(*) FROM runnerq_activities WHERE queue_name = $1 AND parent_activity_id IS NULL AND status = 'dead_letter') AS root_dead_letter`,
-		b.queueName).Scan(
-		&stats.Pending,
-		&stats.Processing,
-		&stats.Scheduled,
-		&stats.Retrying,
-		&stats.Waiting,
-		&stats.Failed,
-		&stats.DeadLetter,
-		&stats.ActiveWorkers,
-		&stats.Roots.Pending,
-		&stats.Roots.Processing,
-		&stats.Roots.Scheduled,
-		&stats.Roots.Retrying,
-		&stats.Roots.Waiting,
-		&stats.Roots.Completed,
-		&stats.Roots.Failed,
-		&stats.Roots.DeadLetter,
-	)
-	if err != nil {
-		return nil, databaseError(err, fmt.Sprintf("Failed to compute queue stats: %v", err))
-	}
-
-	// Priority breakdown for pending activities — hits the dequeue partial index.
-	pRows, err := b.pool.Query(ctx, `
-		SELECT priority, COUNT(*) as count
-		FROM runnerq_activities
-		WHERE queue_name = $1 AND status = 'pending'
-		GROUP BY priority`, b.queueName)
-	if err != nil {
-		return nil, databaseError(err, fmt.Sprintf("Failed to get priority stats: %v", err))
-	}
-	defer pRows.Close()
-
-	for pRows.Next() {
-		var priority int32
-		var count int64
-		if err := pRows.Scan(&priority, &count); err != nil {
-			return nil, databaseError(err, fmt.Sprintf("Failed to scan priority stats: %v", err))
-		}
-		switch storage.ActivityPriority(priority) {
-		case storage.PriorityCritical:
-			stats.ByPriority.Critical = uint64(count)
-		case storage.PriorityHigh:
-			stats.ByPriority.High = uint64(count)
-		case storage.PriorityNormal:
-			stats.ByPriority.Normal = uint64(count)
-		case storage.PriorityLow:
-			stats.ByPriority.Low = uint64(count)
-		}
-	}
-
-	// Cluster-wide max workers: sum max_workers across pools that have
-	// heartbeated within workerPoolLivenessWindow. A pool that crashes
-	// without deregistering drops out of the total once its row ages out.
-	var totalMax int
-	if err := b.pool.QueryRow(ctx, `
-		SELECT COALESCE(SUM(max_workers), 0)::int
-		FROM runnerq_worker_pools
-		WHERE queue_name = $1
-		  AND last_seen_at > NOW() - make_interval(secs => $2)`,
-		b.queueName, int(workerPoolLivenessWindow.Seconds())).Scan(&totalMax); err != nil {
-		return nil, databaseError(err, fmt.Sprintf("Failed to compute cluster worker capacity: %v", err))
-	}
-	if totalMax > 0 {
-		stats.MaxWorkers = &totalMax
-	}
-
-	b.statsMu.Lock()
-	b.statsCache = stats
-	b.statsExpiry = time.Now().Add(statsCacheTTL)
-	b.statsMu.Unlock()
-
-	return stats, nil
-}
-
-func (b *PostgresBackend) listByStatus(ctx context.Context, status string, offset, limit int) ([]storage.ActivitySnapshot, error) {
-	rows, err := b.pool.Query(ctx, `
-		SELECT id, activity_type, payload, priority, status, created_at,
-			scheduled_at, started_at, completed_at, current_worker_id,
-			last_worker_id, retry_count, max_retries, timeout_seconds,
-			retry_delay_seconds, last_error, last_error_at, metadata,
-			idempotency_key, lease_deadline_ms,
-			parent_activity_id, root_activity_id, depth
-		FROM runnerq_activities
-		WHERE queue_name = $1 AND status = $2
-		ORDER BY priority DESC, retry_count DESC, created_at ASC
-		LIMIT $3 OFFSET $4`,
-		b.queueName, status, limit, offset)
-	if err != nil {
-		return nil, databaseError(err, fmt.Sprintf("Failed to list %s: %v", status, err))
-	}
-	defer rows.Close()
-
-	return b.scanSnapshots(rows)
-}
-
-func (b *PostgresBackend) ListPending(ctx context.Context, offset, limit int) ([]storage.ActivitySnapshot, error) {
-	return b.listByStatus(ctx, "pending", offset, limit)
-}
-
-func (b *PostgresBackend) ListProcessing(ctx context.Context, offset, limit int) ([]storage.ActivitySnapshot, error) {
-	return b.listByStatus(ctx, "processing", offset, limit)
-}
-
-func (b *PostgresBackend) ListScheduled(ctx context.Context, offset, limit int) ([]storage.ActivitySnapshot, error) {
-	rows, err := b.pool.Query(ctx, `
-		SELECT id, activity_type, payload, priority, status, created_at,
-			scheduled_at, started_at, completed_at, current_worker_id,
-			last_worker_id, retry_count, max_retries, timeout_seconds,
-			retry_delay_seconds, last_error, last_error_at, metadata,
-			idempotency_key, lease_deadline_ms,
-			parent_activity_id, root_activity_id, depth
-		FROM runnerq_activities
-		WHERE queue_name = $1 AND status IN ('scheduled', 'retrying', 'waiting')
-		ORDER BY scheduled_at ASC, created_at ASC
-		LIMIT $2 OFFSET $3`,
-		b.queueName, limit, offset)
-	if err != nil {
-		return nil, databaseError(err, fmt.Sprintf("Failed to list scheduled: %v", err))
-	}
-	defer rows.Close()
-
-	return b.scanSnapshots(rows)
-}
-
-func (b *PostgresBackend) ListCompleted(ctx context.Context, offset, limit int) ([]storage.ActivitySnapshot, error) {
-	return b.ListCompletedNonCron(ctx, offset, limit)
-}
-
-func (b *PostgresBackend) ListCompletedNonCron(ctx context.Context, offset, limit int) ([]storage.ActivitySnapshot, error) {
-	rows, err := b.pool.Query(ctx, `
-		SELECT id, activity_type, payload, priority, status, created_at,
-			scheduled_at, started_at, completed_at, current_worker_id,
-			last_worker_id, retry_count, max_retries, timeout_seconds,
-			retry_delay_seconds, last_error, last_error_at, metadata,
-			idempotency_key, lease_deadline_ms,
-			parent_activity_id, root_activity_id, depth
-		FROM runnerq_activities
-		WHERE queue_name = $1 AND status IN ('completed', 'failed')
-		  AND (metadata->>'source') IS DISTINCT FROM 'cron'
-		ORDER BY completed_at DESC, created_at DESC
-		LIMIT $2 OFFSET $3`,
-		b.queueName, limit, offset)
-	if err != nil {
-		return nil, databaseError(err, fmt.Sprintf("Failed to list completed non-cron: %v", err))
-	}
-	defer rows.Close()
-
-	return b.scanSnapshots(rows)
-}
-
-func (b *PostgresBackend) ListCompletedCron(ctx context.Context, offset, limit int) ([]storage.ActivitySnapshot, error) {
-	rows, err := b.pool.Query(ctx, `
-		SELECT id, activity_type, payload, priority, status, created_at,
-			scheduled_at, started_at, completed_at, current_worker_id,
-			last_worker_id, retry_count, max_retries, timeout_seconds,
-			retry_delay_seconds, last_error, last_error_at, metadata,
-			idempotency_key, lease_deadline_ms,
-			parent_activity_id, root_activity_id, depth
-		FROM runnerq_activities
-		WHERE queue_name = $1 AND status IN ('completed', 'failed')
-		  AND metadata->>'source' = 'cron'
-		ORDER BY completed_at DESC, created_at DESC
-		LIMIT $2 OFFSET $3`,
-		b.queueName, limit, offset)
-	if err != nil {
-		return nil, databaseError(err, fmt.Sprintf("Failed to list completed cron: %v", err))
-	}
-	defer rows.Close()
-
-	return b.scanSnapshots(rows)
-}
 
 func (b *PostgresBackend) ListDeadLetter(ctx context.Context, offset, limit int) ([]storage.DeadLetterRecord, error) {
 	rows, err := b.pool.Query(ctx, `
@@ -2167,107 +1926,6 @@ func (b *PostgresBackend) GetChildren(ctx context.Context, parentID uuid.UUID, o
 	return b.scanSnapshots(rows)
 }
 
-// statusOrderTimestampSQL picks the timestamp column that's most meaningful
-// for the active status filter so "newest first" actually means "most
-// recently transitioned into this state":
-//
-//	completed  -> completed_at
-//	failed     -> last_error_at
-//	processing -> started_at
-//	scheduled  -> scheduled_at
-//	retrying   -> last_error_at  (most recent failure that triggered the retry)
-//	dead_letter-> last_error_at
-//	pending / "all" -> created_at (no later timestamp exists yet)
-//
-// Wrapped in COALESCE so a NULL on the status-specific column (defensive —
-// shouldn't happen) and the unfiltered "all" case both fall back to
-// created_at, preserving the prior behaviour as the safe default.
-const statusOrderTimestampSQL = `COALESCE(
-		CASE $2
-			WHEN 'completed'   THEN completed_at
-			WHEN 'failed'      THEN last_error_at
-			WHEN 'processing'  THEN started_at
-			WHEN 'scheduled'   THEN scheduled_at
-			WHEN 'retrying'    THEN last_error_at
-			WHEN 'dead_letter' THEN last_error_at
-		END,
-		created_at
-	) DESC`
-
-func (b *PostgresBackend) ListRecentRoots(ctx context.Context, status string, offset, limit int) ([]storage.ActivitySnapshot, error) {
-	rows, err := b.pool.Query(ctx, `
-		SELECT id, activity_type, payload, priority, status, created_at,
-			scheduled_at, started_at, completed_at, current_worker_id,
-			last_worker_id, retry_count, max_retries, timeout_seconds,
-			retry_delay_seconds, last_error, last_error_at, metadata,
-			idempotency_key, lease_deadline_ms,
-			parent_activity_id, root_activity_id, depth
-		FROM runnerq_activities
-		WHERE queue_name = $1 AND parent_activity_id IS NULL
-		  AND ($2 = '' OR status = $2)
-		  -- The Schedules tab is the canonical home for cron runs; suppress
-		  -- them from the runs list when the user is browsing terminal
-		  -- statuses so the Completed/Failed views aren't dominated by
-		  -- recurring-job clutter. Other statuses (pending/processing/etc.)
-		  -- still surface cron rows so live cron work stays observable.
-		  AND ($2 NOT IN ('completed', 'failed') OR (metadata->>'source') IS DISTINCT FROM 'cron')
-		ORDER BY `+statusOrderTimestampSQL+`
-		LIMIT $3 OFFSET $4`,
-		b.queueName, status, limit, offset)
-	if err != nil {
-		return nil, databaseError(err, fmt.Sprintf("Failed to list recent roots: %v", err))
-	}
-	defer rows.Close()
-
-	return b.scanSnapshots(rows)
-}
-
-func (b *PostgresBackend) ListRecentActivities(ctx context.Context, status string, offset, limit int) ([]storage.ActivitySnapshot, error) {
-	rows, err := b.pool.Query(ctx, `
-		SELECT id, activity_type, payload, priority, status, created_at,
-			scheduled_at, started_at, completed_at, current_worker_id,
-			last_worker_id, retry_count, max_retries, timeout_seconds,
-			retry_delay_seconds, last_error, last_error_at, metadata,
-			idempotency_key, lease_deadline_ms,
-			parent_activity_id, root_activity_id, depth
-		FROM runnerq_activities
-		WHERE queue_name = $1
-		  AND ($2 = '' OR status = $2)
-		  -- See ListRecentRoots: cron runs live in the Schedules tab; hide
-		  -- them from the flattened runs list on terminal statuses.
-		  AND ($2 NOT IN ('completed', 'failed') OR (metadata->>'source') IS DISTINCT FROM 'cron')
-		ORDER BY `+statusOrderTimestampSQL+`
-		LIMIT $3 OFFSET $4`,
-		b.queueName, status, limit, offset)
-	if err != nil {
-		return nil, databaseError(err, fmt.Sprintf("Failed to list recent activities: %v", err))
-	}
-	defer rows.Close()
-
-	return b.scanSnapshots(rows)
-}
-
-func (b *PostgresBackend) ListCronActivities(ctx context.Context, offset, limit int) ([]storage.ActivitySnapshot, error) {
-	rows, err := b.pool.Query(ctx, `
-		SELECT id, activity_type, payload, priority, status, created_at,
-			scheduled_at, started_at, completed_at, current_worker_id,
-			last_worker_id, retry_count, max_retries, timeout_seconds,
-			retry_delay_seconds, last_error, last_error_at, metadata,
-			idempotency_key, lease_deadline_ms,
-			parent_activity_id, root_activity_id, depth
-		FROM runnerq_activities
-		WHERE queue_name = $1 AND metadata->>'source' = 'cron'
-		ORDER BY created_at DESC
-		LIMIT $2 OFFSET $3`,
-		b.queueName, limit, offset)
-	if err != nil {
-		return nil, databaseError(err, fmt.Sprintf("Failed to list cron activities: %v", err))
-	}
-	defer rows.Close()
-
-	return b.scanSnapshots(rows)
-}
-
 // GetActivitySteps returns an activity's durable checkpoint rows (its ctx.Run /
 // ctx.Sleep steps), oldest first. Hits idx_runnerq_results_owner; console-only,
 // never a hot path. step is stored as "kind:name" and split here.
@@ -2324,18 +1982,6 @@ func (b *PostgresBackend) GetSubtree(ctx context.Context, rootID uuid.UUID) ([]s
 	defer rows.Close()
 
 	return b.scanSnapshots(rows)
-}
-
-// EventStream yields lifecycle events committed after the subscription. It is
-// fed by the shared event tailer (signals.go): writers only insert rows, a
-// debounced post-commit notification kicks the tailer, and the tailer reads
-// full event rows from the table by id cursor. Consequences vs the old
-// per-event NOTIFY design: subscribers no longer pin a dedicated pool
-// connection each (one shared LISTEN connection serves everything), event
-// payloads are no longer truncated at the 8KB NOTIFY limit, and writers pay
-// zero notification cost inside their transactions.
-func (b *PostgresBackend) EventStream(ctx context.Context) (<-chan storage.ActivityEvent, error) {
-	return b.getWatcher().subscribeEvents(ctx), nil
 }
 
 // ============================================================================
@@ -2471,58 +2117,6 @@ func (r *activityRow) toSnapshot() storage.ActivitySnapshot {
 		RootActivityID:    r.rootActivityID,
 		Depth:             uint16(r.depth),
 	}
-}
-
-// ============================================================================
-// WorkerPoolRegistrar Implementation
-// ============================================================================
-
-// RegisterWorkerPool inserts (or refreshes, on UUID collision) the row that
-// identifies this engine instance's pool. The same call doubles as the first
-// heartbeat — last_seen_at is set to NOW() so it counts immediately.
-func (b *PostgresBackend) RegisterWorkerPool(ctx context.Context, pool storage.WorkerPoolInfo) error {
-	var types []string
-	if len(pool.ActivityTypes) > 0 {
-		types = pool.ActivityTypes
-	}
-	_, err := b.pool.Exec(ctx, `
-		INSERT INTO runnerq_worker_pools (pool_id, queue_name, max_workers, activity_types, started_at, last_seen_at)
-		VALUES ($1, $2, $3, $4, NOW(), NOW())
-		ON CONFLICT (pool_id) DO UPDATE
-		SET max_workers    = EXCLUDED.max_workers,
-		    activity_types = EXCLUDED.activity_types,
-		    last_seen_at   = NOW()`,
-		pool.PoolID, pool.QueueName, pool.MaxWorkers, types)
-	if err != nil {
-		return databaseError(err, fmt.Sprintf("Failed to register worker pool: %v", err))
-	}
-	return nil
-}
-
-// HeartbeatWorkerPool refreshes last_seen_at. A pool that misses heartbeats
-// for longer than workerPoolLivenessWindow stops counting toward Stats()
-// max_workers but its row is left in place — registration on next start
-// reuses the same UUID slot via the upsert in RegisterWorkerPool, and dead
-// rows can be vacuumed independently.
-func (b *PostgresBackend) HeartbeatWorkerPool(ctx context.Context, poolID uuid.UUID) error {
-	_, err := b.pool.Exec(ctx, `
-		UPDATE runnerq_worker_pools SET last_seen_at = NOW() WHERE pool_id = $1`,
-		poolID)
-	if err != nil {
-		return databaseError(err, fmt.Sprintf("Failed to heartbeat worker pool: %v", err))
-	}
-	return nil
-}
-
-// DeregisterWorkerPool removes the row on graceful shutdown. Best-effort —
-// callers should log but not fail on errors. Crashed pools are reaped
-// implicitly by the liveness window.
-func (b *PostgresBackend) DeregisterWorkerPool(ctx context.Context, poolID uuid.UUID) error {
-	_, err := b.pool.Exec(ctx, `DELETE FROM runnerq_worker_pools WHERE pool_id = $1`, poolID)
-	if err != nil {
-		return databaseError(err, fmt.Sprintf("Failed to deregister worker pool: %v", err))
-	}
-	return nil
 }
 
 func (b *PostgresBackend) scanSnapshots(rows pgx.Rows) ([]storage.ActivitySnapshot, error) {

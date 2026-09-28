@@ -83,7 +83,7 @@ func (s *suite) sweep(policy storage.RetentionPolicy, batch int, want uint64) {
 func (s *suite) wantTree(tr tree, present bool) {
 	s.t.Helper()
 	for _, id := range []uuid.UUID{tr.root, tr.child} {
-		snap, err := s.b.GetActivity(s.ctx, id)
+		snap, err := s.r.GetActivity(s.ctx, id)
 		if err != nil {
 			s.t.Fatal(err)
 		}
@@ -106,7 +106,7 @@ func (s *suite) wantTree(tr tree, present bool) {
 	if (err == nil) != present {
 		s.t.Fatalf("key %q lookup err=%v, want present=%v", tr.key, err, present)
 	}
-	if sub, err := s.b.GetSubtree(s.ctx, tr.root); err != nil || (len(sub) > 0) != present {
+	if sub, err := s.r.GetSubtree(s.ctx, tr.root); err != nil || (len(sub) > 0) != present {
 		s.t.Fatalf("subtree of %s has %d rows (%v), want present=%v", tr.root, len(sub), err, present)
 	}
 }
@@ -134,7 +134,7 @@ func testRetentionKeepsLiveTrees(t *testing.T, h Harness) {
 	}
 	s.age()
 	s.sweep(storage.RetentionPolicy{Completed: retentionTTL}, 100, 0)
-	if snap, err := s.b.GetActivity(s.ctx, root.ID); err != nil || snap == nil {
+	if snap, err := s.r.GetActivity(s.ctx, root.ID); err != nil || snap == nil {
 		t.Fatalf("root with a live child was swept: %v", err)
 	}
 	s.claim("c", child, "child")

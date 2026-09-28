@@ -169,7 +169,7 @@ func testDeadLetter(t *testing.T, h Harness) {
 	s.wantResult(a.ID, storage.ResultErr)
 	s.wantEvent(a.ID, storage.EventDeadLetter)
 	s.claimNothing()
-	records, err := s.b.ListDeadLetter(s.ctx, 0, 10)
+	records, err := s.r.ListDeadLetter(s.ctx, 0, 10)
 	if err != nil || len(records) != 1 || records[0].Activity.ID != a.ID || records[0].Error != "second" {
 		t.Fatalf("dead-letter list = %+v err=%v", records, err)
 	}
