@@ -163,3 +163,80 @@ func TestStreamGapLimitsAndFilters(t *testing.T) {
 		}
 	}
 }
+
+// A catch-up batch bigger than the Cloud's frame limit goes out as several
+// frames, each under the limit, with cursors that only move forward; an event
+// too large for any frame goes without its detail rather than jamming the
+// stream.
+func TestStreamSplitsBatchesToTheFrameLimit(t *testing.T) {
+	e, _, queue := pgEngine(t)
+	g := newFakeGateway(t, sessionConfig{})
+	g.frame = 16 << 10
+	startAgent(t, e, g, Config{})
+	g.waitHello()
+	var sub subscription
+	g.ok(typeEventsSubscribe, subscribeRequest{Filter: queueFilter(queue), MaxDelayMS: 50}, &sub)
+
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, os.Getenv("RUNNERQ_TEST_DSN"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	want := map[string]int{} // activity id -> detail bytes
+	for i := range 13 {
+		size := 3000
+		if i == 12 {
+			size = 40 << 10 // over the whole frame limit on its own
+		}
+		id := uuid.New()
+		want[id.String()] = size
+		if _, err := conn.Exec(ctx, `INSERT INTO runnerq_events (activity_id, queue_name, event_type, detail, created_at)
+			VALUES ($1, $2, 'Enqueued', jsonb_build_object('blob', repeat('x', $3::int)), now())`, id, queue, size); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seen := map[string]int{}
+	frames, last := 0, int64(0)
+	deadline := time.Now().Add(15 * time.Second)
+	for len(seen) < len(want) {
+		if time.Now().After(deadline) {
+			t.Fatalf("stream delivered %d of %d events", len(seen), len(want))
+		}
+		env := g.waitEvent(typeStreamEvents)
+		raw, _ := json.Marshal(env)
+		if len(raw) > g.frame {
+			t.Fatalf("a %d-byte frame is over the %d-byte limit", len(raw), g.frame)
+		}
+		var b streamEvents
+		if err := json.Unmarshal(env.Data, &b); err != nil {
+			t.Fatal(err)
+		}
+		cursor, err := strconv.ParseInt(b.Cursor, 10, 64)
+		if err != nil || cursor < last {
+			t.Fatalf("cursor went from %d to %q", last, b.Cursor)
+		}
+		last = cursor
+		frames++
+		for _, ev := range b.Items {
+			if _, ok := want[ev.ActivityID]; ok {
+				seen[ev.ActivityID]++
+				if want[ev.ActivityID] > 16<<10 && ev.Detail != nil {
+					t.Fatal("the oversized event kept its detail")
+				}
+				if want[ev.ActivityID] <= 16<<10 && ev.Detail == nil {
+					t.Fatal("an event that fits lost its detail")
+				}
+			}
+		}
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Fatalf("event for %s delivered %d times", id, n)
+		}
+	}
+	if frames < 3 {
+		t.Fatalf("36KB of events arrived in %d frames under a 16KB limit", frames)
+	}
+}

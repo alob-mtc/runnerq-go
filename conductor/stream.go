@@ -231,27 +231,81 @@ func (t *tailer) poll(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	var items []eventView
+	var pending []storage.EventRecord
 	for _, ev := range append(late, fresh...) {
-		if t.sent[ev.ID] {
-			continue
+		if !t.sent[ev.ID] {
+			pending = append(pending, ev)
 		}
-		t.sent[ev.ID] = true
-		t.cursor = max(t.cursor, ev.ID)
-		items = append(items, toEvent(ev))
+	}
+	if err := t.send(ctx, pending); err != nil {
+		return false, err
 	}
 	for id := range t.sent {
 		if id <= t.cursor-streamRescan {
 			delete(t.sent, id)
 		}
 	}
-	if len(items) == 0 {
-		return false, nil
-	}
-	if err := t.push(ctx, typeStreamEvents, streamEvents{SubscriptionID: t.id, Items: items, Cursor: strconv.FormatInt(t.cursor, 10)}); err != nil {
-		return false, err
-	}
 	return len(fresh) == t.batch, nil
+}
+
+// send pushes events as stream.events frames that each fit the Cloud's frame
+// limit (an oversized frame would drop the session, and the resumed stream
+// would read the same batch again). An event counts as sent, and moves the
+// cursor, only once its frame is written, so each frame's cursor covers what
+// the Cloud has received. An event too large for a frame by itself goes
+// without its detail.
+func (t *tailer) send(ctx context.Context, events []storage.EventRecord) error {
+	budget := int(t.s.a.peerFrameLimit.Load()) - 1024 // the margin serve leaves too
+	var (
+		items []eventView
+		ids   []int64
+		size  int
+	)
+	flush := func() error {
+		if len(items) == 0 {
+			return nil
+		}
+		cursor := t.cursor
+		for _, id := range ids {
+			cursor = max(cursor, id)
+		}
+		if err := t.push(ctx, typeStreamEvents, streamEvents{SubscriptionID: t.id, Items: items, Cursor: strconv.FormatInt(cursor, 10)}); err != nil {
+			return err
+		}
+		for _, id := range ids {
+			t.sent[id] = true
+		}
+		t.cursor = cursor
+		items, ids, size = nil, nil, 0
+		return nil
+	}
+	for _, ev := range events {
+		item := toEvent(ev)
+		n := encodedSize(item)
+		if budget > 0 && n > budget && item.Detail != nil {
+			slog.Warn("Conductor event detail is over the frame limit; streaming the event without it",
+				"subscription", t.id, "event", item.ID, "bytes", n, "limit", budget)
+			item.Detail = nil
+			n = encodedSize(item)
+		}
+		if budget > 0 && len(items) > 0 && size+n+1 > budget {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		items = append(items, item)
+		ids = append(ids, ev.ID)
+		size += n + 1
+	}
+	return flush()
+}
+
+func encodedSize(v any) int {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return 0
+	}
+	return len(b)
 }
 
 func (t *tailer) push(ctx context.Context, msgType string, data any) error {
