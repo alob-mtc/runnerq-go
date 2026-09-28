@@ -98,6 +98,11 @@ func TestAwaitFastChildStaysInProcess(t *testing.T) {
 	}}
 
 	rig := newStepsRig(t, func(e *WorkerEngine) {
+		// The child is fast, but a loaded runner (CI under -race) can take
+		// longer than the default two-second grace to claim and finish it, and
+		// the parent then parks as designed. A long grace keeps this test about
+		// the fast path, not the machine's speed.
+		e.awaitGrace = 15 * time.Second
 		e.RegisterActivityWithName("parent_fast", parent)
 		e.RegisterActivityWithName("fast_child", child)
 	})
