@@ -83,7 +83,11 @@ const awaitParkGrace = 2 * time.Second
 // blocks until the result exists or ctx is done.
 func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error) {
 	queue := f.queue
+	grace := awaitParkGrace
 	if scoped, ok := ctx.Value(attemptQueueKey{}).(*attemptQueue); ok {
+		if scoped.awaitGrace > 0 {
+			grace = scoped.awaitGrace
+		}
 		if err := scoped.registerFuture(ctx, f.activityID); err != nil {
 			return nil, err
 		}
@@ -106,7 +110,7 @@ func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error)
 
 	// In-handler: wait in-process up to the grace (clamped to the handler's
 	// remaining budget, same margin policy as Sleep), then park.
-	bound := time.Now().Add(awaitParkGrace)
+	bound := time.Now().Add(grace)
 	if deadline, ok := ctx.Deadline(); ok {
 		margin := max(min(yieldMargin, time.Until(deadline)/2), 0)
 		if budgetBound := deadline.Add(-margin); budgetBound.Before(bound) {

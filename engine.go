@@ -56,6 +56,8 @@ type WorkerEngine struct {
 
 	// heartbeatInterval overrides attemptHeartbeatInterval; zero uses it.
 	heartbeatInterval time.Duration
+	// awaitGrace overrides awaitParkGrace; zero uses it.
+	awaitGrace time.Duration
 
 	poolID uuid.UUID // identity used for worker_pools registration; zero if backend doesn't support it
 
@@ -677,7 +679,7 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	// yield-park this activity; awaits outside a handler block normally.
 	timeoutCtx = withHandlerScope(timeoutCtx)
 
-	attemptQ := &attemptQueue{activityQueue: e.queue, backend: e.backend, owner: act.ID, worker: workerLabel, persistenceCtx: ctx, metrics: e.metrics}
+	attemptQ := &attemptQueue{activityQueue: e.queue, backend: e.backend, owner: act.ID, worker: workerLabel, persistenceCtx: ctx, metrics: e.metrics, awaitGrace: e.awaitGrace}
 	timeoutCtx = context.WithValue(timeoutCtx, attemptQueueKey{}, attemptQ)
 	scopedExecutor := newActivityExecutor(attemptQ, e.config.MaxActivityDepth).scopedForChild(act)
 
