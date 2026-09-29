@@ -28,7 +28,9 @@ engine.Start(ctx)
 
 - **Workers only.** Start one agent per engine. Each engine appears in the
   Cloud as an executor, identified by `engine.InstanceID()`, with its live
-  in-flight activities and counters pushed as periodic reports.
+  in-flight activities and counters pushed as reports: on the interval the
+  Cloud sets, and within about a second of a change (an activity starting or
+  finishing, or a drain beginning).
 - **Labels.** Tag the worker with `WorkerConfig.Labels` (region, deploy
   version); the Cloud shows them whichever way the worker reports.
   `conductor.Config.Labels` adds to them and wins on a clash.
@@ -132,3 +134,9 @@ reports, and a storage backend that implements `executor.Observer`, which the
 engine tells when it starts and stops (the RunnerQ Cloud storage adapter
 reports hosted workers this way). Attach your own with `engine.Observe(o)`
 before `Start`.
+
+The engine is also an `executor.Notifier`: `engine.Changed()` returns a
+channel closed at its next change (an activity starting or finishing, or a
+drain beginning). `executor.Report` is the loop the agent and the adapter
+use to report on an interval and soon after changes, spaced by a minimum
+gap so a busy worker doesn't flood its destination.

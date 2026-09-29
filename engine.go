@@ -68,6 +68,10 @@ type WorkerEngine struct {
 	sdk         executor.SDK
 	observers   []executor.Observer // guarded by mu
 	servedTypes []string            // guarded by mu; set by Start
+
+	// changes tells reporters when an activity starts or finishes, or a
+	// drain begins.
+	changes executor.Signal
 }
 
 // Interrupt stops the handler this engine is running for activityID, as if
@@ -135,6 +139,13 @@ func (e *WorkerEngine) Snapshot() executor.Snapshot {
 		snap.State.Running = append(snap.State.Running, executor.Running{ID: a.ID, Type: a.Type, Attempt: a.Attempt, StartedAt: a.StartedAt})
 	}
 	return snap
+}
+
+// Changed returns a channel closed at the engine's next change: an
+// activity starting or finishing, or a drain beginning. Reporters use it
+// (executor.Notifier) to report soon after a change.
+func (e *WorkerEngine) Changed() <-chan struct{} {
+	return e.changes.Changed()
 }
 
 // Observe tells o when this engine starts and stops executing, so it can
@@ -527,6 +538,7 @@ func (e *WorkerEngine) stop() {
 		case <-e.shutdownCh:
 		default:
 			close(e.shutdownCh)
+			e.changes.Notify()
 		}
 	}
 }
@@ -688,7 +700,11 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	})
 	e.metrics.IncCounter(metricStarted, 1)
 	e.metrics.ObserveDuration(metricClaimLag, claimLag(act, now))
-	defer e.inflight.Delete(activityID)
+	e.changes.Notify()
+	defer func() {
+		e.inflight.Delete(activityID)
+		e.changes.Notify()
+	}()
 
 	activityTimeout := time.Duration(act.TimeoutSeconds) * time.Second
 	deadlineCtx, timeoutCancel := context.WithTimeout(ctx, activityTimeout)
