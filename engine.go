@@ -95,6 +95,16 @@ func (e *WorkerEngine) InFlight() []InFlightActivity {
 	return out
 }
 
+// executorState is what the engine is doing now, for backends that report
+// it (storage.ExecutorReportingStorage).
+func (e *WorkerEngine) executorState() storage.ExecutorState {
+	st := storage.ExecutorState{Draining: e.Draining()}
+	for _, a := range e.InFlight() {
+		st.Running = append(st.Running, storage.RunningActivity{ID: a.ID, Type: a.Type, Attempt: a.Attempt, StartedAt: a.StartedAt})
+	}
+	return st
+}
+
 // StartedAt is when Start was last called, or zero.
 func (e *WorkerEngine) StartedAt() time.Time {
 	e.mu.Lock()
@@ -301,6 +311,13 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	e.mu.Unlock()
 	defer engineCancel()
 	slog.Info("Starting worker engine", "max_concurrent_activities", e.config.MaxConcurrentActivities)
+	if r, ok := e.backend.(storage.ExecutorReportingStorage); ok {
+		r.ExecutorStarted(storage.ExecutorInfo{
+			ID: e.instanceID, Queue: e.config.QueueName, ActivityTypes: slices.Clone(types),
+			MaxConcurrency: e.config.MaxConcurrentActivities, StartedAt: e.StartedAt(),
+		}, e.executorState)
+		defer r.ExecutorStopped(e.instanceID)
+	}
 
 	var wg sync.WaitGroup
 
