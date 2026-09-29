@@ -54,7 +54,15 @@ type QueuedActivity struct {
 	ParentActivityID     *uuid.UUID
 	RootActivityID       uuid.UUID
 	Depth                uint16
+	// Serialization is the payload's encoding: empty for plain JSON (json-v1),
+	// which is all the Go SDK writes. Other SDKs set their own (the TypeScript
+	// SDK's native superjson-v1); backends store it with the payload and return
+	// it with claims.
+	Serialization string `json:",omitempty"`
 }
+
+// SerializationJSON is plain JSON, the encoding an empty Serialization means.
+const SerializationJSON = "json-v1"
 
 // IdempotencyKeyConfig holds a key and its behavior.
 type IdempotencyKeyConfig struct {
@@ -104,6 +112,9 @@ type BatchQueueStorage interface {
 type ActivityResult struct {
 	Data  json.RawMessage
 	State ResultState
+	// Serialization is Data's encoding; empty for plain JSON (json-v1), as for
+	// QueuedActivity.Serialization.
+	Serialization string `json:",omitempty"`
 }
 
 // StepRecord is one durable checkpoint of an activity (a ctx.Run or ctx.Sleep
@@ -137,6 +148,10 @@ type FailureKind struct {
 	Retryable bool
 	Reason    string
 	IsTimeout bool
+	// Details is a structured account of the failure (the TypeScript SDK
+	// records name, message, stack, code and cause), stored in the error
+	// result as "failure". Empty for the Go SDK.
+	Details json.RawMessage `json:",omitempty"`
 }
 
 // NewRetryableFailure creates a retryable failure.

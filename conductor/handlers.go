@@ -189,7 +189,7 @@ func toResult(r *storage.ActivityResult) *result {
 		return nil
 	}
 	if r.State == storage.ResultOk {
-		return &result{State: "ok", Data: r.Data}
+		return &result{State: "ok", Data: plainJSON(r)}
 	}
 	var e struct {
 		Error string `json:"error"`
@@ -608,4 +608,19 @@ func errorMessage(err error) string {
 		msg = msg[:i]
 	}
 	return msg
+}
+
+// plainJSON is a result's data as the console reads it: the "json" part of
+// the TypeScript SDK's native superjson-v1, as storage queries give it.
+func plainJSON(r *storage.ActivityResult) json.RawMessage {
+	if r.Serialization != "superjson-v1" {
+		return r.Data
+	}
+	var envelope struct {
+		JSON json.RawMessage `json:"json"`
+	}
+	if json.Unmarshal(r.Data, &envelope) != nil || envelope.JSON == nil {
+		return r.Data
+	}
+	return envelope.JSON
 }

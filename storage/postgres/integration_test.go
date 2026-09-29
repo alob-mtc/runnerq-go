@@ -601,3 +601,143 @@ func TestLeaseUsesDBClockAndExtends(t *testing.T) {
 		t.Fatal("extended the lease of a completed activity")
 	}
 }
+
+// Other SDKs' encodings round-trip: an encoded claim takes what a plain claim
+// leaves, and results, checkpoints and signals keep the encoding they were
+// written with, while Go callers still see plain JSON as empty.
+func TestEncodedStorageRoundTrips(t *testing.T) {
+	b := testBackend(t)
+	ctx := context.Background()
+	native := testActivity(3)
+	native.Serialization = "superjson-v1"
+	native.Payload = json.RawMessage(`{"json":{"at":"2026-09-29T00:00:00.000Z"},"meta":{"values":{"at":["Date"]}}}`)
+	if err := b.Enqueue(ctx, native); err != nil {
+		t.Fatal(err)
+	}
+	if claims, err := b.DequeueBatch(ctx, "go", 10, 0, nil); err != nil || len(claims) != 0 {
+		t.Fatalf("plain claim took %d, %v", len(claims), err)
+	}
+	claims, err := b.DequeueBatchEncoded(ctx, "ts", 10, 0, nil, []string{"json-v1", "superjson-v1"})
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("encoded claim: %d, %v", len(claims), err)
+	}
+	c := claims[0]
+	if c.Activity.ID != native.ID || c.Activity.Serialization != "superjson-v1" {
+		t.Fatalf("claimed %+v", c.Activity)
+	}
+	// Only the encodings asked for: none claims nothing, and plain JSON isn't
+	// implied.
+	if none, err := b.DequeueBatchEncoded(ctx, "ts", 10, 0, nil, nil); err != nil || len(none) != 0 {
+		t.Fatalf("no encodings claimed %d, %v", len(none), err)
+	}
+
+	checkpoint := uuid.New()
+	step := storage.ActivityResult{Data: json.RawMessage(`{"json":1}`), State: storage.ResultOk, Serialization: "superjson-v1"}
+	if err := b.StoreCheckpoint(ctx, checkpoint, native.ID, c.LeaseID, step, "run:load"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.StoreCheckpoint(ctx, checkpoint, native.ID, c.LeaseID, step, "run:load"); err != nil {
+		t.Fatalf("identical checkpoint retry: %v", err)
+	}
+	plainStep := step
+	plainStep.Serialization = ""
+	if err := b.StoreCheckpoint(ctx, checkpoint, native.ID, c.LeaseID, plainStep, "run:load"); err == nil {
+		t.Fatal("a checkpoint in another encoding was accepted")
+	}
+	if got, err := b.GetResult(ctx, checkpoint); err != nil || got.Serialization != "superjson-v1" {
+		t.Fatalf("checkpoint result %+v, %v", got, err)
+	}
+
+	signal := uuid.New()
+	if err := b.SignalActivityEncoded(ctx, native.ID, signal, "approve", json.RawMessage(`{"json":true}`), "superjson-v1"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := b.GetResult(ctx, signal); err != nil || got.Serialization != "superjson-v1" {
+		t.Fatalf("signal result %+v, %v", got, err)
+	}
+
+	result := json.RawMessage(`{"json":"done"}`)
+	if err := b.AckSuccessEncoded(ctx, native.ID, result, "superjson-v1", c.LeaseID); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.AckSuccessEncoded(ctx, native.ID, result, "superjson-v1", c.LeaseID); err != nil {
+		t.Fatalf("identical completion retry: %v", err)
+	}
+	if got, err := b.GetResult(ctx, native.ID); err != nil || got.Serialization != "superjson-v1" || got.State != storage.ResultOk {
+		t.Fatalf("result %+v, %v", got, err)
+	}
+
+	// Queries show a native value as its plain "json" part.
+	page, err := b.QueryActivities(ctx, storage.ActivityQuery{
+		Filter:  &storage.QueryFilter{Field: "id", Op: storage.OpEq, Value: native.ID.String()},
+		Include: storage.RecordInclude{Payload: true, Result: true},
+	})
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("query: %+v, %v", page, err)
+	}
+	if got := string(page.Items[0].Payload); got != `{"at": "2026-09-29T00:00:00.000Z"}` && got != `{"at":"2026-09-29T00:00:00.000Z"}` {
+		t.Fatalf("queried payload %s", got)
+	}
+	if r := page.Items[0].Result; r == nil || string(r.Data) != `"done"` {
+		t.Fatalf("queried result %+v", r)
+	}
+
+	// Plain JSON stays empty for Go callers.
+	plain := testActivity(3)
+	if err := b.Enqueue(ctx, plain); err != nil {
+		t.Fatal(err)
+	}
+	pc, err := b.Dequeue(ctx, "go-1", 0, nil)
+	if err != nil || pc == nil || pc.Serialization != "" {
+		t.Fatalf("plain claim %+v, %v", pc, err)
+	}
+	if err := b.AckSuccess(ctx, plain.ID, json.RawMessage(`1`), "go-1"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := b.GetResult(ctx, plain.ID); err != nil || got.Serialization != "" {
+		t.Fatalf("plain result %+v, %v", got, err)
+	}
+}
+
+// A failure's details are kept in its error result and events, for SDKs
+// that record them.
+func TestFailureDetailsKept(t *testing.T) {
+	b := testBackend(t)
+	ctx := context.Background()
+	a := testActivity(1)
+	if err := b.Enqueue(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	c, err := b.Dequeue(ctx, "w1", 0, nil)
+	if err != nil || c == nil {
+		t.Fatal(err)
+	}
+	if _, err := b.AckFailure(ctx, a.ID, storage.FailureKind{Reason: "x", Details: json.RawMessage(`{not json`)}, "w1"); !isKind(err, storage.ErrInvalidArgument) {
+		t.Fatalf("malformed details: %v", err)
+	}
+	details := json.RawMessage(`{"name":"TypeError","message":"bad input","stack":"at handler"}`)
+	if _, err := b.AckFailure(ctx, a.ID, storage.FailureKind{Reason: "bad input", Details: details}, "w1"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := b.GetResult(ctx, a.ID)
+	if err != nil || res == nil || res.State != storage.ResultErr {
+		t.Fatalf("result %+v, %v", res, err)
+	}
+	var stored struct {
+		Error   string          `json:"error"`
+		Type    string          `json:"type"`
+		Failure json.RawMessage `json:"failure"`
+	}
+	if err := json.Unmarshal(res.Data, &stored); err != nil || stored.Error != "bad input" || stored.Type != "non_retryable" {
+		t.Fatalf("stored %s: %v", res.Data, err)
+	}
+	var failure map[string]string
+	if err := json.Unmarshal(stored.Failure, &failure); err != nil || failure["name"] != "TypeError" || failure["stack"] != "at handler" {
+		t.Fatalf("failure %s: %v", stored.Failure, err)
+	}
+}
+
+func isKind(err error, kind storage.StorageErrorKind) bool {
+	se, ok := storage.IsStorageError(err)
+	return ok && se.Kind == kind
+}
