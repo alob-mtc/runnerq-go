@@ -97,7 +97,7 @@ func TestCompletionRecoveryStopsOnTerminalError(t *testing.T) {
 			}}
 			e := recoveryEngine(q, nil)
 			a := newActivity("test", nil, nil)
-			e.handleSuccess(context.Background(), a, nil, "claim", 0, a.ID, a.ActivityType)
+			e.handleSuccess(context.Background(), a, nil, "claim", 0)
 			m := e.metrics.(recoveryMetrics)
 			if calls != 1 || m["activity_completed"] != 0 || m["activity_completion_pending_started"] != m["activity_completion_pending_finished"] {
 				t.Fatalf("calls=%d metrics=%v", calls, m)
@@ -216,7 +216,7 @@ func TestPostParkFailureHasBoundedReplayDeadline(t *testing.T) {
 	}}
 	e := recoveryEngine(q, nil)
 	a := newActivity("test", nil, nil)
-	e.handleYield(context.Background(), a, &yieldPark{wakeAt: time.Now().Add(signalParkHorizon), recheck: uuid.New()}, "claim", 0, a.ID, a.ActivityType)
+	e.handleYield(context.Background(), a, &yieldPark{wakeAt: time.Now().Add(signalParkHorizon), recheck: uuid.New()}, "claim", 0)
 	if remaining := time.Until(parked); remaining <= 0 || remaining > time.Minute {
 		t.Fatalf("unbounded park: %s", remaining)
 	}
