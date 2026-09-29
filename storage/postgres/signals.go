@@ -45,9 +45,9 @@ import (
 )
 
 const (
-	// signalFlushInterval batches post-commit signals before notifying.
-	// Bounds the per-process NOTIFY rate at ~20/sec/channel no matter the
-	// activity throughput, and bounds the added wake-up latency.
+	// signalFlushInterval is the minimum gap between signal flushes: it
+	// bounds the per-process NOTIFY rate at ~20/sec/channel whatever the
+	// throughput, and the wake-up latency it adds.
 	signalFlushInterval = 50 * time.Millisecond
 
 	// workWaitProbe is how often a parked Dequeue re-probes the table while
@@ -116,13 +116,19 @@ func (s *signaler) send(m signalMsg) {
 	}
 }
 
+// run flushes at most once per signalFlushInterval, and only when there is
+// something to send: an idle backend has no timer running at all.
 func (s *signaler) run(ctx context.Context) {
 	defer close(s.done)
-	ticker := time.NewTicker(signalFlushInterval)
-	defer ticker.Stop()
-
-	var workPending bool
-	resultIDs := make(map[uuid.UUID]struct{})
+	var (
+		workPending bool
+		resultIDs   = make(map[uuid.UUID]struct{})
+		lastFlush   time.Time
+		timer       = time.NewTimer(0)
+		due         <-chan time.Time // non-nil while a flush is scheduled
+	)
+	timer.Stop()
+	defer timer.Stop()
 
 	flush := func() {
 		if !workPending && len(resultIDs) == 0 {
@@ -152,6 +158,7 @@ func (s *signaler) run(ctx context.Context) {
 		}
 		workPending = false
 		clear(resultIDs)
+		lastFlush = time.Now()
 	}
 
 	for {
@@ -166,7 +173,12 @@ func (s *signaler) run(ctx context.Context) {
 			case sigResult:
 				resultIDs[m.id] = struct{}{}
 			}
-		case <-ticker.C:
+			if due == nil {
+				timer.Reset(max(signalFlushInterval-time.Since(lastFlush), 0))
+				due = timer.C
+			}
+		case <-due:
+			due = nil
 			flush()
 		}
 	}
@@ -355,6 +367,8 @@ func (b *PostgresBackend) WaitForResult(ctx context.Context, activityID uuid.UUI
 	w := b.getWatcher()
 	ch := w.registerResult(activityID)
 	defer w.unregisterResult(activityID, ch)
+	fallback := time.NewTimer(resultWaitFallback)
+	defer fallback.Stop()
 
 	for {
 		// Check after registering so a result committed between the check and
@@ -367,11 +381,12 @@ func (b *PostgresBackend) WaitForResult(ctx context.Context, activityID uuid.UUI
 			return res, nil
 		}
 
+		fallback.Reset(resultWaitFallback)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-ch:
-		case <-time.After(resultWaitFallback):
+		case <-fallback.C:
 		}
 	}
 }

@@ -761,6 +761,8 @@ func (b *PostgresBackend) waitForClaim(ctx context.Context, maxBlock time.Durati
 	w := b.getWatcher()
 	ch := w.registerWork()
 	defer w.unregisterWork(ch)
+	probeTimer := time.NewTimer(workWaitProbe)
+	defer probeTimer.Stop()
 
 	for {
 		// Re-probe after registering so a signal emitted between the previous
@@ -772,11 +774,12 @@ func (b *PostgresBackend) waitForClaim(ctx context.Context, maxBlock time.Durati
 		if remaining <= 0 {
 			return nil
 		}
+		probeTimer.Reset(min(remaining, workWaitProbe))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ch:
-		case <-time.After(min(remaining, workWaitProbe)):
+		case <-probeTimer.C:
 		}
 	}
 }
