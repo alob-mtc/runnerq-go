@@ -137,6 +137,7 @@ before `Start`.
 
 The engine is also an `executor.Notifier`: `engine.Changed()` returns a
 channel closed at its next change (an activity starting or finishing, or a
-drain beginning). `executor.Report` is the loop the agent and the adapter
-use to report on an interval and soon after changes, spaced by a minimum
-gap so a busy worker doesn't flood its destination.
+drain beginning). `executor.Report` reports on an interval and soon after
+changes, spaced by a minimum gap so a busy worker doesn't flood its
+destination. The Cloud agent reports through it, and an `executor.Observer`
+can too.
