@@ -47,6 +47,9 @@ func (s *Signal) Notify() {
 // in the next report. interval is read before each wait, so it may change.
 func Report(ctx context.Context, src Source, interval func() time.Duration, minGap time.Duration, send func()) {
 	n, _ := src.(Notifier)
+	timer := time.NewTimer(0)
+	timer.Stop()
+	defer timer.Stop()
 	for {
 		// Taken before the send, so a change during it isn't missed.
 		var changed <-chan struct{}
@@ -55,20 +58,17 @@ func Report(ctx context.Context, src Source, interval func() time.Duration, minG
 		}
 		send()
 		sent := time.Now()
-		next := time.NewTimer(interval())
+		timer.Reset(interval())
 		select {
 		case <-ctx.Done():
-			next.Stop()
 			return
-		case <-next.C:
+		case <-timer.C:
 		case <-changed:
-			next.Stop()
-			gap := time.NewTimer(time.Until(sent.Add(minGap)))
+			timer.Reset(time.Until(sent.Add(minGap)))
 			select {
 			case <-ctx.Done():
-				gap.Stop()
 				return
-			case <-gap.C:
+			case <-timer.C:
 			}
 		}
 	}

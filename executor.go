@@ -317,8 +317,6 @@ func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) 
 		if b.idempotencyKey != nil {
 			idempKey = &IdempotencyConfig{Key: idempotencyStorageKey(b.idempotencyKey.Key, b.activityType), Behavior: b.idempotencyKey.Behavior}
 		}
-		metadata := make(map[string]string)
-		maps.Copy(metadata, b.metadata)
 		option = &ActivityOption{
 			Priority:             b.priority,
 			MaxRetries:           maxRetries,
@@ -326,7 +324,7 @@ func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) 
 			MaxRetryDelaySeconds: maxRetryDelaySec,
 			DelaySeconds:         delaySec,
 			IdempotencyKey:       idempKey,
-			Metadata:             metadata,
+			Metadata:             b.metadata, // newActivity copies it
 		}
 	}
 
