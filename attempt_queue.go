@@ -3,6 +3,7 @@ package runnerq
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/alob-mtc/runnerq-go/storage"
@@ -68,12 +69,15 @@ func (q *attemptQueue) EnqueueIdempotent(ctx context.Context, a *activity) (*sto
 
 // heartbeat renews the claim every interval until ctx ends (the handler
 // returned or ran out its timeout) or the claim turns out to be lost, in which
-// case it calls revoke with the ErrClaimLost error and exits. A renewal that
+// case it calls revoke with the ErrClaimLost error and stops. A renewal that
 // merely fails is retried on the next beat: the lease already covers the
-// handler's whole timeout, so an outage shorter than that costs nothing. The
-// returned stop blocks until the goroutine has exited, so no renewal can race
-// the acknowledgement that follows — a beat landing after the ack would find
-// the claim released and misreport it as lost.
+// handler's whole timeout, so an outage shorter than that costs nothing.
+//
+// Beats run on a timer rather than a goroutine per activity, so an activity
+// shorter than one interval costs one timer. The returned stop waits for a
+// beat in progress, so no renewal can race the acknowledgement that follows:
+// a beat landing after the ack would find the claim released and misreport it
+// as lost.
 func (q *attemptQueue) heartbeat(ctx context.Context, interval time.Duration, revoke context.CancelCauseFunc) (stop func()) {
 	if _, ok := q.backend.(storage.AttemptLeaseStorage); !ok {
 		return func() {}
@@ -86,34 +90,39 @@ func (q *attemptQueue) heartbeat(ctx context.Context, interval time.Duration, re
 		metrics = NoopMetrics{}
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-			attempt, attemptCancel := context.WithTimeout(ctx, storageAttemptTimeout)
-			err := q.renew(attempt)
-			attemptCancel()
-			if err == nil || ctx.Err() != nil {
-				continue
-			}
+	var (
+		mu      sync.Mutex // held by a running beat; stop waits on it
+		stopped bool
+		timer   *time.Timer
+	)
+	beat := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if stopped || ctx.Err() != nil {
+			return
+		}
+		attempt, attemptCancel := context.WithTimeout(ctx, storageAttemptTimeout)
+		err := q.renew(attempt)
+		attemptCancel()
+		if err != nil && ctx.Err() == nil {
 			if se, ok := storage.IsStorageError(err); ok && se.Kind == storage.ErrClaimLost {
 				revoke(err)
 				return
 			}
-			metrics.IncCounter("activity_heartbeat_failed", 1)
+			metrics.IncCounter(metricHeartbeatFailed, 1)
 			slog.Warn("Could not renew activity claim; retrying on the next heartbeat", "activity_id", q.owner, "error", err)
 		}
-	}()
+		timer.Reset(interval)
+	}
+	mu.Lock()
+	timer = time.AfterFunc(interval, beat)
+	mu.Unlock()
 	return func() {
 		cancel()
-		<-done
+		mu.Lock()
+		stopped = true
+		timer.Stop()
+		mu.Unlock()
 	}
 }
 

@@ -55,10 +55,7 @@ type WorkerEngine struct {
 	// awaitGrace overrides awaitParkGrace; zero uses it.
 	awaitGrace time.Duration
 
-	// inflight tracks the activities this engine is executing (id ->
-	// InFlightActivity) for live executor state.
-	inflight  sync.Map
-	revokers  sync.Map  // id -> context.CancelCauseFunc of the running handler
+	inflight  sync.Map  // id -> *running: the activities executing here
 	startedAt time.Time // guarded by mu; zero until Start
 
 	// counts counts the metrics the engine emits for Snapshot, and passes
@@ -80,11 +77,11 @@ type WorkerEngine struct {
 // would notice within a heartbeat interval anyway; this makes it immediate
 // when the command lands on the executor running the activity.
 func (e *WorkerEngine) Interrupt(activityID uuid.UUID) bool {
-	v, ok := e.revokers.Load(activityID)
+	v, ok := e.inflight.Load(activityID)
 	if !ok {
 		return false
 	}
-	v.(context.CancelCauseFunc)(&storage.StorageError{
+	v.(*running).revoke(&storage.StorageError{
 		Kind: storage.ErrClaimLost, Message: fmt.Sprintf("activity %s was cancelled", activityID),
 	})
 	return true
@@ -98,11 +95,17 @@ type InFlightActivity struct {
 	StartedAt time.Time
 }
 
+// running is an activity executing here and the cancel that interrupts it.
+type running struct {
+	InFlightActivity
+	revoke context.CancelCauseFunc
+}
+
 // InFlight returns the activities this engine is executing, oldest first.
 func (e *WorkerEngine) InFlight() []InFlightActivity {
 	var out []InFlightActivity
 	e.inflight.Range(func(_, v any) bool {
-		out = append(out, v.(InFlightActivity))
+		out = append(out, v.(*running).InFlightActivity)
 		return true
 	})
 	slices.SortFunc(out, func(a, b InFlightActivity) int { return a.StartedAt.Compare(b.StartedAt) })
@@ -666,10 +669,19 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 		return
 	}
 
+	activityTimeout := time.Duration(act.TimeoutSeconds) * time.Second
+	deadlineCtx, timeoutCancel := context.WithTimeout(ctx, activityTimeout)
+	defer timeoutCancel()
+	// revoke cancels the handler early when the heartbeat finds the claim
+	// lost (or Interrupt is called); context.Cause then reports the
+	// ErrClaimLost error.
+	timeoutCtx, revoke := context.WithCancelCause(deadlineCtx)
+	defer revoke(nil)
+
 	now := time.Now().UTC()
-	e.inflight.Store(activityID, InFlightActivity{
+	e.inflight.Store(activityID, &running{InFlightActivity{
 		ID: activityID, Type: activityType, Attempt: int(act.RetryCount) + 1, StartedAt: now,
-	})
+	}, revoke})
 	e.metrics.IncCounter(metricStarted, 1)
 	e.metrics.ObserveDuration(metricClaimLag, claimLag(act, now))
 	e.changes.Notify()
@@ -677,16 +689,6 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 		e.inflight.Delete(activityID)
 		e.changes.Notify()
 	}()
-
-	activityTimeout := time.Duration(act.TimeoutSeconds) * time.Second
-	deadlineCtx, timeoutCancel := context.WithTimeout(ctx, activityTimeout)
-	defer timeoutCancel()
-	// revoke cancels the handler early when the heartbeat finds the claim
-	// lost; context.Cause then reports the ErrClaimLost error.
-	timeoutCtx, revoke := context.WithCancelCause(deadlineCtx)
-	defer revoke(nil)
-	e.revokers.Store(activityID, revoke)
-	defer e.revokers.Delete(activityID)
 	// Carrying the attempt queue marks the context as handler-scoped, so
 	// in-handler GetResult calls may yield-park this activity; awaits outside
 	// a handler block normally.
@@ -719,7 +721,7 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	// rejected by the fence anyway.
 	if cause := context.Cause(timeoutCtx); cause != nil {
 		if se, ok := storage.IsStorageError(cause); ok && se.Kind == storage.ErrClaimLost {
-			e.metrics.IncCounter("activity_claim_lost", 1)
+			e.metrics.IncCounter(metricClaimLost, 1)
 			slog.Warn("Activity execution lost its claim; handler was cancelled", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "error", cause)
 			return
 		}
@@ -741,7 +743,7 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 		return
 	}
 	if se, ok := storage.IsStorageError(handlerErr); ok && se.Kind == storage.ErrClaimLost {
-		e.metrics.IncCounter("activity_claim_lost", 1)
+		e.metrics.IncCounter(metricClaimLost, 1)
 		slog.Warn("Activity execution lost its claim", "activity_id", activityID, "error", handlerErr)
 		return
 	}
@@ -791,13 +793,13 @@ func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result 
 	if err != nil {
 		counter := "activity_completion_error"
 		if se, ok := storage.IsStorageError(err); ok && se.Kind == storage.ErrClaimLost {
-			counter = "activity_claim_lost"
+			counter = metricClaimLost
 		}
 		e.metrics.IncCounter(counter, 1)
 		slog.Error("Failed to confirm activity completion", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "error", err)
 		return
 	}
-	e.metrics.IncCounter("activity_completed", 1)
+	e.metrics.IncCounter(metricCompleted, 1)
 	slog.Info("Activity completed successfully", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType)
 }
 
@@ -864,7 +866,7 @@ func (e *WorkerEngine) handleYield(ctx context.Context, act *activity, ys *yield
 
 func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity, handler ActivityHandler, payload json.RawMessage, reason string, workerLabel string, workerID int) {
 	activityID, activityType := act.ID, act.ActivityType
-	e.metrics.IncCounter("activity_retry", 1)
+	e.metrics.IncCounter(metricRetried, 1)
 	slog.Warn("Activity requesting retry", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "reason", reason)
 
 	deadLettered, err := e.persistFailure(ctx, act, reason, true, workerLabel)
@@ -879,7 +881,7 @@ func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity
 
 func (e *WorkerEngine) handleNonRetryableFailure(ctx context.Context, act *activity, reason string, workerLabel string, workerID int) {
 	activityID, activityType := act.ID, act.ActivityType
-	e.metrics.IncCounter("activity_failed_non_retry", 1)
+	e.metrics.IncCounter(metricFailed, 1)
 	slog.Error("Activity failed", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "reason", reason)
 
 	// The error result row is written inside the AckFailure transaction by the
@@ -891,7 +893,7 @@ func (e *WorkerEngine) handleNonRetryableFailure(ctx context.Context, act *activ
 
 func (e *WorkerEngine) handleTimeout(ctx context.Context, act *activity, handler ActivityHandler, payload json.RawMessage, workerLabel string, workerID int, timeout time.Duration) {
 	activityID, activityType := act.ID, act.ActivityType
-	e.metrics.IncCounter("activity_timeout", 1)
+	e.metrics.IncCounter(metricTimedOut, 1)
 	errorMsg := "Activity execution timed out"
 	slog.Error("Activity timed out", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "timeout", timeout)
 
