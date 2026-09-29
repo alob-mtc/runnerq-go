@@ -1,13 +1,9 @@
 // Package conductor connects a worker process to RunnerQ Cloud.
 //
-// The agent dials out to the Cloud gateway over a WebSocket and answers its
-// requests — queue stats, activity reads, signals — by running them against
-// the engine's own storage backend. The Cloud never connects into your
-// network and never holds database credentials.
-//
-// The agent is off the execution path: if the Cloud is unreachable, or the
-// agent fails, activities keep running. It reconnects on its own with
-// exponential backoff.
+// The agent dials out over a WebSocket and answers the Cloud's requests from
+// the engine's own storage backend; the Cloud never connects in and never
+// holds database credentials. It is off the execution path: activities keep
+// running if the Cloud or the agent fails, and it reconnects with backoff.
 //
 //	engine, _ := runnerq.Builder().Backend(backend).Build()
 //	agent, err := conductor.Start(ctx, engine, conductor.Config{
@@ -15,15 +11,13 @@
 //		APIKey: os.Getenv("RUNNERQ_CONDUCTOR_KEY"),
 //	})
 //	if err != nil { ... }
-//	defer agent.Close(context.Background()) // runs before the engine stops
+//	defer agent.Close(context.Background())
 //	engine.Start(ctx)
 //
-// Services that hold a backend themselves, such as RunnerQ Cloud's data
-// plane for hosted stores, answer the same requests with a Handler, without
-// a worker or a connection.
+// Services that hold a backend themselves (RunnerQ Cloud's data plane)
+// answer the same requests with a Handler, without a worker or connection.
 //
-// The wire protocol is specified in the runnerq-cloud repository
-// (docs/protocol.md).
+// The wire protocol is specified in runnerq-cloud's docs/protocol.md.
 package conductor
 
 import (
@@ -56,33 +50,30 @@ const (
 	maxMessageBytes  = 4 << 20
 	// defaultReportInterval applies until the Cloud sets one.
 	defaultReportInterval = 15 * time.Second
-	// reportMinGap spaces the reports an executor's changes trigger.
+	// reportMinGap rate-limits change-triggered reports.
 	reportMinGap = time.Second
 )
 
 // Config configures the agent.
 type Config struct {
-	// URL is the Cloud gateway, e.g. "wss://cloud.runnerq.dev". The agent
-	// path (/v1/agent) is appended when missing; http(s) schemes are mapped
-	// to ws(s).
+	// URL is the Cloud gateway, e.g. "wss://cloud.runnerq.dev". /v1/agent is
+	// appended when missing; http(s) maps to ws(s).
 	URL string
-	// APIKey authenticates the app. It is sent in the Authorization header,
-	// never in the URL.
+	// APIKey authenticates the app. It is sent only in the Authorization
+	// header, never in the URL.
 	APIKey string
 	// AllowControl lets the Cloud run commands (cancel, retry, run now,
-	// reschedule, set priority, delete, signal). Off by default: the agent
-	// is read-only and advertises no commands.
+	// reschedule, set priority, delete, signal). Off by default: read-only.
 	AllowControl bool
-	// MetadataOnly strips payloads, results, errors and event details from
-	// every response, whatever mode the Cloud asks for.
+	// MetadataOnly withholds payloads, results, errors and event details
+	// whatever mode the Cloud asks for; the Cloud cannot relax it.
 	MetadataOnly bool
-	// Labels are free-form executor tags (region, deploy version) the Cloud
-	// can filter and group executors by. They're added to the engine's own
-	// (WorkerConfig.Labels), and win on a clash; prefer those, which every
-	// way of reporting to the Cloud carries.
+	// Labels are executor tags (region, deploy version) the Cloud filters and
+	// groups by, merged over WorkerConfig.Labels. Prefer WorkerConfig.Labels,
+	// which every way of reporting to the Cloud carries.
 	Labels map[string]string
-	// MaxConcurrentRequests bounds requests served at once (default 16).
-	// Requests beyond it are answered "resource_exhausted" instead of queueing.
+	// MaxConcurrentRequests bounds requests served at once (default 16);
+	// excess requests get "resource_exhausted" rather than queueing.
 	MaxConcurrentRequests int
 	// RequestTimeout bounds one request (default 30s).
 	RequestTimeout time.Duration
@@ -149,16 +140,13 @@ type Agent struct {
 	sessionID string
 	closing   bool
 
-	connected atomic.Bool
-	// reportEvery is the executor.report interval the Cloud asked for.
-	reportEvery atomic.Int64
-	// peerFrameLimit is the Cloud's max frame size for this session.
+	connected      atomic.Bool
+	reportEvery    atomic.Int64
 	peerFrameLimit atomic.Int64
 }
 
-// Start validates cfg and connects in the background. It returns without
-// waiting for the Cloud: an unreachable Cloud never delays the worker. The
-// agent stops when ctx ends or Close is called.
+// Start validates cfg and connects in the background, so an unreachable
+// Cloud never delays the worker. The agent stops when ctx ends or on Close.
 func Start(ctx context.Context, engine *runnerq.WorkerEngine, cfg Config) (*Agent, error) {
 	if engine == nil {
 		return nil, errors.New("conductor: engine is required")
@@ -188,9 +176,9 @@ func Start(ctx context.Context, engine *runnerq.WorkerEngine, cfg Config) (*Agen
 // Connected reports whether the agent currently has a Cloud session.
 func (a *Agent) Connected() bool { return a.connected.Load() }
 
-// Close tells the Cloud this executor is shutting down (so it is recorded as
-// a deploy, not a crash), closes the connection and waits for the agent to
-// stop or ctx to end. Call it before stopping the engine.
+// Close says goodbye (so the Cloud records a deploy, not a crash), closes
+// the connection and waits for the agent to stop or ctx to end. Call it
+// before stopping the engine.
 func (a *Agent) Close(ctx context.Context) error {
 	a.mu.Lock()
 	a.closing = true
@@ -205,8 +193,8 @@ func (a *Agent) Close(ctx context.Context) error {
 	}
 }
 
-// goodbye ends the current session cleanly, once: whichever of Close and a
-// cancelled Start context gets here first takes the connection.
+// goodbye runs once per session: whichever of Close and a cancelled Start
+// context gets here first takes the connection.
 func (a *Agent) goodbye(ctx context.Context) {
 	a.mu.Lock()
 	a.closing = true
@@ -218,7 +206,6 @@ func (a *Agent) goodbye(ctx context.Context) {
 	}
 }
 
-// sayGoodbye sends the graceful-shutdown event and closes conn normally.
 func sayGoodbye(ctx context.Context, conn *websocket.Conn) {
 	if evt, err := newEvent(typeGoodbye, goodbye{Reason: "shutdown"}); err == nil {
 		wctx, cancel := context.WithTimeout(ctx, writeTimeout)
@@ -228,7 +215,6 @@ func sayGoodbye(ctx context.Context, conn *websocket.Conn) {
 	_ = conn.Close(websocket.StatusNormalClosure, "shutdown")
 }
 
-// run keeps a session open until the agent stops.
 func (a *Agent) run(ctx context.Context) {
 	defer close(a.done)
 	delay := a.cfg.MinReconnectDelay
@@ -275,12 +261,9 @@ func jitter(d time.Duration) time.Duration {
 	return d/2 + rand.N(d)
 }
 
-// session dials, completes the handshake and serves requests until the
-// connection ends.
 func (a *Agent) session(ctx context.Context) error {
-	// The handshake is not cut short by Close: a Close that lands mid-way
-	// waits (bounded by handshakeTimeout) and then says goodbye below, so the
-	// Cloud never records a clean stop as a crash.
+	// Close doesn't cut the handshake short: it waits (up to handshakeTimeout)
+	// and says goodbye below, so a clean stop is never recorded as a crash.
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), handshakeTimeout)
 	defer cancel()
 	conn, res, err := websocket.Dial(dctx, a.url, &websocket.DialOptions{
@@ -308,8 +291,7 @@ func (a *Agent) session(ctx context.Context) error {
 
 	a.mu.Lock()
 	if a.closing {
-		// Close ran during the handshake and found no connection to say
-		// goodbye on; do it here so the Cloud still records a clean stop.
+		// Close ran during the handshake and found no connection to use.
 		a.mu.Unlock()
 		sayGoodbye(context.WithoutCancel(ctx), conn)
 		return nil
@@ -326,8 +308,7 @@ func (a *Agent) session(ctx context.Context) error {
 	}()
 
 	// The session outlives ctx just long enough to say goodbye: a read whose
-	// context ends closes the connection at once, which the Cloud would
-	// record as a crash rather than a clean stop.
+	// context ends closes the connection at once, which reads as a crash.
 	sctx, stop := context.WithCancel(context.WithoutCancel(ctx))
 	defer stop()
 	go func() {
@@ -398,8 +379,7 @@ func (a *Agent) handshake(ctx context.Context, conn *websocket.Conn) (welcome, e
 	return w, nil
 }
 
-// pingLoop detects a dead gateway: the connection is closed when a ping goes
-// unanswered.
+// pingLoop closes the connection when a ping goes unanswered (dead gateway).
 func (a *Agent) pingLoop(ctx context.Context, conn *websocket.Conn) {
 	t := time.NewTicker(pingInterval)
 	defer t.Stop()
@@ -419,8 +399,8 @@ func (a *Agent) pingLoop(ctx context.Context, conn *websocket.Conn) {
 	}
 }
 
-// applyConfig applies the Cloud's session settings. The local MetadataOnly
-// setting cannot be relaxed by the Cloud.
+// applyConfig applies the Cloud's session settings; the Cloud can tighten
+// data mode but never relax a local MetadataOnly.
 func (a *Agent) applyConfig(c sessionConfig) {
 	if c.DataMode != "" {
 		a.h.cloudMetadataOnly.Store(c.DataMode == dataModeMetadataOnly)
@@ -430,8 +410,7 @@ func (a *Agent) applyConfig(c sessionConfig) {
 	}
 }
 
-// reportLoop pushes executor.report on connect and then at the interval the
-// Cloud asked for, so dashboards do not poll.
+// reportLoop pushes executor.report so dashboards don't poll.
 func (a *Agent) reportLoop(ctx context.Context, conn *websocket.Conn) {
 	every := func() time.Duration { return time.Duration(a.reportEvery.Load()) }
 	executor.Report(ctx, a.engine, every, reportMinGap, func() {
@@ -452,8 +431,8 @@ func (a *Agent) readLoop(ctx context.Context, conn *websocket.Conn, st *streams)
 	}
 	var wg sync.WaitGroup
 	defer wg.Wait()
-	// In-flight requests are abandoned once the connection is gone: nobody
-	// is left to read their responses.
+	// In-flight requests are abandoned with the connection: nobody is left
+	// to read their responses.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	for {
@@ -488,8 +467,8 @@ func (a *Agent) readLoop(ctx context.Context, conn *websocket.Conn, st *streams)
 	}
 }
 
-// serve runs one request and builds its response. A panicking handler is
-// reported as an internal error; it never takes down the worker.
+// serve recovers a panicking handler as an internal error so it never takes
+// down the worker.
 func (a *Agent) serve(ctx context.Context, req envelope, session map[string]handlerFunc) (res envelope) {
 	defer func() {
 		if p := recover(); p != nil {

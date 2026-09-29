@@ -15,17 +15,15 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// Event streams tail the event log through QueryStorage and push batches to
-// the Cloud as stream.events. They are resumable: a subscription starts
-// after a cursor, so when the Cloud moves the stream to another executor it
-// loses nothing.
+// Event streams tail the event log via QueryStorage and push stream.events
+// batches. They resume after a cursor, so the Cloud can move a stream to
+// another executor without loss.
 //
-// Event ids grow in insertion order but a transaction can commit late,
-// surfacing an event below ids already delivered. Each poll therefore
-// rescans the streamRescan ids below the cursor and sends only ids it has
-// not sent. A subscription resuming after a cursor treats that window as
-// already sent, so a failover does not replay it. Delivery is at least once
-// in edge cases, so consumers dedupe by event id.
+// Ids grow in insertion order, but a late-committing transaction can surface
+// an event below ids already sent, so each poll rescans the streamRescan ids
+// below the cursor and sends only unsent ones. A resumed subscription treats
+// that window as already sent, so failover doesn't replay it. Delivery is at
+// least once in edge cases; consumers dedupe by event id.
 
 const (
 	maxSubscriptions   = 4
@@ -33,12 +31,10 @@ const (
 	maxStreamBatch     = 1000
 	defaultStreamDelay = 500 * time.Millisecond
 	minStreamDelay     = 50 * time.Millisecond
-	// streamRescan is how many ids below the cursor each poll looks at
-	// again for late commits.
-	streamRescan = 256
+	streamRescan       = 256
 )
 
-// streams holds one session's subscriptions; they end with the session.
+// streams holds one session's subscriptions, which end with the session.
 type streams struct {
 	a    *Agent
 	conn *websocket.Conn
@@ -52,7 +48,6 @@ func newStreams(a *Agent, conn *websocket.Conn) *streams {
 	return &streams{a: a, conn: conn, subs: map[string]context.CancelFunc{}}
 }
 
-// close stops every subscription and waits for them.
 func (s *streams) close() {
 	s.mu.Lock()
 	for _, cancel := range s.subs {
@@ -98,7 +93,7 @@ func (s *streams) subscribe(ctx context.Context, data json.RawMessage) (any, err
 		}
 	}
 	if req.AfterCursor == "" || gap {
-		// Validate the filter and find the log's end in one query.
+		// Validates the filter and finds the log's end in one query.
 		last, err := qs.QueryEvents(ctx, storage.EventQuery{Filter: filter, Desc: true, Limit: 1})
 		if err != nil {
 			return nil, err
@@ -122,8 +117,8 @@ func (s *streams) subscribe(ctx context.Context, data json.RawMessage) (any, err
 	s.mu.Unlock()
 
 	t := &tailer{s: s, id: id, filter: filter, batch: batch, delay: delay, cursor: cursor, sent: map[int64]bool{}}
-	// What is already in the window below the start was delivered before (or
-	// predates the subscription): only late commits into it are new.
+	// The window below the start was already delivered (or predates the
+	// subscription): only late commits into it are new.
 	if seen, err := t.window(ctx, false); err == nil {
 		for _, ev := range seen {
 			t.sent[ev.ID] = true
@@ -155,7 +150,6 @@ func (s *streams) unsubscribe(_ context.Context, data json.RawMessage) (any, err
 	return struct{}{}, nil
 }
 
-// tailer is one subscription's poll loop.
 type tailer struct {
 	s      *streams
 	id     string
@@ -163,9 +157,7 @@ type tailer struct {
 	batch  int
 	delay  time.Duration
 	cursor int64
-	// sent holds ids delivered within the rescan window, so a rescan never
-	// repeats them.
-	sent map[int64]bool
+	sent   map[int64]bool // ids delivered within the rescan window
 }
 
 func (t *tailer) run(ctx context.Context) {
@@ -212,7 +204,6 @@ func (t *tailer) query(ctx context.Context, after, upTo int64, limit int, detail
 	return page.Items, nil
 }
 
-// window reads the rescan window below the cursor.
 func (t *tailer) window(ctx context.Context, detail bool) ([]storage.EventRecord, error) {
 	if t.cursor <= 0 {
 		return nil, nil
@@ -220,8 +211,8 @@ func (t *tailer) window(ctx context.Context, detail bool) ([]storage.EventRecord
 	return t.query(ctx, max(t.cursor-streamRescan, 0), t.cursor, streamRescan, detail)
 }
 
-// poll sends late commits found in the rescan window and the next batch
-// past the cursor, and reports whether that batch was full.
+// poll sends late commits in the rescan window plus the next batch past the
+// cursor, and reports whether that batch was full.
 func (t *tailer) poll(ctx context.Context) (bool, error) {
 	late, err := t.window(ctx, true)
 	if err != nil {
@@ -248,12 +239,10 @@ func (t *tailer) poll(ctx context.Context) (bool, error) {
 	return len(fresh) == t.batch, nil
 }
 
-// send pushes events as stream.events frames that each fit the Cloud's frame
-// limit (an oversized frame would drop the session, and the resumed stream
-// would read the same batch again). An event counts as sent, and moves the
-// cursor, only once its frame is written, so each frame's cursor covers what
-// the Cloud has received. An event too large for a frame by itself goes
-// without its detail.
+// send splits events into frames within the Cloud's frame limit (an
+// oversized frame would drop the session and the resumed stream would reread
+// the same batch). Events count as sent, and move the cursor, only once their
+// frame is written. An event too large for a frame alone loses its detail.
 func (t *tailer) send(ctx context.Context, events []storage.EventRecord) error {
 	budget := int(t.s.a.peerFrameLimit.Load()) - 1024 // the margin serve leaves too
 	var (
@@ -308,11 +297,10 @@ func encodedSize(v any) int {
 	return len(b)
 }
 
-// push writes one frame for the subscription. The write doesn't take the
-// subscription's context: coder/websocket closes the whole connection when a
-// write's context ends mid-write, so an unsubscribe landing during a push
-// would drop the session. A subscription that has ended stops before
-// writing; the write itself is bounded by writeTimeout.
+// push doesn't write under the subscription's context: coder/websocket
+// closes the whole connection when a write's context ends mid-write, so an
+// unsubscribe during a push would drop the session. An ended subscription
+// stops before writing; the write is bounded by writeTimeout.
 func (t *tailer) push(ctx context.Context, msgType string, data any) error {
 	if err := ctx.Err(); err != nil {
 		return err

@@ -6,15 +6,14 @@ import (
 	"time"
 )
 
-// Notifier is a Source that says when its state changes: an activity
-// starts or finishes, or a drain begins. Changed returns a channel that is
-// closed at the next change after the call, so a reporter can report soon
-// after a change rather than at its next interval. The engine is one.
+// Notifier is implemented by a Source (such as the engine) that signals
+// state changes: an activity starts or finishes, or a drain begins. Changed
+// returns a channel closed at the next change after the call.
 type Notifier interface {
 	Changed() <-chan struct{}
 }
 
-// Signal tells any number of waiters about changes. The zero value is
+// Signal implements Notifier for any number of waiters. The zero value is
 // ready to use.
 type Signal struct {
 	mu sync.Mutex
@@ -41,17 +40,17 @@ func (s *Signal) Notify() {
 	}
 }
 
-// Report calls send now, then every interval, until ctx ends. When src is
-// a Notifier it also sends soon after each change, but never sooner than
-// minGap after the previous send: changes in the meantime go out together
-// in the next report. interval is read before each wait, so it may change.
+// Report calls send now and then every interval() until ctx ends. When src
+// is a Notifier it also sends after each change, but no sooner than minGap
+// after the previous send, so bursts coalesce. interval is re-read each
+// round, so it may change.
 func Report(ctx context.Context, src Source, interval func() time.Duration, minGap time.Duration, send func()) {
 	n, _ := src.(Notifier)
 	timer := time.NewTimer(0)
 	timer.Stop()
 	defer timer.Stop()
 	for {
-		// Taken before the send, so a change during it isn't missed.
+		// Taken before send so a change during it isn't missed.
 		var changed <-chan struct{}
 		if n != nil {
 			changed = n.Changed()

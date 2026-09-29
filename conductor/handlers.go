@@ -19,24 +19,21 @@ import (
 // maxEmbedded bounds steps and events embedded in activities.get.
 const maxEmbedded = 1000
 
-// handlerFunc serves one request type. Returning a *wireError picks the error
-// code; other errors are mapped by toWireError.
+// handlerFunc returns a *wireError to pick the error code; other errors go
+// through toWireError.
 type handlerFunc func(ctx context.Context, data json.RawMessage) (any, error)
 
-// handlers serves protocol requests from the engine's storage.
 type handlers struct {
-	// engine is nil in a Handler, which serves storage without a worker.
-	engine  *runnerq.WorkerEngine
+	engine  *runnerq.WorkerEngine // nil in a Handler
 	backend storage.Storage
 	// queue is the queue commands act on.
-	queue string
-	qs    storage.QueryStorage   // nil when the backend has no QueryStorage
-	cs    storage.CommandStorage // nil when the backend has no CommandStorage
-	// allowControl lets the Cloud run commands.
+	queue        string
+	qs           storage.QueryStorage   // nil when unsupported
+	cs           storage.CommandStorage // nil when unsupported
 	allowControl bool
-	// forceMetadataOnly is the local setting; it always wins.
+	// forceMetadataOnly is the local setting; it always wins over
+	// cloudMetadataOnly (welcome/config.update).
 	forceMetadataOnly bool
-	// cloudMetadataOnly is the Cloud's current setting (welcome/config.update).
 	cloudMetadataOnly atomic.Bool
 	started           time.Time
 }
@@ -72,8 +69,6 @@ var (
 	getIncludes    = []string{"events", "last_error", "payload", "result", "steps"}
 )
 
-// capabilities describes what this agent serves, from the backend's own
-// query capabilities.
 func (h *handlers) capabilities() map[string]capability {
 	caps := map[string]capability{typeExecutorDescribe: {V: 1}}
 	h.commandCapabilities(caps)
@@ -98,8 +93,6 @@ func (h *handlers) capabilities() map[string]capability {
 	return caps
 }
 
-// --- decoding and mapping ---
-
 func decode[T any](data json.RawMessage) (T, error) {
 	var v T
 	if len(data) == 0 {
@@ -113,7 +106,7 @@ func decode[T any](data json.RawMessage) (T, error) {
 	return v, nil
 }
 
-// toStorageFilter converts a wire filter; values keep their JSON types.
+// toStorageFilter keeps filter values in their JSON types.
 func toStorageFilter(f *wireFilter) (*storage.QueryFilter, error) {
 	if f == nil {
 		return nil, nil
@@ -148,8 +141,7 @@ func toStorageFilter(f *wireFilter) (*storage.QueryFilter, error) {
 	return out, nil
 }
 
-// includes validates an include list against what the message allows.
-// Anything carrying customer data is refused in metadata-only mode.
+// includes refuses anything carrying customer data in metadata-only mode.
 func (h *handlers) includes(list, allowed []string) (map[string]bool, error) {
 	out := map[string]bool{}
 	for _, inc := range list {
@@ -168,8 +160,8 @@ func recordInclude(inc map[string]bool) storage.RecordInclude {
 	return storage.RecordInclude{Payload: inc["payload"], Result: inc["result"], LastError: inc["last_error"]}
 }
 
-// parseID parses an activity id. Ids are opaque on the wire; one this
-// backend could not have issued simply does not exist.
+// parseID reports false for an id this backend could not have issued; on
+// the wire such an id simply does not exist.
 func parseID(s string) (uuid.UUID, bool) {
 	id, err := uuid.Parse(s)
 	return id, err == nil
@@ -250,8 +242,6 @@ func toEvent(e storage.EventRecord) eventView {
 		At: ts(e.At), ExecutorID: e.ExecutorID, Detail: e.Detail,
 	}
 }
-
-// --- queries ---
 
 func (h *handlers) activitiesList(ctx context.Context, data json.RawMessage) (any, error) {
 	q, err := decode[query](data)
@@ -523,16 +513,13 @@ func (h *handlers) treesGet(ctx context.Context, data json.RawMessage) (any, err
 	return treeView{RootID: tree.RootID.String(), Items: toActivities(tree.Items), Truncated: tree.Truncated}, nil
 }
 
-// --- executor ---
-
-// state is this executor's live state. withRunning adds the in-flight list
-// (describe) rather than just its size (periodic reports).
+// state includes the in-flight list when withRunning (describe), not just
+// its size (periodic reports).
 func (h *handlers) state(withRunning bool) executorState {
 	return stateOf(h.engine.Snapshot(), h.started, withRunning)
 }
 
-// stateOf is a snapshot's state on the wire. The uptime counts from started
-// when the engine hasn't started.
+// stateOf counts uptime from started when the engine hasn't started.
 func stateOf(snap executor.Snapshot, started time.Time, withRunning bool) executorState {
 	if !snap.Info.StartedAt.IsZero() {
 		started = snap.Info.StartedAt
@@ -565,9 +552,6 @@ func (h *handlers) executorDescribe(context.Context, json.RawMessage) (any, erro
 	return h.state(true), nil
 }
 
-// --- errors ---
-
-// toWireError maps a handler error onto a protocol error.
 func toWireError(err error) *wireError {
 	var we *wireError
 	if errors.As(err, &we) {
@@ -610,8 +594,8 @@ func errorMessage(err error) string {
 	return msg
 }
 
-// plainJSON is a result's data as the console reads it: the "json" part of
-// the TypeScript SDK's native superjson-v1, as storage queries give it.
+// plainJSON unwraps the "json" part of the TypeScript SDK's superjson-v1
+// results, which is what the console reads; other data passes through.
 func plainJSON(r *storage.ActivityResult) json.RawMessage {
 	if r.Serialization != "superjson-v1" {
 		return r.Data

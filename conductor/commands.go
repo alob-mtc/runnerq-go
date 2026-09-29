@@ -12,7 +12,6 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// commandKinds maps command message types to storage command kinds.
 var commandKinds = map[string]storage.CommandKind{
 	typeActivitiesCancel:      storage.CommandCancel,
 	typeActivitiesRetry:       storage.CommandRetry,
@@ -23,8 +22,6 @@ var commandKinds = map[string]storage.CommandKind{
 	typeActivitiesSignal:      storage.CommandSignal,
 }
 
-// addCommands registers the command handlers and capabilities when the
-// backend supports commands and the agent is allowed to run them.
 func (h *handlers) addCommands(t map[string]handlerFunc) {
 	if h.cs == nil || !h.allowControl {
 		return
@@ -74,15 +71,14 @@ func (h *handlers) command(kind storage.CommandKind) handlerFunc {
 		res := &storage.CommandResult{}
 		if len(req.Target.IDs) == 0 || len(cmd.Target.IDs) > 0 {
 			res, err = h.cs.ApplyCommand(ctx, cmd)
-		} // else every id was foreign: nothing for the backend to do
+		} // else every id was foreign
 		if err != nil {
 			if se, ok := storage.IsStorageError(err); ok && se.Kind == storage.ErrConflict {
 				return nil, errorf(codeConflict, "%s", se.Message)
 			}
 			return nil, err
 		}
-		// A cancelled activity this executor is running stops now rather
-		// than at its next claim heartbeat.
+		// Stop a cancelled activity running here now, not at its next heartbeat.
 		if kind == storage.CommandCancel && !cmd.DryRun && !res.Replayed && h.engine != nil {
 			for _, it := range res.Items {
 				if it.Outcome == storage.CommandApplied {
@@ -116,8 +112,7 @@ func (h *handlers) command(kind storage.CommandKind) handlerFunc {
 	}
 }
 
-// toCommand validates a command request for kind and converts it. It
-// returns the target ids that are not valid ids for this backend.
+// toCommand also returns the target ids this backend could not have issued.
 func (h *handlers) toCommand(kind storage.CommandKind, req commandRequest) (storage.Command, []string, error) {
 	cmd := storage.Command{ID: req.CommandID, Kind: kind, DryRun: req.DryRun, Reason: req.Reason}
 	if q := req.Target.Queue; q != "" && q != h.queue {
