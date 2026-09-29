@@ -288,7 +288,7 @@ type activityView struct {
 	Depth          int               `json:"depth"`
 	IdempotencyKey string            `json:"idempotency_key,omitempty"`
 	Attempt        int               `json:"attempt"`
-	MaxAttempts    int               `json:"max_attempts"`
+	MaxAttempts    int               `json:"max_attempts,omitempty"` // absent: unlimited
 	CreatedAt      string            `json:"created_at"`
 	ScheduledFor   string            `json:"scheduled_for,omitempty"`
 	StartedAt      string            `json:"started_at,omitempty"`

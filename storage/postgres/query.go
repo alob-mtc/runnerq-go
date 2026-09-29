@@ -65,13 +65,15 @@ var activityFields = map[string]queryField{
 	"depth":           {expr: "a.depth", kind: kindInt},
 	"idempotency_key": {expr: "a.idempotency_key", kind: kindString, nullable: true},
 	"attempt":         {expr: "(a.retry_count + 1)", kind: kindInt},
-	"max_attempts":    {expr: "(a.max_retries + 1)", kind: kindInt},
-	"created_at":      {expr: "a.created_at", kind: kindTime},
-	"scheduled_for":   {expr: "a.scheduled_at", kind: kindTime, nullable: true},
-	"started_at":      {expr: "a.started_at", kind: kindTime, nullable: true},
-	"completed_at":    {expr: "a.completed_at", kind: kindTime, nullable: true},
-	"updated_at":      {expr: updatedAtSQL, kind: kindTime},
-	"executor_id":     {expr: "NULLIF(split_part(a.current_worker_id, ':', 1), '')", kind: kindString, nullable: true},
+	// max_retries holds the total attempts allowed (0 is unlimited, which no
+	// number matches).
+	"max_attempts":  {expr: "NULLIF(a.max_retries, 0)", kind: kindInt},
+	"created_at":    {expr: "a.created_at", kind: kindTime},
+	"scheduled_for": {expr: "a.scheduled_at", kind: kindTime, nullable: true},
+	"started_at":    {expr: "a.started_at", kind: kindTime, nullable: true},
+	"completed_at":  {expr: "a.completed_at", kind: kindTime, nullable: true},
+	"updated_at":    {expr: updatedAtSQL, kind: kindTime},
+	"executor_id":   {expr: "NULLIF(split_part(a.current_worker_id, ':', 1), '')", kind: kindString, nullable: true},
 }
 
 var eventFields = map[string]queryField{
@@ -571,13 +573,13 @@ func activitySelect(inc storage.RecordInclude) (cols, joins string) {
 			ORDER BY e.created_at DESC, e.id DESC LIMIT 1
 		) y ON a.status = 'waiting'`
 	if inc.Payload {
-		cols += ", (SELECT i.payload FROM runnerq_inputs i WHERE i.activity_id = a.id)"
+		cols += ", (SELECT " + plainData("i.payload", "i.serialization") + " FROM runnerq_inputs i WHERE i.activity_id = a.id)"
 	}
 	if inc.LastError {
 		cols += ", a.last_error, a.last_error_at"
 	}
 	if inc.Result {
-		cols += ", r.state, r.data"
+		cols += ", r.state, " + plainData("r.data", "r.serialization")
 		joins += " LEFT JOIN runnerq_results r ON r.activity_id = a.id"
 	}
 	return cols, joins
@@ -626,7 +628,7 @@ func scanRecord(rows pgx.Rows, inc storage.RecordInclude, extra ...any) (storage
 		r.IdempotencyKey = storage.ApplicationIdempotencyKey(*idemKey, r.Type)
 	}
 	r.Attempt = int(retryCount) + 1
-	r.MaxAttempts = int(maxRetry) + 1
+	r.MaxAttempts = int(maxRetry)
 	r.Timeout = time.Duration(timeoutSeconds) * time.Second
 	if leaseMS != nil && status == "processing" {
 		t := time.UnixMilli(*leaseMS).UTC()
@@ -1045,7 +1047,7 @@ func (b *PostgresBackend) ListStepEntries(ctx context.Context, activityID uuid.U
 	}
 	data := "NULL::jsonb"
 	if includeData {
-		data = "data"
+		data = plainData("data", "serialization")
 	}
 	rows, err := b.pool.Query(ctx, fmt.Sprintf(`
 		SELECT activity_id, step, state, %s, created_at FROM runnerq_results
@@ -1129,3 +1131,11 @@ func (b *PostgresBackend) GetActivityTree(ctx context.Context, activityID uuid.U
 }
 
 var _ storage.QueryStorage = (*PostgresBackend)(nil)
+
+// plainData is a stored value as the console reads it: plain JSON as stored,
+// and the TypeScript SDK's native superjson-v1 as its "json" part (the value
+// with dates as ISO strings and the like; its "meta" only matters to the SDK
+// that decodes it).
+func plainData(data, serialization string) string {
+	return "CASE WHEN " + serialization + " = 'superjson-v1' THEN " + data + "->'json' ELSE " + data + " END"
+}

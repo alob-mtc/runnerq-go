@@ -427,15 +427,41 @@ func (b *PostgresBackend) storeResultTx(ctx context.Context, tx pgx.Tx, activity
 		stepArg = step
 	}
 	_, err := tx.Exec(ctx, `
-		INSERT INTO runnerq_results (activity_id, queue_name, state, data, created_at, owner_activity_id, step)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO runnerq_results (activity_id, queue_name, state, data, created_at, owner_activity_id, step, serialization)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (activity_id) DO UPDATE
-		SET state = $3, data = $4, created_at = $5, owner_activity_id = $6, step = $7`,
-		activityID, b.queueName, stateStr, result.Data, now, owner, stepArg)
+		SET state = $3, data = $4, created_at = $5, owner_activity_id = $6, step = $7, serialization = $8`,
+		activityID, b.queueName, stateStr, result.Data, now, owner, stepArg, storedSerialization(result.Serialization))
 	if err != nil {
 		return databaseError(err, fmt.Sprintf("Failed to store result: %v", err))
 	}
 	return b.wakeResultWaitersTx(ctx, tx, activityID)
+}
+
+// storedSerialization is the encoding column's value for s (empty is plain JSON).
+func storedSerialization(s string) string {
+	if s == "" {
+		return storage.SerializationJSON
+	}
+	return s
+}
+
+// reportedSerialization is the Serialization field for a stored encoding:
+// empty for plain JSON, so Go callers see what they always have.
+func reportedSerialization(s string) string {
+	if s == storage.SerializationJSON {
+		return ""
+	}
+	return s
+}
+
+// withFailure adds a failure's structured details (FailureKind.Details) to an
+// error result or event detail, as "failure", when there are any.
+func withFailure(kv map[string]any, details json.RawMessage) map[string]any {
+	if len(details) > 0 {
+		kv["failure"] = details
+	}
+	return kv
 }
 
 func toDetail(kv map[string]any) json.RawMessage {
@@ -520,14 +546,14 @@ func (b *PostgresBackend) enqueueInTx(ctx context.Context, tx pgx.Tx, a *storage
 			) VALUES ($1, $2, $3, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		)
 		INSERT INTO runnerq_inputs (activity_id, queue_name, payload, serialization)
-		VALUES ($1, $2, $4, 'json-v1')`,
+		VALUES ($1, $2, $4, $19)`,
 		a.ID, b.queueName, a.ActivityType, a.Payload,
 		priorityToInt(a.Priority), status, a.CreatedAt, a.ScheduledAt,
 		int32(a.RetryCount), int32(a.MaxRetries),
 		int64(a.TimeoutSeconds), int64(a.RetryDelaySeconds),
 		int64(a.MaxRetryDelaySeconds),
 		metadataJSON, idempotencyKey,
-		a.ParentActivityID, rootID, int16(a.Depth))
+		a.ParentActivityID, rootID, int16(a.Depth), storedSerialization(a.Serialization))
 	if err != nil {
 		return databaseError(err, fmt.Sprintf("Failed to enqueue activity: %v", err))
 	}
@@ -604,6 +630,7 @@ const (
 	// order scanClaim reads it.
 	claimColumnsSQL = `id, activity_type,
 			(SELECT i.payload FROM runnerq_inputs i WHERE i.activity_id = a.id),
+			(SELECT i.serialization FROM runnerq_inputs i WHERE i.activity_id = a.id),
 			priority, retry_count, max_retries,
 			timeout_seconds, retry_delay_seconds, max_retry_delay_seconds,
 			scheduled_at, metadata, idempotency_key, created_at,
@@ -653,6 +680,17 @@ const (
 	dequeueBatchSQLAllTypes  = dequeueBatchSQLHead + dequeueBatchSQLTail
 	dequeueBatchSQLOneType   = dequeueBatchSQLHead + ` AND activity_type = $5` + dequeueBatchSQLTail
 	dequeueBatchSQLManyTypes = dequeueBatchSQLHead + ` AND activity_type = ANY($5)` + dequeueBatchSQLTail
+
+	// claimPlainJSON is the encoding predicate of every claim above.
+	claimPlainJSON = `i.serialization <> 'json-v1'`
+)
+
+// The encoded batch claims (EncodedStorage) take the encodings the caller
+// reads as their last parameter instead of plain JSON alone.
+var (
+	dequeueBatchEncodedSQLAllTypes  = strings.Replace(dequeueBatchSQLAllTypes, claimPlainJSON, `i.serialization <> ALL($5::text[])`, 1)
+	dequeueBatchEncodedSQLOneType   = strings.Replace(dequeueBatchSQLOneType, claimPlainJSON, `i.serialization <> ALL($6::text[])`, 1)
+	dequeueBatchEncodedSQLManyTypes = strings.Replace(dequeueBatchSQLManyTypes, claimPlainJSON, `i.serialization <> ALL($6::text[])`, 1)
 )
 
 // scanClaim reads one claimColumnsSQL row.
@@ -661,7 +699,7 @@ func scanClaim(row pgx.Row) (storage.DequeuedActivity, error) {
 	var leaseID string
 	var leaseDeadlineMS int64
 	if err := row.Scan(
-		&ar.id, &ar.activityType, &ar.payload, &ar.priority,
+		&ar.id, &ar.activityType, &ar.payload, &ar.serialization, &ar.priority,
 		&ar.retryCount, &ar.maxRetries, &ar.timeoutSeconds,
 		&ar.retryDelaySeconds, &ar.maxRetryDelaySeconds,
 		&ar.scheduledAt, &ar.metadata,
@@ -782,10 +820,32 @@ func (b *PostgresBackend) DequeueBatch(ctx context.Context, workerIDPrefix strin
 	if limit <= 0 {
 		return nil, nil
 	}
+	return b.dequeueBatch(ctx, workerIDPrefix, limit, maxBlock, activityTypes, nil)
+}
+
+// DequeueBatchEncoded is DequeueBatch for a worker that reads the given
+// encodings (EncodedStorage).
+func (b *PostgresBackend) DequeueBatchEncoded(ctx context.Context, workerIDPrefix string, limit int, maxBlock time.Duration, activityTypes []string, serializations []string) ([]storage.DequeuedActivity, error) {
+	// Only what the caller reads: an empty entry is plain JSON, and no
+	// encodings claim nothing.
+	if len(serializations) == 0 {
+		return nil, nil
+	}
+	reads := make([]string, 0, len(serializations))
+	for _, s := range serializations {
+		reads = append(reads, storedSerialization(s))
+	}
+	return b.dequeueBatch(ctx, workerIDPrefix, limit, maxBlock, activityTypes, reads)
+}
+
+func (b *PostgresBackend) dequeueBatch(ctx context.Context, workerIDPrefix string, limit int, maxBlock time.Duration, activityTypes, reads []string) ([]storage.DequeuedActivity, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
 	var claims []storage.DequeuedActivity
 	err := b.waitForClaim(ctx, maxBlock, func() (bool, error) {
 		var err error
-		claims, err = b.dequeueBatchOnce(ctx, workerIDPrefix, limit, activityTypes)
+		claims, err = b.dequeueBatchOnce(ctx, workerIDPrefix, limit, activityTypes, reads)
 		return len(claims) > 0, err
 	})
 	if err != nil {
@@ -794,7 +854,8 @@ func (b *PostgresBackend) DequeueBatch(ctx context.Context, workerIDPrefix strin
 	return claims, nil
 }
 
-func (b *PostgresBackend) dequeueBatchOnce(ctx context.Context, workerIDPrefix string, limit int, activityTypes []string) ([]storage.DequeuedActivity, error) {
+// dequeueBatchOnce claims once; reads nil means plain JSON only.
+func (b *PostgresBackend) dequeueBatchOnce(ctx context.Context, workerIDPrefix string, limit int, activityTypes, reads []string) ([]storage.DequeuedActivity, error) {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
 		return nil, databaseError(err, fmt.Sprintf("Failed to begin batch dequeue transaction: %v", err))
@@ -802,13 +863,20 @@ func (b *PostgresBackend) dequeueBatchOnce(ctx context.Context, workerIDPrefix s
 	defer tx.Rollback(ctx)
 
 	var rows pgx.Rows
-	switch len(activityTypes) {
-	case 0:
-		rows, err = tx.Query(ctx, dequeueBatchSQLAllTypes, workerIDPrefix, b.defaultLeaseMS.Load(), b.queueName, limit)
-	case 1:
-		rows, err = tx.Query(ctx, dequeueBatchSQLOneType, workerIDPrefix, b.defaultLeaseMS.Load(), b.queueName, limit, activityTypes[0])
+	lease := b.defaultLeaseMS.Load()
+	switch {
+	case reads == nil && len(activityTypes) == 0:
+		rows, err = tx.Query(ctx, dequeueBatchSQLAllTypes, workerIDPrefix, lease, b.queueName, limit)
+	case reads == nil && len(activityTypes) == 1:
+		rows, err = tx.Query(ctx, dequeueBatchSQLOneType, workerIDPrefix, lease, b.queueName, limit, activityTypes[0])
+	case reads == nil:
+		rows, err = tx.Query(ctx, dequeueBatchSQLManyTypes, workerIDPrefix, lease, b.queueName, limit, activityTypes)
+	case len(activityTypes) == 0:
+		rows, err = tx.Query(ctx, dequeueBatchEncodedSQLAllTypes, workerIDPrefix, lease, b.queueName, limit, reads)
+	case len(activityTypes) == 1:
+		rows, err = tx.Query(ctx, dequeueBatchEncodedSQLOneType, workerIDPrefix, lease, b.queueName, limit, activityTypes[0], reads)
 	default:
-		rows, err = tx.Query(ctx, dequeueBatchSQLManyTypes, workerIDPrefix, b.defaultLeaseMS.Load(), b.queueName, limit, activityTypes)
+		rows, err = tx.Query(ctx, dequeueBatchEncodedSQLManyTypes, workerIDPrefix, lease, b.queueName, limit, activityTypes, reads)
 	}
 	if err != nil {
 		return nil, databaseError(err, fmt.Sprintf("Failed to batch dequeue: %v", err))
@@ -836,6 +904,15 @@ func (b *PostgresBackend) dequeueBatchOnce(ctx context.Context, workerIDPrefix s
 }
 
 func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, result json.RawMessage, workerID string) error {
+	return b.ackSuccess(ctx, activityID, result, "", workerID)
+}
+
+// AckSuccessEncoded is AckSuccess with the result's encoding (EncodedStorage).
+func (b *PostgresBackend) AckSuccessEncoded(ctx context.Context, activityID uuid.UUID, result json.RawMessage, serialization string, workerID string) error {
+	return b.ackSuccess(ctx, activityID, result, serialization, workerID)
+}
+
+func (b *PostgresBackend) ackSuccess(ctx context.Context, activityID uuid.UUID, result json.RawMessage, serialization string, workerID string) error {
 	now := time.Now().UTC()
 
 	tx, err := b.pool.Begin(ctx)
@@ -865,7 +942,8 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
                 SELECT 1 FROM runnerq_activities a JOIN runnerq_results r ON r.activity_id = a.id
                 WHERE a.id = $1 AND a.queue_name = $2 AND a.status = 'completed'
                   AND a.last_worker_id = $3 AND r.queue_name = $2 AND r.state = 'Ok'
-                  AND r.data IS NOT DISTINCT FROM $4::jsonb)`, activityID, b.queueName, workerID, result).Scan(&same)
+                  AND r.data IS NOT DISTINCT FROM $4::jsonb AND r.serialization = $5)`,
+				activityID, b.queueName, workerID, result, storedSerialization(serialization)).Scan(&same)
 			if readErr != nil {
 				return databaseError(readErr, "failed to reconcile completion")
 			}
@@ -889,7 +967,7 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 	// without one would hang them until their own timeout. Storing it in this
 	// transaction means completion and result are atomic — a crash can't leave
 	// a completed activity with no result.
-	ar := &storage.ActivityResult{Data: result, State: storage.ResultOk}
+	ar := &storage.ActivityResult{Data: result, State: storage.ResultOk, Serialization: serialization}
 	if err := b.storeResultTx(ctx, tx, activityID, activityID, ar, now, ""); err != nil {
 		return err
 	}
@@ -914,6 +992,11 @@ func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, 
 }
 
 func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, failure storage.FailureKind, workerID string) (bool, error) {
+	// Details go into the error result and events as JSON: reject what isn't,
+	// before anything changes, rather than record the failure without them.
+	if len(failure.Details) > 0 && !json.Valid(failure.Details) {
+		return false, &storage.StorageError{Kind: storage.ErrInvalidArgument, Message: "failure details must be JSON", Field: "failure.Details"}
+	}
 	now := time.Now().UTC()
 
 	tx, err := b.pool.Begin(ctx)
@@ -968,16 +1051,16 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 			return false, databaseError(err, fmt.Sprintf("Failed to mark as failed: %v", err))
 		}
 
-		res := &storage.ActivityResult{Data: toDetail(map[string]any{
+		res := &storage.ActivityResult{Data: toDetail(withFailure(map[string]any{
 			"error":     errorMessage,
 			"type":      "non_retryable",
 			"failed_at": now.Format(time.RFC3339),
-		}), State: storage.ResultErr}
+		}, failure.Details)), State: storage.ResultErr}
 		if err := b.storeResultTx(ctx, tx, activityID, activityID, res, now, ""); err != nil {
 			return false, err
 		}
 		if err := b.recordEvent(ctx, tx, activityID, storage.EventFailed, &workerID,
-			toDetail(map[string]any{"retryable": false, "error": errorMessage})); err != nil {
+			toDetail(withFailure(map[string]any{"retryable": false, "error": errorMessage}, failure.Details))); err != nil {
 			return false, err
 		}
 
@@ -1041,11 +1124,11 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		}
 
 		if err := b.recordEvent(ctx, tx, activityID, storage.EventRetrying, &workerID,
-			toDetail(map[string]any{
+			toDetail(withFailure(map[string]any{
 				"retry_count":  newRetryCount,
 				"scheduled_at": scheduledAt.Format(time.RFC3339),
 				"error":        errorMessage,
-			})); err != nil {
+			}, failure.Details))); err != nil {
 			return false, err
 		}
 
@@ -1076,16 +1159,16 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		return false, databaseError(err, fmt.Sprintf("Failed to move to DLQ: %v", err))
 	}
 
-	res := &storage.ActivityResult{Data: toDetail(map[string]any{
+	res := &storage.ActivityResult{Data: toDetail(withFailure(map[string]any{
 		"error":     errorMessage,
 		"type":      "dead_letter",
 		"failed_at": now.Format(time.RFC3339),
-	}), State: storage.ResultErr}
+	}, failure.Details)), State: storage.ResultErr}
 	if err := b.storeResultTx(ctx, tx, activityID, activityID, res, now, ""); err != nil {
 		return false, err
 	}
 	if err := b.recordEvent(ctx, tx, activityID, storage.EventDeadLetter, &workerID,
-		toDetail(map[string]any{"error": errorMessage})); err != nil {
+		toDetail(withFailure(map[string]any{"error": errorMessage}, failure.Details))); err != nil {
 		return false, err
 	}
 
@@ -1289,6 +1372,16 @@ func (b *PostgresBackend) Yield(ctx context.Context, activityID uuid.UUID, wakeA
 // if it is parked as scheduled — a yielded WaitForSignal resumes immediately
 // instead of waiting out its park deadline. Store + wake commit atomically.
 func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UUID, signalID uuid.UUID, name string, payload json.RawMessage) error {
+	return b.signalActivity(ctx, activityID, signalID, name, payload, "")
+}
+
+// SignalActivityEncoded is SignalActivity with the payload's encoding
+// (EncodedStorage).
+func (b *PostgresBackend) SignalActivityEncoded(ctx context.Context, activityID uuid.UUID, signalID uuid.UUID, name string, payload json.RawMessage, serialization string) error {
+	return b.signalActivity(ctx, activityID, signalID, name, payload, serialization)
+}
+
+func (b *PostgresBackend) signalActivity(ctx context.Context, activityID uuid.UUID, signalID uuid.UUID, name string, payload json.RawMessage, serialization string) error {
 	now := time.Now().UTC()
 
 	tx, err := b.pool.Begin(ctx)
@@ -1317,7 +1410,7 @@ func (b *PostgresBackend) SignalActivity(ctx context.Context, activityID uuid.UU
 	if name != "" {
 		signalStep = "signal:" + name
 	}
-	res := &storage.ActivityResult{Data: payload, State: storage.ResultOk}
+	res := &storage.ActivityResult{Data: payload, State: storage.ResultOk, Serialization: serialization}
 	if err := b.storeResultTx(ctx, tx, signalID, activityID, res, now, signalStep); err != nil {
 		return err
 	}
@@ -1641,10 +1734,10 @@ func (b *PostgresBackend) StoreResult(ctx context.Context, activityID uuid.UUID,
 }
 
 func (b *PostgresBackend) GetResult(ctx context.Context, activityID uuid.UUID) (*storage.ActivityResult, error) {
-	var stateStr string
+	var stateStr, serialization string
 	var data json.RawMessage
 
-	err := b.pool.QueryRow(ctx, `SELECT state, data FROM runnerq_results WHERE activity_id = $1 AND queue_name = $2`, activityID, b.queueName).Scan(&stateStr, &data)
+	err := b.pool.QueryRow(ctx, `SELECT state, data, serialization FROM runnerq_results WHERE activity_id = $1 AND queue_name = $2`, activityID, b.queueName).Scan(&stateStr, &data, &serialization)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, nil
@@ -1657,7 +1750,7 @@ func (b *PostgresBackend) GetResult(ctx context.Context, activityID uuid.UUID) (
 		state = storage.ResultErr
 	}
 
-	return &storage.ActivityResult{Data: data, State: state}, nil
+	return &storage.ActivityResult{Data: data, State: state, Serialization: reportedSerialization(serialization)}, nil
 }
 
 func (b *PostgresBackend) EnqueueIdempotent(ctx context.Context, a *storage.QueuedActivity) (*storage.IdempotencyResult, error) {
@@ -2012,6 +2105,7 @@ type activityRow struct {
 	id                   uuid.UUID
 	activityType         string
 	payload              json.RawMessage
+	serialization        *string
 	priority             int32
 	status               string
 	createdAt            time.Time
@@ -2053,10 +2147,15 @@ func (r *activityRow) toQueuedActivity() *storage.QueuedActivity {
 	if r.rootActivityID != nil {
 		rootID = *r.rootActivityID
 	}
+	var serialization string
+	if r.serialization != nil {
+		serialization = reportedSerialization(*r.serialization)
+	}
 	return &storage.QueuedActivity{
 		ID:                   r.id,
 		ActivityType:         r.activityType,
 		Payload:              r.payload,
+		Serialization:        serialization,
 		Priority:             intToPriority(r.priority),
 		MaxRetries:           uint32(r.maxRetries),
 		RetryCount:           uint32(r.retryCount),
@@ -2157,3 +2256,5 @@ func (b *PostgresBackend) scanSnapshots(rows pgx.Rows) ([]storage.ActivitySnapsh
 	}
 	return snapshots, nil
 }
+
+var _ storage.EncodedStorage = (*PostgresBackend)(nil)

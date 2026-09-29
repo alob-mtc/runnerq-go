@@ -150,7 +150,8 @@ type ActivityRecord struct {
 	IdempotencyKey string
 	// Attempt is the attempt running or next to run, from 1; for a terminal
 	// activity, the number of attempts made.
-	Attempt        int
+	Attempt int
+	// MaxAttempts is the total number of attempts allowed; 0 is unlimited.
 	MaxAttempts    int
 	CreatedAt      time.Time
 	ScheduledFor   *time.Time
