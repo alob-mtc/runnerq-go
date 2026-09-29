@@ -10,29 +10,24 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Result publication and durable parking must take turns for one logical
-// result, or a consumer can park just as the result lands and nobody wakes it
-// (write skew under READ COMMITTED: each side reads what the other has not
-// committed yet). They coordinate on the row lock of the result's OWNER
-// activity — the child for an await, the target for a signal, the handler's
-// activity for a checkpoint — which every producer path already holds
-// exclusively when it publishes (its own status UPDATE or claim FOR UPDATE).
-// The parking consumer takes the same row FOR SHARE before it registers its
-// dependency and checks readiness. Whichever transaction is ordered second
-// sees the first one's committed write, so no advisory lock, no extra
-// statement, and no shared-lock-table entry per result is needed. Sharers do
-// not block each other, so fan-in consumers park concurrently.
+// Result publication and durable parking must take turns per result, or a
+// consumer can park just as the result lands and never wake (write skew under
+// READ COMMITTED). They coordinate on the row lock of the result's OWNER
+// activity (the child for an await, the target for a signal, the handler's
+// activity for a checkpoint), which every producer already holds exclusively
+// when publishing (its status UPDATE or claim FOR UPDATE). The parker takes the
+// same row FOR SHARE before registering its dependency and checking readiness,
+// so whichever commits second sees the other's write: no advisory lock needed,
+// and sharers don't block each other, so fan-in consumers park concurrently.
 //
 // Invariant for producers: lock the owner row BEFORE storeResultTx / the wake
 // UPDATE, never after.
 
-// lockProducerRootTx orders this transaction against two others for one
-// producer: retention for the producer's workflow tree (root FOR KEY SHARE —
-// the root row is the single coordination point for every result in the
-// tree, held only until this transaction commits) and result publication for
-// the producer itself (producer FOR SHARE — conflicts with the publisher's
-// status UPDATE but not with other sharers). Returns false when the producer
-// no longer exists in this queue.
+// lockProducerRootTx orders this transaction against retention of the
+// producer's tree (root FOR KEY SHARE: the root is the single coordination
+// point for every result in the tree) and against result publication (producer
+// FOR SHARE: conflicts with the publisher's status UPDATE, not other sharers).
+// Returns false when the producer no longer exists in this queue.
 func (b *PostgresBackend) lockProducerRootTx(ctx context.Context, tx pgx.Tx, producer uuid.UUID) (bool, error) {
 	var root uuid.UUID
 	err := tx.QueryRow(ctx, `
@@ -61,9 +56,8 @@ func (b *PostgresBackend) addDependencyTx(ctx context.Context, tx pgx.Tx, waiter
 	return nil
 }
 
-// linkStmt registers child as a dependency of parent. Existing APIs permit
-// imported lineage with no local parent: only a live local parent is linked,
-// never an uncollectable reference.
+// linkStmt links child to parent only when the parent exists locally: imported
+// lineage may have no local parent, and a dangling link would be uncollectable.
 func (b *PostgresBackend) linkStmt(parent, child uuid.UUID) stmt {
 	return stmt{`INSERT INTO runnerq_dependencies(queue_name,waiter_activity_id,result_id,producer_activity_id)
  SELECT $1::text, $2::uuid, $3::uuid, $3::uuid
@@ -88,8 +82,6 @@ func (b *PostgresBackend) RegisterDependency(ctx context.Context, waiter, result
 		return databaseError(err, "failed to begin dependency transaction")
 	}
 	defer tx.Rollback(ctx)
-	// A dependency and retention must take turns for the producer's workflow
-	// tree, but unrelated queues and trees remain independent.
 	if exists, err := b.lockProducerRootTx(ctx, tx, result); err != nil {
 		return err
 	} else if !exists {
@@ -107,9 +99,8 @@ func (b *PostgresBackend) RegisterDependency(ctx context.Context, waiter, result
 	return nil
 }
 
-// wakeStmt wakes the activities parked on result. Spawn links also live in
-// runnerq_dependencies, so a dependency alone does not mean the activity is
-// waiting for this result.
+// Spawn links also live in runnerq_dependencies, so a dependency alone does
+// not mean the activity is waiting for this result.
 func (b *PostgresBackend) wakeStmt(result uuid.UUID) stmt {
 	return stmt{`UPDATE runnerq_activities a
  SET status='pending', scheduled_at=NULL, waiting_result_id=NULL
@@ -124,13 +115,12 @@ func (b *PostgresBackend) YieldForResult(ctx context.Context, waiter, result uui
 		return databaseError(err, "failed to begin durable park")
 	}
 	defer tx.Rollback(ctx)
-	// Lock order: the waiter's own row (claim check), then the result owner's
-	// row via lockProducerRootTx for an await. For a signal the owner IS the
-	// waiter, so the claim check's FOR UPDATE already orders us against
-	// SignalActivity's FOR NO KEY UPDATE on the target.
+	// Lock order: the waiter's row (claim check), then for an await the result
+	// owner's via lockProducerRootTx. For a signal the owner IS the waiter, so
+	// the claim's FOR UPDATE orders us against SignalActivity's FOR NO KEY UPDATE.
 	if err := b.verifyClaimTx(ctx, tx, waiter, worker); err != nil {
-		// A lost reply can be reconciled even if an early wake or next claim has
-		// occurred. The durable event identifies this exact execution's park.
+		// Reconcile a lost commit reply, even after an early wake or re-claim:
+		// the durable event identifies this exact execution's park.
 		if se, ok := storage.IsStorageError(err); !ok || se.Kind != storage.ErrClaimLost {
 			return err
 		}

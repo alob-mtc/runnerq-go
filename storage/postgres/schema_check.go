@@ -14,27 +14,19 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Schema DDL is expensive even when it changes nothing: ALTER TABLE ... ADD
-// COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE and CREATE INDEX IF NOT EXISTS
-// takes SHARE on the table before either evaluates its IF NOT EXISTS, so
-// every process start stalls live claims, acks and parks in every other
-// process and can be picked as a deadlock victim by them. initSchema
-// therefore first asks the catalog whether everything the DDL would create
-// already exists and, if so, runs no DDL at all.
-//
-// The expectation is parsed from the DDL itself rather than maintained by
-// hand, so adding a table, column or index to schemaSql (or an entry to
-// dequeueIndexes) extends the check automatically; TestSchemaExpectation
-// guards the parser against DDL forms it does not recognise.
-
+// No-op DDL still locks: ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE and
+// CREATE INDEX IF NOT EXISTS takes SHARE before checking IF NOT EXISTS, so each
+// process start would stall live claims/acks/parks elsewhere and risk being a
+// deadlock victim. initSchema first checks the catalog and skips DDL entirely
+// when current. The expectation is parsed from schemaSql and dequeueIndexes,
+// so new objects extend the check automatically (TestSchemaExpectation guards
+// the parser).
 type schemaExpectation struct {
-	tables  []string // CREATE TABLE IF NOT EXISTS
-	columns []string // "table.column" from ALTER TABLE ... ADD COLUMN IF NOT EXISTS
-	indexes []string // CREATE INDEX IF NOT EXISTS, plus dequeueIndexes (must be valid)
-	retired []string // dequeueIndexes predecessors (must be gone)
-	// retiredColumns ("table.column") must be gone: schemaSql moves their
-	// data and drops them.
-	retiredColumns []string
+	tables         []string
+	columns        []string // "table.column"
+	indexes        []string // must be valid
+	retired        []string // dequeueIndexes predecessors (must be gone)
+	retiredColumns []string // "table.column"; schemaSql moves their data and drops them
 }
 
 var (
@@ -70,10 +62,8 @@ var expectedSchema = sync.OnceValue(func() schemaExpectation {
 	return e
 })
 
-// schemaCurrent reports whether every table, column and index the DDL would
-// create already exists (indexes valid) and every retired index and column
-// is gone, in
-// the connection's current schema. One catalog round trip, no table locks.
+// schemaCurrent checks the connection's current schema in one catalog round
+// trip, taking no table locks.
 func schemaCurrent(ctx context.Context, conn *pgxpool.Conn) (bool, error) {
 	e := expectedSchema()
 	var current bool
@@ -98,16 +88,13 @@ func schemaCurrent(ctx context.Context, conn *pgxpool.Conn) (bool, error) {
 	return current, nil
 }
 
-// isDeadlock reports a Postgres "deadlock detected" error. Schema DDL run
-// against live traffic (a rolling deploy, parallel test packages) can be
-// chosen as the victim; the DDL is idempotent, so it is simply re-run.
+// Schema DDL against live traffic (rolling deploy, parallel test packages) can
+// be chosen as a deadlock victim; the DDL is idempotent, so it is re-run.
 func isDeadlock(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "40P01"
 }
 
-// retryDeadlock runs op until it succeeds or fails with anything other than
-// a deadlock, backing off briefly between attempts.
 func retryDeadlock(ctx context.Context, what string, op func() error) error {
 	const attempts = 5
 	var err error

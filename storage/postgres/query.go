@@ -18,10 +18,8 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// This file implements storage.QueryStorage: a general, cross-queue query
-// layer over the activity, event and result tables, in the canonical model
-// RunnerQ Cloud speaks. Filters compile to parameterized SQL; nothing from a
-// query is ever spliced into SQL text except whitelisted expressions.
+// storage.QueryStorage is cross-queue. Filters compile to parameterized SQL;
+// nothing from a query is spliced into SQL text except whitelisted expressions.
 
 const (
 	defaultQueryLimit = 50
@@ -65,8 +63,7 @@ var activityFields = map[string]queryField{
 	"depth":           {expr: "a.depth", kind: kindInt},
 	"idempotency_key": {expr: "a.idempotency_key", kind: kindString, nullable: true},
 	"attempt":         {expr: "(a.retry_count + 1)", kind: kindInt},
-	// max_retries holds the total attempts allowed (0 is unlimited, which no
-	// number matches).
+	// max_retries holds total attempts allowed; 0 (unlimited) matches no number.
 	"max_attempts":  {expr: "NULLIF(a.max_retries, 0)", kind: kindInt},
 	"created_at":    {expr: "a.created_at", kind: kindTime},
 	"scheduled_for": {expr: "a.scheduled_at", kind: kindTime, nullable: true},
@@ -77,15 +74,14 @@ var activityFields = map[string]queryField{
 }
 
 var eventFields = map[string]queryField{
-	// seq is the event's position in the log (its cursor): increasing, so
-	// "seq > cursor" tails the log.
+	// Increasing, so "seq > cursor" tails the log.
 	"seq":         {expr: "e.id", kind: kindInt},
 	"activity_id": {expr: "e.activity_id", kind: kindUUID},
 	"queue":       {expr: "e.queue_name", kind: kindString},
 	"type":        {expr: "e.event_type", kind: kindEventType},
 	"at":          {expr: "e.created_at", kind: kindTime},
 	"executor_id": {expr: "NULLIF(split_part(e.worker_id, ':', 1), '')", kind: kindString, nullable: true},
-	// root_id is special-cased in compilePredicate: events carry no root.
+	// Special-cased in predicate: events carry no root.
 	"root_id": {expr: "", kind: kindUUID},
 }
 
@@ -104,7 +100,6 @@ var activitySorts = map[string]sortField{
 	"priority":     {expr: "a.priority", kind: kindInt},
 }
 
-// canonicalStatuses maps a canonical status to the internal ones it covers.
 var canonicalStatuses = map[string][]string{
 	storage.RecordStatusPending:    {"pending"},
 	storage.RecordStatusScheduled:  {"scheduled", "retrying"},
@@ -116,7 +111,6 @@ var canonicalStatuses = map[string][]string{
 	storage.RecordStatusCancelled:  {"cancelled"},
 }
 
-// canonicalStatusSQL maps a.status to the canonical status in SQL.
 const canonicalStatusSQL = `CASE a.status WHEN 'processing' THEN 'running' WHEN 'retrying' THEN 'scheduled' ELSE a.status END`
 
 func canonicalStatus(internal string) string {
@@ -129,7 +123,6 @@ func canonicalStatus(internal string) string {
 	return internal
 }
 
-// canonicalEvents maps internal event names to canonical event types.
 var canonicalEvents = map[string]string{
 	storage.EventEnqueued:        storage.RecordEventCreated,
 	storage.EventScheduled:       storage.RecordEventScheduled,
@@ -159,7 +152,6 @@ func canonicalEvent(internal string) string {
 	return "other." + strings.ToLower(internal)
 }
 
-// internalEvents returns the internal event names a canonical type covers.
 func internalEvents(canonical string) []string {
 	var out []string
 	for in, c := range canonicalEvents {
@@ -175,7 +167,6 @@ func internalEvents(canonical string) []string {
 	return out
 }
 
-// QueryCapabilities lists what the Postgres backend evaluates.
 func (b *PostgresBackend) QueryCapabilities() storage.QueryCapabilities {
 	fields := make([]string, 0, len(activityFields)+1)
 	for f := range activityFields {
@@ -203,8 +194,6 @@ func (b *PostgresBackend) QueryCapabilities() storage.QueryCapabilities {
 	}
 }
 
-// --- filter compilation ---
-
 type sqlBuilder struct {
 	args  []any
 	nodes int
@@ -215,7 +204,6 @@ func (sb *sqlBuilder) arg(v any) string {
 	return "$" + strconv.Itoa(len(sb.args))
 }
 
-// where compiles an optional filter to a SQL condition ("TRUE" when nil).
 func (sb *sqlBuilder) where(f *storage.QueryFilter, fields map[string]queryField) (string, error) {
 	if f == nil {
 		return "TRUE", nil
@@ -355,12 +343,10 @@ func (sb *sqlBuilder) predicate(f storage.QueryFilter, fields map[string]queryFi
 	return "", storage.NewUnsupportedQueryError(f.Field, fmt.Sprintf("operator %q is not supported", f.Op))
 }
 
-// eventRootPredicate filters events to the trees rooted at the given ids.
-// idempotencyKeyPredicate matches the application's key (see
-// storage.ApplicationIdempotencyKey) against how it is stored: as a v2
-// business key for the row's own type, a legacy "<key>-<type>" key, or as is
-// (keys written directly through the storage API). Step-derived keys are not
-// application keys. Encoded keys can't be matched by prefix or substring.
+// idempotencyKeyPredicate matches the application key (see
+// storage.ApplicationIdempotencyKey) against every stored form: v2 business
+// key for the row's type, legacy "<key>-<type>", or raw (written directly via
+// the storage API). Step-derived keys are excluded.
 func (sb *sqlBuilder) idempotencyKeyPredicate(f storage.QueryFilter) (string, error) {
 	const stored = "a.idempotency_key"
 	hasKey := "(" + stored + " IS NOT NULL AND " + stored + " <> '' AND left(" + stored + ", " +
@@ -400,8 +386,8 @@ func (sb *sqlBuilder) idempotencyKeyPredicate(f storage.QueryFilter) (string, er
 			}
 			keys = append(keys, s)
 		}
-		// The v2 encoding, computed per row for its type: base64 without
-		// padding (Postgres wraps base64 at 76 characters, so drop newlines).
+		// v2 encoding per row type: unpadded base64, newlines dropped since
+		// Postgres wraps base64 at 76 characters.
 		v2 := "'rq:key:v2:' || rtrim(translate(encode(convert_to(octet_length(k) || ':' || k || a.activity_type, 'UTF8'), 'base64'), E'\\n', ''), '=')"
 		match := "EXISTS (SELECT 1 FROM unnest(" + sb.arg(keys) + "::text[]) AS keys(k) WHERE " +
 			stored + " = " + v2 + " OR " + stored + " = k || '-' || a.activity_type OR (" + stored + " = k AND left(" + stored + ", 10) <> 'rq:key:v2:'))"
@@ -439,8 +425,7 @@ func (sb *sqlBuilder) eventRootPredicate(f storage.QueryFilter) (string, error) 
 	return "e.activity_id IN (SELECT x.id FROM runnerq_activities x WHERE x.id = ANY(" + p + ") OR x.root_activity_id = ANY(" + p + "))", nil
 }
 
-// convertValues converts decoded JSON values to a typed slice for the field.
-// It returns nil (no error) when no value can possibly match.
+// convertValues returns nil (no error) when no value can possibly match.
 func convertValues(field string, kind fieldKind, raw []any) (any, error) {
 	switch kind {
 	case kindString:
@@ -527,8 +512,6 @@ func singleValue(vals any) any {
 	return vals
 }
 
-// --- cursors ---
-
 type activityCursor struct {
 	Sort string     `json:"s"`
 	Desc bool       `json:"d"`
@@ -557,9 +540,6 @@ func clampLimit(limit, def, max int) int {
 	return min(limit, max)
 }
 
-// --- activities ---
-
-// activitySelect builds the SELECT list and joins for ActivityRecord rows.
 func activitySelect(inc storage.RecordInclude) (cols, joins string) {
 	cols = `a.id, a.activity_type, a.queue_name, a.status, a.priority,
 		COALESCE(a.root_activity_id, a.id), a.parent_activity_id, a.depth, a.idempotency_key,
@@ -585,7 +565,6 @@ func activitySelect(inc storage.RecordInclude) (cols, joins string) {
 	return cols, joins
 }
 
-// scanRecord scans one activitySelect row, plus any trailing destinations.
 func scanRecord(rows pgx.Rows, inc storage.RecordInclude, extra ...any) (storage.ActivityRecord, error) {
 	var (
 		r                    storage.ActivityRecord
@@ -697,8 +676,7 @@ func parseWait(detail []byte) *storage.RecordWait {
 	return w
 }
 
-// QueryActivities runs a filtered, sorted, keyset-paginated activity query
-// across every queue in the database.
+// QueryActivities spans every queue in the database, not just this backend's.
 func (b *PostgresBackend) QueryActivities(ctx context.Context, q storage.ActivityQuery) (*storage.ActivityRecordPage, error) {
 	sort := storage.QuerySort{Field: "created_at", Desc: true}
 	if q.Sort != nil {
@@ -790,7 +768,6 @@ func (b *PostgresBackend) QueryActivities(ctx context.Context, q storage.Activit
 	return page, nil
 }
 
-// CountActivities counts matches, stopping at limit.
 func (b *PostgresBackend) CountActivities(ctx context.Context, filter *storage.QueryFilter, limit int64) (int64, bool, error) {
 	if limit <= 0 {
 		limit = 100_000
@@ -831,8 +808,6 @@ var bucketFields = map[string]string{
 	"completed_at": "a.completed_at",
 }
 
-// AggregateActivities groups activities and computes counts and duration
-// percentiles, optionally in fixed time buckets.
 func (b *PostgresBackend) AggregateActivities(ctx context.Context, q storage.AggregateQuery) (*storage.AggregateRows, error) {
 	if !q.Count && len(q.Durations) == 0 {
 		return nil, storage.NewInvalidQueryError("metrics", "ask for at least one metric")
@@ -968,9 +943,6 @@ func (b *PostgresBackend) AggregateActivities(ctx context.Context, q storage.Agg
 	return out, nil
 }
 
-// --- events ---
-
-// QueryEvents lists lifecycle events in id order.
 func (b *PostgresBackend) QueryEvents(ctx context.Context, q storage.EventQuery) (*storage.EventRecordPage, error) {
 	limit := clampLimit(q.Limit, defaultQueryLimit, maxQueryLimit)
 	sb := &sqlBuilder{}
@@ -1025,14 +997,11 @@ func (b *PostgresBackend) QueryEvents(ctx context.Context, q storage.EventQuery)
 	return page, nil
 }
 
-// --- steps ---
-
 type stepCursor struct {
 	At time.Time `json:"t"`
 	ID uuid.UUID `json:"i"`
 }
 
-// ListStepEntries lists an activity's durable steps, oldest first.
 func (b *PostgresBackend) ListStepEntries(ctx context.Context, activityID uuid.UUID, includeData bool, limit int, cursor string) (*storage.StepEntryPage, error) {
 	limit = clampLimit(limit, defaultQueryLimit, maxQueryLimit)
 	sb := &sqlBuilder{}
@@ -1090,9 +1059,6 @@ func (b *PostgresBackend) ListStepEntries(ctx context.Context, activityID uuid.U
 	return page, nil
 }
 
-// --- trees ---
-
-// GetActivityTree returns the tree the activity belongs to, root first.
 func (b *PostgresBackend) GetActivityTree(ctx context.Context, activityID uuid.UUID, inc storage.RecordInclude, maxNodes int) (*storage.ActivityTree, error) {
 	maxNodes = clampLimit(maxNodes, maxTreeNodes, maxTreeNodes)
 	var root uuid.UUID
@@ -1132,10 +1098,8 @@ func (b *PostgresBackend) GetActivityTree(ctx context.Context, activityID uuid.U
 
 var _ storage.QueryStorage = (*PostgresBackend)(nil)
 
-// plainData is a stored value as the console reads it: plain JSON as stored,
-// and the TypeScript SDK's native superjson-v1 as its "json" part (the value
-// with dates as ISO strings and the like; its "meta" only matters to the SDK
-// that decodes it).
+// plainData reads json-v1 as stored and the TypeScript SDK's superjson-v1 as
+// its "json" part; "meta" only matters to the SDK that decodes it.
 func plainData(data, serialization string) string {
 	return "CASE WHEN " + serialization + " = 'superjson-v1' THEN " + data + "->'json' ELSE " + data + " END"
 }

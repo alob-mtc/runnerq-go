@@ -15,15 +15,10 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// This file implements storage.CommandStorage: operator commands from
-// RunnerQ Cloud, applied atomically to this backend's queue, idempotent by
-// command id through the runnerq_commands ledger.
-
 const (
 	maxCommandIDs    = 1000
 	maxCommandFilter = 10000
-	// commandLedgerKeep is how long applied commands stay replayable
-	// (the protocol promises at least 24 hours).
+	// The command protocol promises replay for at least 24 hours.
 	commandLedgerKeep = 7 * 24 * time.Hour
 )
 
@@ -32,7 +27,6 @@ var (
 	failedStatuses   = map[string]bool{"failed": true, "dead_letter": true, "cancelled": true}
 )
 
-// postCommit collects the wake-ups a command owes once it commits.
 type postCommit struct {
 	work    bool
 	results []uuid.UUID
@@ -44,7 +38,6 @@ type targetRow struct {
 	parent *uuid.UUID
 }
 
-// ledgerItem and ledgerResult are the JSON the ledger stores.
 type ledgerItem struct {
 	ID         uuid.UUID `json:"id"`
 	Outcome    string    `json:"outcome"`
@@ -116,7 +109,7 @@ func validateCommand(cmd storage.Command) error {
 	return nil
 }
 
-// ApplyCommand applies a command to this queue's activities.
+// ApplyCommand is idempotent by command id through the runnerq_commands ledger.
 func (b *PostgresBackend) ApplyCommand(ctx context.Context, cmd storage.Command) (*storage.CommandResult, error) {
 	if err := validateCommand(cmd); err != nil {
 		return nil, err
@@ -126,9 +119,8 @@ func (b *PostgresBackend) ApplyCommand(ctx context.Context, cmd storage.Command)
 		post postCommit
 		err  error
 	)
-	// Commands lock several rows; a concurrent command or engine path can
-	// pick this transaction as a deadlock victim. It rolled back whole, so
-	// running it again is safe.
+	// Multi-row locking can lose a deadlock/serialization race; the
+	// transaction rolled back whole, so rerunning is safe.
 	for attempt := range 4 {
 		res, post, err = b.applyCommandTx(ctx, cmd)
 		var pgErr *pgconn.PgError
@@ -165,8 +157,8 @@ func (b *PostgresBackend) applyCommandTx(ctx context.Context, cmd storage.Comman
 
 	ledger := cmd.ID != "" && !cmd.DryRun
 	if ledger {
-		// Serialize concurrent deliveries of one command id, then replay a
-		// recorded result instead of applying twice.
+		// Serialize deliveries of one command id, then replay a recorded result
+		// instead of applying twice.
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
 			"runnerq_command:"+b.queueName+":"+cmd.ID); err != nil {
 			return nil, post, err
@@ -256,9 +248,8 @@ func (b *PostgresBackend) applyCommandTx(ctx context.Context, cmd storage.Comman
 	return res, post, nil
 }
 
-// eligibleSQL narrows a filter target to the activities the command can act
-// on, so repeating a bounded command ("retry the next 100 dead letters")
-// makes progress instead of re-selecting rows it already handled.
+// eligibleSQL narrows filter targets so repeating a bounded command ("retry
+// the next 100 dead letters") makes progress instead of re-selecting handled rows.
 var eligibleSQL = map[storage.CommandKind]string{
 	storage.CommandCancel:      "a.status NOT IN ('completed', 'failed', 'dead_letter', 'cancelled')",
 	storage.CommandSetPriority: "a.status NOT IN ('completed', 'failed', 'dead_letter', 'cancelled')",
@@ -269,7 +260,6 @@ var eligibleSQL = map[storage.CommandKind]string{
 	storage.CommandDelete:      "a.status IN ('completed', 'failed', 'dead_letter', 'cancelled') AND a.parent_activity_id IS NULL",
 }
 
-// resolveTargets turns a target into activity ids, in target order.
 func (b *PostgresBackend) resolveTargets(ctx context.Context, tx pgx.Tx, kind storage.CommandKind, t storage.CommandTarget) ([]uuid.UUID, bool, error) {
 	switch {
 	case len(t.IDs) > 0:
@@ -328,8 +318,7 @@ func (b *PostgresBackend) resolveTargets(ctx context.Context, tx pgx.Tx, kind st
 	return ids, false, nil
 }
 
-// lockRows locks the activities in id order (a stable order keeps concurrent
-// commands from deadlocking each other) and returns them by id.
+// lockRows locks in id order so concurrent commands don't deadlock each other.
 func (b *PostgresBackend) lockRows(ctx context.Context, tx pgx.Tx, ids []uuid.UUID) (map[uuid.UUID]targetRow, error) {
 	out := make(map[uuid.UUID]targetRow, len(ids))
 	if len(ids) == 0 {
@@ -356,7 +345,6 @@ func skipped(row targetRow, msg string) storage.CommandItem {
 		ErrKind: storage.ErrConflict, ErrMessage: msg}
 }
 
-// applyOne applies the command to one locked activity.
 func (b *PostgresBackend) applyOne(ctx context.Context, tx pgx.Tx, cmd storage.Command, row targetRow, now time.Time, post *postCommit) (storage.CommandItem, error) {
 	ok := func(after string) storage.CommandItem {
 		outcome := storage.CommandApplied
@@ -406,8 +394,7 @@ func (b *PostgresBackend) applyOne(ctx context.Context, tx pgx.Tx, cmd storage.C
 			WHERE id = $1 AND queue_name = $2`, row.id, b.queueName, cmd.ResetAttempts); err != nil {
 			return storage.CommandItem{}, err
 		}
-		// The terminal result goes; checkpoints stay, so the rerun replays
-		// completed steps instead of repeating them.
+		// Checkpoints stay, so the rerun replays completed steps.
 		if err := exec(`DELETE FROM runnerq_results WHERE queue_name = $1 AND activity_id = $2`, b.queueName, row.id); err != nil {
 			return storage.CommandItem{}, err
 		}
@@ -426,8 +413,8 @@ func (b *PostgresBackend) applyOne(ctx context.Context, tx pgx.Tx, cmd storage.C
 	case storage.CommandRunNow:
 		switch row.status {
 		case "scheduled", "retrying":
-			// The database clock, not ours: dequeue compares against NOW(),
-			// and an app clock ahead of the database would leave it not due.
+			// Database clock: dequeue compares against NOW(), and an app clock
+			// ahead of the database would leave it not yet due.
 			if err := exec(`UPDATE runnerq_activities SET scheduled_at = NOW() WHERE id = $1 AND queue_name = $2`,
 				row.id, b.queueName); err != nil {
 				return storage.CommandItem{}, err
@@ -518,10 +505,8 @@ func (b *PostgresBackend) applyOne(ctx context.Context, tx pgx.Tx, cmd storage.C
 	return storage.CommandItem{}, storage.NewUnsupportedQueryError("kind", string(cmd.Kind))
 }
 
-// cancelRow cancels one locked, non-terminal activity. A running handler
-// finds its claim gone at the next heartbeat and is stopped; its
-// acknowledgement is fenced out. The stored error result wakes anything
-// awaiting the activity, so a waiting parent sees a cancellation error.
+// A running handler finds its claim gone at the next heartbeat and its ack is
+// fenced out. The stored error result wakes awaiters with a cancellation error.
 func (b *PostgresBackend) cancelRow(ctx context.Context, tx pgx.Tx, cmd storage.Command, row targetRow, now time.Time, post *postCommit) error {
 	if cmd.DryRun {
 		return nil
@@ -555,8 +540,6 @@ func (b *PostgresBackend) cancelRow(ctx context.Context, tx pgx.Tx, cmd storage.
 	return nil
 }
 
-// cancelDescendants cancels the non-terminal descendants of the cancelled
-// activities and returns how many it cancelled (or would, in a dry run).
 func (b *PostgresBackend) cancelDescendants(ctx context.Context, tx pgx.Tx, cmd storage.Command, roots []uuid.UUID, now time.Time, post *postCommit) (int, error) {
 	rows, err := tx.Query(ctx, `
 		WITH RECURSIVE d(id) AS (
@@ -599,7 +582,6 @@ func (b *PostgresBackend) cancelDescendants(ctx context.Context, tx pgx.Tx, cmd 
 	return n, nil
 }
 
-// deleteRow deletes a finished root together with its whole tree.
 func (b *PostgresBackend) deleteRow(ctx context.Context, tx pgx.Tx, cmd storage.Command, row targetRow) (storage.CommandItem, error) {
 	if row.parent != nil {
 		return skipped(row, "not a root: delete the root to remove the whole tree"), nil

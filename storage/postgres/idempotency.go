@@ -9,9 +9,9 @@ import (
 
 const businessKeyLockClass = int32(1381913431)
 
-// Prefer an existing v2 claim. Otherwise preserve a correctly typed legacy
-// claim in place. New claims use v2; ambiguous legacy rows of another type are
-// never reused. Old and new enqueue writers require a coordinated cutover.
+// Prefers an existing v2 claim, else reuses a legacy claim of the same type in
+// place; legacy rows of another type are never reused. Old and new enqueue
+// writers require a coordinated cutover.
 func (b *PostgresBackend) resolveBusinessKeyTx(ctx context.Context, tx pgx.Tx, key, activityType string) (string, error) {
 	legacy, encodedType, ok := storage.LegacyBusinessIdempotencyKey(key)
 	if !ok {

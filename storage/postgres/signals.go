@@ -1,32 +1,20 @@
 package postgres
 
-// Wake-up signalling between RunnerQ processes, built on LISTEN/NOTIFY with
-// the table data as the source of truth.
+// Cross-process wake-ups over LISTEN/NOTIFY; the tables stay the source of truth.
 //
-// Design constraints this file exists to satisfy:
+//  1. NOTIFY never runs inside a data transaction: Postgres serializes every
+//     NOTIFY-carrying commit on one global lock, capping cluster-wide commit
+//     throughput. Hot paths report AFTER commit and one goroutine per backend
+//     flushes small batched notifications outside any transaction.
+//  2. Waiters may live in another process than the producer (e.g. a server
+//     calling GetResult with only a backend handle), so wake-up state lives in
+//     the backend (one LISTEN connection + in-process fan-out), not the engine.
+//  3. Notifications are hints: connections drop and signals can be lost
+//     between a waiter's check and its park, so every wait path re-checks the
+//     tables on a slow fallback interval.
 //
-//  1. NOTIFY must never run inside a data transaction. Postgres serializes
-//     the commit of every NOTIFY-carrying transaction on a single global
-//     queue lock, so per-transition in-transaction notifications cap
-//     cluster-wide commit throughput regardless of hardware. Instead, hot
-//     paths report what happened AFTER their transaction commits (see
-//     signaler), and a single goroutine per backend flushes tiny batched
-//     notifications from outside any transaction.
-//
-//  2. Waiters can live in a different process than the worker that produces
-//     what they're waiting for. A future's GetResult is routinely called
-//     from a separate server process that only holds a backend handle, so
-//     all wake-up state lives here in the storage backend (one LISTEN
-//     connection + in-process fan-out per backend instance), never in the
-//     engine.
-//
-//  3. Notifications are hints, not deliveries. LISTEN connections drop, and
-//     a signal can be lost between a waiter's last check and its park. Every
-//     wait path therefore re-checks the tables on a slow fallback interval;
-//     correctness never depends on a notification arriving.
-//
-// Channels (queue names are capped at 48 chars, so these stay under the
-// 63-byte identifier limit):
+// Channels (queue names are capped at 48 chars, keeping these under the 63-byte
+// identifier limit):
 //
 //	rq_w_<queue> — edge trigger: runnable work was committed
 //	rq_r_<queue> — payload: comma-joined activity IDs whose results committed
@@ -45,31 +33,22 @@ import (
 )
 
 const (
-	// signalFlushInterval is the minimum gap between signal flushes: it
-	// bounds the per-process NOTIFY rate at ~20/sec/channel whatever the
+	// Bounds the per-process NOTIFY rate at ~20/sec/channel regardless of
 	// throughput, and the wake-up latency it adds.
 	signalFlushInterval = 50 * time.Millisecond
 
-	// workWaitProbe is how often a parked Dequeue re-probes the table while
-	// blocked, covering lost work signals and scheduled/retrying rows coming
-	// due (which emit no signal at their due time).
+	// Covers lost work signals and scheduled/retrying rows coming due, which
+	// emit no signal.
 	workWaitProbe = 2 * time.Second
 
-	// resultWaitFallback is how often a parked WaitForResult re-checks the
-	// results table, covering lost result signals.
 	resultWaitFallback = 5 * time.Second
 
-	// resultIDsPerNotify keeps result notification payloads under the 8KB
-	// NOTIFY limit (36-byte UUIDs plus separators).
+	// Keeps payloads under the 8KB NOTIFY limit (36-byte UUIDs plus separators).
 	resultIDsPerNotify = 200
 )
 
 func (b *PostgresBackend) workChannel() string   { return "rq_w_" + b.queueName }
 func (b *PostgresBackend) resultChannel() string { return "rq_r_" + b.queueName }
-
-// ---------------------------------------------------------------------------
-// Send side: post-commit batched signaler
-// ---------------------------------------------------------------------------
 
 type signalKind int
 
@@ -80,7 +59,7 @@ const (
 
 type signalMsg struct {
 	kind signalKind
-	id   uuid.UUID // set for sigResult only
+	id   uuid.UUID
 }
 
 type signaler struct {
@@ -107,8 +86,8 @@ func (s *signaler) stop() {
 	<-s.done
 }
 
-// send never blocks the hot path: if the buffer is full the signal is
-// dropped, and receivers recover via their fallback probes.
+// send never blocks the hot path: a full buffer drops the signal and
+// receivers recover via their fallback probes.
 func (s *signaler) send(m signalMsg) {
 	select {
 	case s.ch <- m:
@@ -116,8 +95,8 @@ func (s *signaler) send(m signalMsg) {
 	}
 }
 
-// run flushes at most once per signalFlushInterval, and only when there is
-// something to send: an idle backend has no timer running at all.
+// run arms a timer only when there is something to send, so an idle backend
+// runs no timer.
 func (s *signaler) run(ctx context.Context) {
 	defer close(s.done)
 	var (
@@ -148,8 +127,7 @@ func (s *signaler) run(ctx context.Context) {
 				batch.Queue(`SELECT pg_notify($1, $2)`, s.b.resultChannel(), strings.Join(ids[start:end], ","))
 			}
 		}
-		// Not the caller's ctx: flushes happen on the signaler's own clock,
-		// and a failed flush is harmless (receivers re-probe).
+		// A failed flush is harmless: receivers re-probe.
 		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		err := s.b.pool.SendBatch(flushCtx, batch).Close()
 		cancel()
@@ -184,16 +162,12 @@ func (s *signaler) run(ctx context.Context) {
 	}
 }
 
-// Post-commit signal helpers — call ONLY after the relevant transaction has
-// committed, so a woken waiter's re-query is guaranteed to see the data.
+// Call signal helpers ONLY after commit, so a woken waiter's re-query sees
+// the data.
 func (b *PostgresBackend) signalWork() { b.sig.send(signalMsg{kind: sigWork}) }
 func (b *PostgresBackend) signalResult(id uuid.UUID) {
 	b.sig.send(signalMsg{kind: sigResult, id: id})
 }
-
-// ---------------------------------------------------------------------------
-// Receive side: shared watcher (one LISTEN connection per backend instance)
-// ---------------------------------------------------------------------------
 
 type watcher struct {
 	b      *PostgresBackend
@@ -205,8 +179,8 @@ type watcher struct {
 	resultWaiters map[uuid.UUID]map[chan struct{}]struct{}
 }
 
-// getWatcher lazily starts the watcher on first use, so backends that never
-// block (pure producers, read-only tools) don't pay for a LISTEN connection.
+// Lazy so backends that never block (pure producers, read-only tools) don't
+// hold a LISTEN connection.
 func (b *PostgresBackend) getWatcher() *watcher {
 	b.watcherMu.Lock()
 	defer b.watcherMu.Unlock()
@@ -244,9 +218,8 @@ func (w *watcher) run(ctx context.Context) {
 	}
 }
 
-// listenOnce holds one pooled connection in LISTEN mode until it errors or
-// the watcher stops. Waiters parked during an outage are woken by their own
-// fallback probes, so a dropped connection degrades latency, not correctness.
+// Waiters parked during an outage are woken by their fallback probes, so a
+// dropped LISTEN connection degrades latency, not correctness.
 func (w *watcher) listenOnce(ctx context.Context) error {
 	conn, err := w.b.pool.Acquire(ctx)
 	if err != nil {
@@ -274,8 +247,6 @@ func (w *watcher) listenOnce(ctx context.Context) error {
 	}
 }
 
-// ---- work waiters (blocking Dequeue) ----
-
 func (w *watcher) registerWork() chan struct{} {
 	ch := make(chan struct{}, 1)
 	w.mu.Lock()
@@ -300,8 +271,6 @@ func (w *watcher) wakeWorkWaiters() {
 		}
 	}
 }
-
-// ---- result waiters (WaitForResult) ----
 
 func (w *watcher) registerResult(id uuid.UUID) chan struct{} {
 	ch := make(chan struct{}, 1)
@@ -350,19 +319,10 @@ func (w *watcher) wakeResultWaiters(payload string) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Public wait APIs
-// ---------------------------------------------------------------------------
-
-// WaitForResult blocks until the activity's result exists, the context is
-// cancelled, or a storage error occurs. Implements storage.ResultWaiter.
-//
-// Works across processes: the producing worker and the waiting caller only
-// need backend instances pointed at the same database — wake-ups travel via
-// LISTEN/NOTIFY, with a slow table re-check as the lossy-notification
-// fallback. Idle cost per waiting process is one parked channel per waiter
-// plus one point-SELECT per waiter per resultWaitFallback, instead of the
-// previous 10 queries/sec/waiter.
+// WaitForResult blocks until the activity's result exists, ctx is done, or a
+// storage error occurs. It works across processes: the producer and the waiter
+// only need backends on the same database. Idle cost is one point-SELECT per
+// waiter every 5s.
 func (b *PostgresBackend) WaitForResult(ctx context.Context, activityID uuid.UUID) (*storage.ActivityResult, error) {
 	w := b.getWatcher()
 	ch := w.registerResult(activityID)
@@ -371,8 +331,8 @@ func (b *PostgresBackend) WaitForResult(ctx context.Context, activityID uuid.UUI
 	defer fallback.Stop()
 
 	for {
-		// Check after registering so a result committed between the check and
-		// the park can't be missed: its signal lands on ch.
+		// Checked after registering so a result committed before the park
+		// still signals ch.
 		res, err := b.GetResult(ctx, activityID)
 		if err != nil {
 			return nil, err
