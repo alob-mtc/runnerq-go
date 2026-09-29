@@ -311,13 +311,18 @@ func TestConfigValidation(t *testing.T) {
 
 func TestHelloDescribesExecutor(t *testing.T) {
 	g := newFakeGateway(t, sessionConfig{})
-	e := nopEngine(t)
+	e := runnerq.NewWorkerEngineWithBackend(nopStorage{}, runnerq.WorkerConfig{
+		QueueName: "q1", MaxConcurrentActivities: 3, Labels: map[string]string{"region": "us", "deploy": "v7"},
+	})
+	e.RegisterActivity(&Echo{})
+	// The agent's labels are added to the engine's, and win.
 	a := startAgent(t, e, g, Config{Labels: map[string]string{"region": "eu"}})
 
 	h := g.waitHello()
 	ex := h.Executor
 	if ex.ID != e.InstanceID() || ex.MaxConcurrency != 3 || len(ex.Queues) != 1 || ex.Queues[0] != "q1" ||
-		ex.Labels["region"] != "eu" || len(ex.ActivityTypes) != 1 || ex.ActivityTypes[0] != "Echo" {
+		ex.Labels["region"] != "eu" || ex.Labels["deploy"] != "v7" || len(ex.ActivityTypes) != 1 || ex.ActivityTypes[0] != "Echo" ||
+		ex.Hostname == "" {
 		t.Fatalf("executor %+v", ex)
 	}
 	if h.SDK.Name != "runnerq-go" || h.SDK.Language != "go" || h.Limits.MaxFrameBytes != maxMessageBytes {
@@ -343,12 +348,21 @@ func TestExecutorDescribeAndReports(t *testing.T) {
 
 	var st executorState
 	g.ok(typeExecutorDescribe, struct{}{}, &st)
-	if st.ID != e.InstanceID() || st.MaxConcurrency != 3 || st.InFlight != 0 || st.Draining {
+	if st.ID != e.InstanceID() || st.MaxConcurrency != 3 || st.InFlight != 0 || st.Draining ||
+		st.Counters == nil || *st.Counters != (executorCounters{}) {
 		t.Fatalf("state %+v", st)
 	}
 	evt := g.waitEvent(typeExecutorReport)
-	if err := json.Unmarshal(evt.Data, &st); err != nil || st.ID != e.InstanceID() {
+	var report map[string]json.RawMessage
+	if err := json.Unmarshal(evt.Data, &report); err != nil || string(report["id"]) != `"`+e.InstanceID()+`"` {
 		t.Fatalf("report %s: %v", evt.Data, err)
+	}
+	if string(report["claim_lag_ms"]) != "0" || string(report["heartbeat_failures"]) != "0" {
+		t.Fatalf("report %s", evt.Data)
+	}
+	var counters map[string]any
+	if err := json.Unmarshal(report["counters"], &counters); err != nil || counters["claimed"] != 0.0 || counters["dead_lettered"] != 0.0 {
+		t.Fatalf("report counters %s: %v", report["counters"], err)
 	}
 }
 

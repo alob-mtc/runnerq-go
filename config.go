@@ -1,6 +1,9 @@
 package runnerq
 
-import "time"
+import (
+	"maps"
+	"time"
+)
 
 // RetentionConfig opts the engine into deleting old terminal workflow trees.
 // Without it, activities, events, results, and idempotency keys are kept
@@ -68,6 +71,11 @@ type WorkerConfig struct {
 	// goroutines are still in flight (those are then orphaned for the
 	// remaining process lifetime, which is fine on a SIGTERM). Default 30s.
 	ShutdownGraceSeconds *uint64 `json:"shutdown_grace_seconds,omitempty"`
+
+	// Labels are free-form tags for this worker (region, deploy version).
+	// RunnerQ Cloud shows them in Fleet, whether the worker is connected by
+	// its agent or reports through the cloud storage adapter.
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // DefaultMaxActivityDepth is the default cap when MaxActivityDepth is unset.
@@ -90,6 +98,7 @@ func DefaultWorkerConfig() WorkerConfig {
 // Detach caller-owned slices and pointers before the engine starts goroutines.
 func cloneWorkerConfig(c WorkerConfig) WorkerConfig {
 	c.ActivityTypes = append([]string(nil), c.ActivityTypes...)
+	c.Labels = maps.Clone(c.Labels)
 	c.SchedulePollIntervalSeconds = cloneConfigPtr(c.SchedulePollIntervalSeconds)
 	c.LeaseMS = cloneConfigPtr(c.LeaseMS)
 	c.ReaperIntervalSeconds = cloneConfigPtr(c.ReaperIntervalSeconds)
