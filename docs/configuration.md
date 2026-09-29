@@ -47,7 +47,8 @@ Sizing guidance:
 - **Pool**: roughly `MaxWorkers + a few` per process (headroom for the reaper,
   scheduled processor, stats, and one shared listener connection). With many
   processes, put PgBouncer in front of Postgres.
-- **Lease floor**: the effective lease is `max(defaultLeaseMS, (timeout+10s))`,
+- **Lease floor**: `WorkerConfig.LeaseMS`, when set, overrides the backend's
+  `defaultLeaseMS`. The effective lease is `max(lease floor, (timeout+10s))`,
   so the per-activity `Timeout` usually dominates. Lower the floor only when
   you also use short activity timeouts and want fast crash recovery (see
   [example 02](../examples/02-crash-and-resume/)).

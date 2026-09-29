@@ -39,8 +39,9 @@ type WorkerConfig struct {
 	// Only effective for backends that don't handle scheduling natively in Dequeue().
 	SchedulePollIntervalSeconds *uint64 `json:"schedule_poll_interval_seconds,omitempty"`
 
-	// LeaseMS is the lease duration in milliseconds for claimed activities.
-	// Defaults to 60000 ms (60s).
+	// LeaseMS overrides the backend's lease floor for claimed activities, in
+	// milliseconds. Nil keeps the backend's own (postgres.WithConfig's
+	// defaultLeaseMS; 60s for postgres.New).
 	LeaseMS *uint64 `json:"lease_ms,omitempty"`
 
 	// ReaperIntervalSeconds is how often the reaper scans for expired leases.
@@ -81,13 +82,11 @@ const DefaultMaxActivityDepth uint16 = 32
 
 // DefaultWorkerConfig returns a WorkerConfig with sensible defaults.
 func DefaultWorkerConfig() WorkerConfig {
-	leaseMS := uint64(60_000)
 	reaperInterval := uint64(5)
 	reaperBatch := 100
 	return WorkerConfig{
 		QueueName:               "default",
 		MaxConcurrentActivities: 10,
-		LeaseMS:                 &leaseMS,
 		ReaperIntervalSeconds:   &reaperInterval,
 		ReaperBatchSize:         &reaperBatch,
 	}
