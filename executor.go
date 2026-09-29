@@ -465,14 +465,10 @@ func (w *ActivityExecutor) executeActivity(ctx context.Context, activityType str
 		return &ActivityFuture{queue: w.queue, activityID: existing.ExistingID}, nil
 	}
 
-	if a.ScheduledAt == nil {
-		if err := w.queue.Enqueue(ctx, a); err != nil {
-			return nil, WorkerErrorFromStorage(err)
-		}
-	} else {
-		if err := w.queue.ScheduleActivity(ctx, a); err != nil {
-			return nil, WorkerErrorFromStorage(err)
-		}
+	// A scheduled activity is enqueued the same way: the backend holds it
+	// until its ScheduledAt.
+	if err := w.queue.Enqueue(ctx, a); err != nil {
+		return nil, WorkerErrorFromStorage(err)
 	}
 
 	return &ActivityFuture{queue: w.queue, activityID: activityID}, nil

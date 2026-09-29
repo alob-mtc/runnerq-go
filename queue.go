@@ -40,7 +40,6 @@ type activityQueue interface {
 	MarkCompleted(ctx context.Context, a *activity, result json.RawMessage, workerID string) error
 	// MarkFailed marks an activity as failed. Returns true if moved to dead letter queue.
 	MarkFailed(ctx context.Context, a *activity, errorMessage string, retryable bool, workerID string) (bool, error)
-	ScheduleActivity(ctx context.Context, a *activity) error
 	ProcessScheduledActivities(ctx context.Context) ([]*activity, error)
 	// Yield parks a processing activity as scheduled until wakeAt without
 	// consuming a retry. Used by durable Sleep/WaitForSignal/await. kind and
@@ -269,15 +268,6 @@ func (a *backendQueueAdapter) MarkFailed(ctx context.Context, act *activity, err
 		failure = storage.NewNonRetryableFailure(errorMessage)
 	}
 	return a.backend.AckFailure(ctx, act.ID, failure, workerID)
-}
-
-func (a *backendQueueAdapter) ScheduleActivity(ctx context.Context, act *activity) error {
-	queued := activityToQueued(act)
-	if queued.ScheduledAt == nil {
-		now := time.Now().UTC()
-		queued.ScheduledAt = &now
-	}
-	return a.backend.Enqueue(ctx, queued)
 }
 
 func (a *backendQueueAdapter) ProcessScheduledActivities(ctx context.Context) ([]*activity, error) {
