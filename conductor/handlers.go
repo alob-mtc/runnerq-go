@@ -1,6 +1,7 @@
 package conductor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -98,7 +99,7 @@ func decode[T any](data json.RawMessage) (T, error) {
 	if len(data) == 0 {
 		return v, nil
 	}
-	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields() // an unknown request field could change meaning
 	if err := dec.Decode(&v); err != nil {
 		return v, errorf(codeInvalidArgument, "decode request: %v", err)
