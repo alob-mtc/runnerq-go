@@ -60,20 +60,16 @@ func (b *PostgresBackend) addDependencyTx(ctx context.Context, tx pgx.Tx, waiter
 	}
 	return nil
 }
-func (b *PostgresBackend) linkChildTx(ctx context.Context, tx pgx.Tx, parent *uuid.UUID, child uuid.UUID) error {
-	if parent == nil {
-		return nil
-	}
-	// Existing APIs permit imported lineage with no local parent. Register only
-	// live local parents; never manufacture an uncollectable reference.
-	var exists bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM runnerq_activities WHERE id=$1 AND queue_name=$2)`, *parent, b.queueName).Scan(&exists); err != nil {
-		return databaseError(err, "failed to find dependency parent")
-	}
-	if !exists {
-		return nil
-	}
-	return b.addDependencyTx(ctx, tx, *parent, child, &child)
+
+// linkStmt registers child as a dependency of parent. Existing APIs permit
+// imported lineage with no local parent: only a live local parent is linked,
+// never an uncollectable reference.
+func (b *PostgresBackend) linkStmt(parent, child uuid.UUID) stmt {
+	return stmt{`INSERT INTO runnerq_dependencies(queue_name,waiter_activity_id,result_id,producer_activity_id)
+ SELECT $1::text, $2::uuid, $3::uuid, $3::uuid
+ WHERE EXISTS(SELECT 1 FROM runnerq_activities WHERE id=$2 AND queue_name=$1)
+ ON CONFLICT(queue_name,waiter_activity_id,result_id) DO NOTHING`,
+		[]any{b.queueName, parent, child}, "failed to register result dependency"}
 }
 func (b *PostgresBackend) verifyClaimTx(ctx context.Context, tx pgx.Tx, id uuid.UUID, worker string) error {
 	var n int
@@ -110,18 +106,17 @@ func (b *PostgresBackend) RegisterDependency(ctx context.Context, waiter, result
 	}
 	return nil
 }
-func (b *PostgresBackend) wakeResultWaitersTx(ctx context.Context, tx pgx.Tx, result uuid.UUID) error {
-	// Spawn links also live in runnerq_dependencies, so a dependency alone
-	// does not mean the activity is currently waiting for this result.
-	_, err := tx.Exec(ctx, `UPDATE runnerq_activities a
+
+// wakeStmt wakes the activities parked on result. Spawn links also live in
+// runnerq_dependencies, so a dependency alone does not mean the activity is
+// waiting for this result.
+func (b *PostgresBackend) wakeStmt(result uuid.UUID) stmt {
+	return stmt{`UPDATE runnerq_activities a
  SET status='pending', scheduled_at=NULL, waiting_result_id=NULL
  WHERE a.queue_name=$1 AND a.status='waiting' AND a.waiting_result_id=$2
  AND EXISTS(
- SELECT 1 FROM runnerq_dependencies d WHERE d.queue_name=$1 AND d.result_id=$2 AND d.waiter_activity_id=a.id)`, b.queueName, result)
-	if err != nil {
-		return databaseError(err, "failed to wake result consumers")
-	}
-	return nil
+ SELECT 1 FROM runnerq_dependencies d WHERE d.queue_name=$1 AND d.result_id=$2 AND d.waiter_activity_id=a.id)`,
+		[]any{b.queueName, result}, "failed to wake result consumers"}
 }
 func (b *PostgresBackend) YieldForResult(ctx context.Context, waiter, result uuid.UUID, producer *uuid.UUID, wakeAt time.Time, worker, kind, step string) error {
 	tx, err := b.pool.Begin(ctx)

@@ -75,10 +75,9 @@ func (b *PostgresBackend) StoreCheckpoint(ctx context.Context, id, owner uuid.UU
 		}
 		return nil
 	}
-	if err := b.recordEvent(ctx, tx, id, storage.EventResultStored, &workerID, toDetail(map[string]any{"result_stored": true, "state": state})); err != nil {
-		return err
-	}
-	if err := b.wakeResultWaitersTx(ctx, tx, id); err != nil {
+	if err := execAll(ctx, tx,
+		b.eventStmt(id, storage.EventResultStored, &workerID, toDetail(map[string]any{"result_stored": true, "state": state})),
+		b.wakeStmt(id)); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {

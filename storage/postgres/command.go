@@ -474,7 +474,7 @@ func (b *PostgresBackend) applyOne(ctx context.Context, tx pgx.Tx, cmd storage.C
 			return skipped(row, "already finished"), nil
 		}
 		if err := exec(`UPDATE runnerq_activities SET priority = $3 WHERE id = $1 AND queue_name = $2`,
-			row.id, b.queueName, priorityToInt(cmd.Priority)); err != nil {
+			row.id, b.queueName, int32(cmd.Priority)); err != nil {
 			return storage.CommandItem{}, err
 		}
 		detail["priority"] = int(cmd.Priority)

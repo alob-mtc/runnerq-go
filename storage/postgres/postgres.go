@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/alob-mtc/runnerq-go/storage"
@@ -351,91 +353,99 @@ func (b *PostgresBackend) ensureDequeueIndex(ctx context.Context, conn *pgxpool.
 	return nil
 }
 
-func priorityToInt(p storage.ActivityPriority) int32 {
-	return int32(p)
-}
-
 func intToPriority(val int32) storage.ActivityPriority {
-	if val <= int32(storage.PriorityLow) {
+	switch {
+	case val <= int32(storage.PriorityLow):
 		return storage.PriorityLow
-	}
-	if val >= int32(storage.PriorityLow) && val <= int32(storage.PriorityCritical) {
+	case val <= int32(storage.PriorityCritical):
 		return storage.ActivityPriority(val)
 	}
 	return storage.PriorityNormal
 }
 
-// recordEvent inserts the lifecycle event row — and ONLY the row. It must
-// never NOTIFY: this runs inside the hot-path transactions, and Postgres
-// serializes the commit of every NOTIFY-carrying transaction on one global
-// lock, capping cluster-wide throughput. Readers query the table
-// (QueryEvents), so no notification is needed.
-func (b *PostgresBackend) recordEvent(ctx context.Context, tx pgx.Tx, activityID uuid.UUID, eventType string, workerID *string, detail json.RawMessage) error {
-	_, err := tx.Exec(ctx, `
+// stmt is one statement of a pipelined write; what names it in errors.
+type stmt struct {
+	sql  string
+	args []any
+	what string
+}
+
+// execAll runs stmts in order in one round trip. On a pgx.Tx they join its
+// transaction; on the pool they run as one implicit transaction, so either
+// way a failed statement rolls back the others.
+func execAll(ctx context.Context, q interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
+}, stmts ...stmt) error {
+	if len(stmts) == 1 {
+		if _, err := q.Exec(ctx, stmts[0].sql, stmts[0].args...); err != nil {
+			return databaseError(err, fmt.Sprintf("%s: %v", stmts[0].what, err))
+		}
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for _, s := range stmts {
+		batch.Queue(s.sql, s.args...)
+	}
+	br := q.SendBatch(ctx, batch)
+	for _, s := range stmts {
+		if _, err := br.Exec(); err != nil {
+			br.Close()
+			return databaseError(err, fmt.Sprintf("%s: %v", s.what, err))
+		}
+	}
+	if err := br.Close(); err != nil {
+		return databaseError(err, fmt.Sprintf("%s: %v", stmts[len(stmts)-1].what, err))
+	}
+	return nil
+}
+
+// eventStmt inserts a lifecycle event row, and only the row. It must never
+// NOTIFY: it runs inside the hot-path transactions, and Postgres serializes
+// the commit of every NOTIFY-carrying transaction on one global lock. Readers
+// query the table (QueryEvents).
+func (b *PostgresBackend) eventStmt(activityID uuid.UUID, eventType string, workerID *string, detail json.RawMessage) stmt {
+	return stmt{`
 		INSERT INTO runnerq_events (activity_id, queue_name, event_type, worker_id, detail, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6)`,
-		activityID, b.queueName, eventType, workerID, detail, time.Now().UTC())
-	if err != nil {
-		return databaseError(err, fmt.Sprintf("Failed to record event: %v", err))
-	}
-	return nil
+		[]any{activityID, b.queueName, eventType, workerID, detail, time.Now().UTC()},
+		"Failed to record event"}
 }
 
-// recordDequeueEvents is recordEvent for a batch claim: one Dequeued row per
-// claimed activity, written with a single multi-row INSERT (unnest over
-// parallel arrays) so the hot path stays at one statement whatever the batch
-// size. Same no-NOTIFY rule as recordEvent; the caller signals after commit.
-func (b *PostgresBackend) recordDequeueEvents(ctx context.Context, tx pgx.Tx, claims []storage.DequeuedActivity) error {
-	ids := make([]uuid.UUID, len(claims))
-	leaseIDs := make([]string, len(claims))
-	details := make([]string, len(claims))
-	for i, c := range claims {
-		ids[i] = c.Activity.ID
-		leaseIDs[i] = c.LeaseID
-		details[i] = string(toDetail(map[string]any{"lease_deadline_ms": c.LeaseDeadline.UnixMilli()}))
-	}
-	_, err := tx.Exec(ctx, `
-		INSERT INTO runnerq_events (activity_id, queue_name, event_type, worker_id, detail, created_at)
-		SELECT c.activity_id, $1, $2, c.worker_id, c.detail::jsonb, $3
-		FROM unnest($4::uuid[], $5::text[], $6::text[]) AS c(activity_id, worker_id, detail)`,
-		b.queueName, storage.EventDequeued, time.Now().UTC(), ids, leaseIDs, details)
-	if err != nil {
-		return databaseError(err, fmt.Sprintf("Failed to record dequeue events: %v", err))
-	}
-	return nil
+func (b *PostgresBackend) recordEvent(ctx context.Context, tx pgx.Tx, activityID uuid.UUID, eventType string, workerID *string, detail json.RawMessage) error {
+	return execAll(ctx, tx, b.eventStmt(activityID, eventType, workerID, detail))
 }
 
-// storeResultTx persists a result row and wakes consumers parked on it.
-// owner is the activity whose workflow tree governs this row's lifetime
-// (equals activityID for normal results; the handler's activity for Run/Sleep
-// checkpoints) — the retention sweeper deletes result rows by owner alongside
-// the tree.
+// resultStmts persist a result row and wake consumers parked on it. owner is
+// the activity whose workflow tree governs the row's lifetime (activityID for
+// normal results; the handler's activity for Run/Sleep checkpoints).
 //
-// Precondition: tx already holds an exclusive row lock (UPDATE, FOR UPDATE or
-// FOR NO KEY UPDATE) on owner's runnerq_activities row. That lock is what
-// orders this publication against a consumer parking on the result — see the
-// note at the top of dependencies.go. Callers that do not naturally update
-// the owner row must lock it explicitly first.
-func (b *PostgresBackend) storeResultTx(ctx context.Context, tx pgx.Tx, activityID, owner uuid.UUID, result *storage.ActivityResult, now time.Time, step string) error {
-	stateStr := "Ok"
+// Precondition: the transaction already holds an exclusive row lock (UPDATE,
+// FOR UPDATE or FOR NO KEY UPDATE) on owner's runnerq_activities row. That
+// lock orders this publication against a consumer parking on the result (see
+// dependencies.go); callers that do not update the owner row must lock it
+// first.
+func (b *PostgresBackend) resultStmts(activityID, owner uuid.UUID, result *storage.ActivityResult, now time.Time, step string) []stmt {
+	state := "Ok"
 	if result.State == storage.ResultErr {
-		stateStr = "Err"
+		state = "Err"
 	}
 	// Empty step → NULL: an activity's own result has no checkpoint identity.
 	var stepArg any
 	if step != "" {
 		stepArg = step
 	}
-	_, err := tx.Exec(ctx, `
+	return []stmt{{`
 		INSERT INTO runnerq_results (activity_id, queue_name, state, data, created_at, owner_activity_id, step, serialization)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (activity_id) DO UPDATE
 		SET state = $3, data = $4, created_at = $5, owner_activity_id = $6, step = $7, serialization = $8`,
-		activityID, b.queueName, stateStr, result.Data, now, owner, stepArg, storedSerialization(result.Serialization))
-	if err != nil {
-		return databaseError(err, fmt.Sprintf("Failed to store result: %v", err))
-	}
-	return b.wakeResultWaitersTx(ctx, tx, activityID)
+		[]any{activityID, b.queueName, state, result.Data, now, owner, stepArg, storedSerialization(result.Serialization)},
+		"Failed to store result"}, b.wakeStmt(activityID)}
+}
+
+func (b *PostgresBackend) storeResultTx(ctx context.Context, tx pgx.Tx, activityID, owner uuid.UUID, result *storage.ActivityResult, now time.Time, step string) error {
+	return execAll(ctx, tx, b.resultStmts(activityID, owner, result, now, step)...)
 }
 
 // storedSerialization is the encoding column's value for s (empty is plain JSON).
@@ -480,23 +490,32 @@ func (b *PostgresBackend) Enqueue(ctx context.Context, a storage.QueuedActivity)
 // enqueue inserts one activity. A non-nil fence makes the insert conditional
 // on the spawning execution's claim, checked in the same transaction.
 func (b *PostgresBackend) enqueue(ctx context.Context, a storage.QueuedActivity, fence *spawnFence) error {
+	stmts, err := b.enqueueStmts(&a)
+	if err != nil {
+		return err
+	}
+	if fence == nil {
+		if err := execAll(ctx, b.pool, stmts...); err != nil {
+			return err
+		}
+		b.signalEnqueued(&a)
+		return nil
+	}
+
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
 		return databaseError(err, fmt.Sprintf("Failed to begin transaction: %v", err))
 	}
 	defer tx.Rollback(ctx)
-
 	if err := b.verifySpawnFenceTx(ctx, tx, fence); err != nil {
 		return err
 	}
-	if err := b.enqueueInTx(ctx, tx, &a); err != nil {
+	if err := execAll(ctx, tx, stmts...); err != nil {
 		return err
 	}
-
 	if err := tx.Commit(ctx); err != nil {
 		return databaseError(err, fmt.Sprintf("Failed to commit enqueue: %v", err))
 	}
-
 	b.signalEnqueued(&a)
 	return nil
 }
@@ -511,10 +530,11 @@ func (b *PostgresBackend) signalEnqueued(a *storage.QueuedActivity) {
 	}
 }
 
-// enqueueInTx inserts the activity row and its lifecycle event inside the
-// caller's transaction, so callers can make the enqueue atomic with other
-// writes (e.g. the idempotency-key claim in EnqueueIdempotent).
-func (b *PostgresBackend) enqueueInTx(ctx context.Context, tx pgx.Tx, a *storage.QueuedActivity) error {
+// enqueueStmts insert the activity row, its input, its link to a local
+// parent and its lifecycle event. Callers run them in their own transaction
+// to make the enqueue atomic with other writes (e.g. the idempotency-key
+// claim in EnqueueIdempotent).
+func (b *PostgresBackend) enqueueStmts(a *storage.QueuedActivity) ([]stmt, error) {
 	status := "pending"
 	if a.ScheduledAt != nil {
 		status = "scheduled"
@@ -522,7 +542,7 @@ func (b *PostgresBackend) enqueueInTx(ctx context.Context, tx pgx.Tx, a *storage
 
 	metadataJSON, err := json.Marshal(a.Metadata)
 	if err != nil {
-		return storage.NewSerializationError(err.Error())
+		return nil, storage.NewSerializationError(err.Error())
 	}
 
 	var idempotencyKey *string
@@ -535,7 +555,7 @@ func (b *PostgresBackend) enqueueInTx(ctx context.Context, tx pgx.Tx, a *storage
 		rootID = a.ID
 	}
 
-	_, err = tx.Exec(ctx, `
+	stmts := []stmt{{`
 		WITH activity AS (
 			INSERT INTO runnerq_activities (
 				id, queue_name, activity_type, priority, status,
@@ -547,34 +567,29 @@ func (b *PostgresBackend) enqueueInTx(ctx context.Context, tx pgx.Tx, a *storage
 		)
 		INSERT INTO runnerq_inputs (activity_id, queue_name, payload, serialization)
 		VALUES ($1, $2, $4, $19)`,
-		a.ID, b.queueName, a.ActivityType, a.Payload,
-		priorityToInt(a.Priority), status, a.CreatedAt, a.ScheduledAt,
-		int32(a.RetryCount), int32(a.MaxRetries),
-		int64(a.TimeoutSeconds), int64(a.RetryDelaySeconds),
-		int64(a.MaxRetryDelaySeconds),
-		metadataJSON, idempotencyKey,
-		a.ParentActivityID, rootID, int16(a.Depth), storedSerialization(a.Serialization))
-	if err != nil {
-		return databaseError(err, fmt.Sprintf("Failed to enqueue activity: %v", err))
+		[]any{a.ID, b.queueName, a.ActivityType, a.Payload,
+			int32(a.Priority), status, a.CreatedAt, a.ScheduledAt,
+			int32(a.RetryCount), int32(a.MaxRetries),
+			int64(a.TimeoutSeconds), int64(a.RetryDelaySeconds),
+			int64(a.MaxRetryDelaySeconds),
+			metadataJSON, idempotencyKey,
+			a.ParentActivityID, rootID, int16(a.Depth), storedSerialization(a.Serialization)},
+		"Failed to enqueue activity"}}
+
+	if a.ParentActivityID != nil {
+		stmts = append(stmts, b.linkStmt(*a.ParentActivityID, a.ID))
 	}
 
-	var eventType string
-	var detail json.RawMessage
+	var event stmt
 	if a.ScheduledAt != nil {
-		eventType = storage.EventScheduled
-		detail = toDetail(map[string]any{"scheduled_at": a.ScheduledAt})
+		event = b.eventStmt(a.ID, storage.EventScheduled, nil, toDetail(map[string]any{"scheduled_at": a.ScheduledAt}))
 	} else {
-		eventType = storage.EventEnqueued
-		detail = toDetail(map[string]any{
-			"priority":     fmt.Sprintf("%d", a.Priority),
+		event = b.eventStmt(a.ID, storage.EventEnqueued, nil, toDetail(map[string]any{
+			"priority":     strconv.Itoa(a.Priority),
 			"scheduled_at": a.ScheduledAt,
-		})
+		}))
 	}
-
-	if err := b.linkChildTx(ctx, tx, a.ParentActivityID, a.ID); err != nil {
-		return err
-	}
-	return b.recordEvent(ctx, tx, a.ID, eventType, nil, detail)
+	return append(stmts, event), nil
 }
 
 // Claim SQL. The single-row and batch claims share one eligibility predicate,
@@ -629,15 +644,28 @@ const (
 	// claimColumnsSQL is the RETURNING list of every claim statement, in the
 	// order scanClaim reads it.
 	claimColumnsSQL = `id, activity_type,
-			(SELECT i.payload FROM runnerq_inputs i WHERE i.activity_id = a.id),
-			(SELECT i.serialization FROM runnerq_inputs i WHERE i.activity_id = a.id),
+			(SELECT i.payload FROM runnerq_inputs i WHERE i.activity_id = a.id) AS payload,
+			(SELECT i.serialization FROM runnerq_inputs i WHERE i.activity_id = a.id) AS serialization,
 			priority, retry_count, max_retries,
 			timeout_seconds, retry_delay_seconds, max_retry_delay_seconds,
 			scheduled_at, metadata, idempotency_key, created_at,
 			parent_activity_id, root_activity_id, depth, current_worker_id, lease_deadline_ms`
+	// claimEventsSQL ends every claim: the same statement records a Dequeued
+	// event per claimed row ($4 is the event time), so a claim is one round
+	// trip and needs no explicit transaction.
+	claimEventsSQL = `
+		), dequeued AS (
+			INSERT INTO runnerq_events (activity_id, queue_name, event_type, worker_id, detail, created_at)
+			SELECT id, $3::text, '` + storage.EventDequeued + `', current_worker_id,
+				jsonb_build_object('lease_deadline_ms', lease_deadline_ms), $4::timestamptz
+			FROM claimed
+		)
+		SELECT * FROM claimed`
 
-	// Single claim: $1 worker token, $2 default lease ms, $3 queue, $4 type filter.
+	// Single claim: $1 worker token, $2 default lease ms, $3 queue, $4 event
+	// time, $5 type filter.
 	dequeueSQLHead = `
+		WITH claimed AS (
 		UPDATE runnerq_activities AS a
 		SET status = 'processing',
 			current_worker_id = $1,
@@ -649,20 +677,21 @@ const (
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING ` + claimColumnsSQL
+		RETURNING ` + claimColumnsSQL + claimEventsSQL
 
 	dequeueSQLAllTypes  = dequeueSQLHead + dequeueSQLTail
-	dequeueSQLOneType   = dequeueSQLHead + ` AND activity_type = $4` + dequeueSQLTail
-	dequeueSQLManyTypes = dequeueSQLHead + ` AND activity_type = ANY($4)` + dequeueSQLTail
+	dequeueSQLOneType   = dequeueSQLHead + ` AND activity_type = $5` + dequeueSQLTail
+	dequeueSQLManyTypes = dequeueSQLHead + ` AND activity_type = ANY($5)` + dequeueSQLTail
 
-	// Batch claim: $1 token prefix, $2 default lease ms, $3 queue, $4 limit,
-	// $5 type filter. The same ordered SKIP LOCKED walk takes the first $4
-	// unlocked rows and a single UPDATE claims them all. Each row's token is
-	// the caller's prefix plus its own id, so the rows of one batch are fenced
-	// independently of each other and of every other claim. The subquery
-	// aliases its id so the unqualified column references in SET and
-	// RETURNING stay unambiguous.
+	// Batch claim: $1 token prefix, $2 default lease ms, $3 queue, $4 event
+	// time, $5 limit, $6 type filter. The same ordered SKIP LOCKED walk takes
+	// the first $5 unlocked rows and a single UPDATE claims them all. Each
+	// row's token is the caller's prefix plus its own id, so the rows of one
+	// batch are fenced independently of each other and of every other claim.
+	// The subquery aliases its id so the unqualified column references in SET
+	// and RETURNING stay unambiguous.
 	dequeueBatchSQLHead = `
+		WITH claimed AS (
 		UPDATE runnerq_activities AS a
 		SET status = 'processing',
 			current_worker_id = $1 || ':' || a.id::text,
@@ -671,15 +700,15 @@ const (
 		FROM (
 			SELECT id AS claim_id FROM runnerq_activities` + claimEligibleSQL
 	dequeueBatchSQLTail = claimOrderSQL + `
-			LIMIT $4
+			LIMIT $5
 			FOR UPDATE SKIP LOCKED
 		) AS c
 		WHERE a.id = c.claim_id
-		RETURNING ` + claimColumnsSQL
+		RETURNING ` + claimColumnsSQL + claimEventsSQL
 
 	dequeueBatchSQLAllTypes  = dequeueBatchSQLHead + dequeueBatchSQLTail
-	dequeueBatchSQLOneType   = dequeueBatchSQLHead + ` AND activity_type = $5` + dequeueBatchSQLTail
-	dequeueBatchSQLManyTypes = dequeueBatchSQLHead + ` AND activity_type = ANY($5)` + dequeueBatchSQLTail
+	dequeueBatchSQLOneType   = dequeueBatchSQLHead + ` AND activity_type = $6` + dequeueBatchSQLTail
+	dequeueBatchSQLManyTypes = dequeueBatchSQLHead + ` AND activity_type = ANY($6)` + dequeueBatchSQLTail
 
 	// claimPlainJSON is the encoding predicate of every claim above.
 	claimPlainJSON = `i.serialization <> 'json-v1'`
@@ -688,9 +717,9 @@ const (
 // The encoded batch claims (EncodedStorage) take the encodings the caller
 // reads as their last parameter instead of plain JSON alone.
 var (
-	dequeueBatchEncodedSQLAllTypes  = strings.Replace(dequeueBatchSQLAllTypes, claimPlainJSON, `i.serialization <> ALL($5::text[])`, 1)
-	dequeueBatchEncodedSQLOneType   = strings.Replace(dequeueBatchSQLOneType, claimPlainJSON, `i.serialization <> ALL($6::text[])`, 1)
-	dequeueBatchEncodedSQLManyTypes = strings.Replace(dequeueBatchSQLManyTypes, claimPlainJSON, `i.serialization <> ALL($6::text[])`, 1)
+	dequeueBatchEncodedSQLAllTypes  = strings.Replace(dequeueBatchSQLAllTypes, claimPlainJSON, `i.serialization <> ALL($6::text[])`, 1)
+	dequeueBatchEncodedSQLOneType   = strings.Replace(dequeueBatchSQLOneType, claimPlainJSON, `i.serialization <> ALL($7::text[])`, 1)
+	dequeueBatchEncodedSQLManyTypes = strings.Replace(dequeueBatchSQLManyTypes, claimPlainJSON, `i.serialization <> ALL($7::text[])`, 1)
 )
 
 // scanClaim reads one claimColumnsSQL row.
@@ -770,20 +799,15 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, maxBlock
 }
 
 func (b *PostgresBackend) dequeueOnce(ctx context.Context, workerID string, activityTypes []string) (*storage.QueuedActivity, error) {
-	tx, err := b.pool.Begin(ctx)
-	if err != nil {
-		return nil, databaseError(err, fmt.Sprintf("Failed to begin transaction: %v", err))
-	}
-	defer tx.Rollback(ctx)
-
+	lease, now := b.defaultLeaseMS.Load(), time.Now().UTC()
 	var row pgx.Row
 	switch len(activityTypes) {
 	case 0:
-		row = tx.QueryRow(ctx, dequeueSQLAllTypes, workerID, b.defaultLeaseMS.Load(), b.queueName)
+		row = b.pool.QueryRow(ctx, dequeueSQLAllTypes, workerID, lease, b.queueName, now)
 	case 1:
-		row = tx.QueryRow(ctx, dequeueSQLOneType, workerID, b.defaultLeaseMS.Load(), b.queueName, activityTypes[0])
+		row = b.pool.QueryRow(ctx, dequeueSQLOneType, workerID, lease, b.queueName, now, activityTypes[0])
 	default:
-		row = tx.QueryRow(ctx, dequeueSQLManyTypes, workerID, b.defaultLeaseMS.Load(), b.queueName, activityTypes)
+		row = b.pool.QueryRow(ctx, dequeueSQLManyTypes, workerID, lease, b.queueName, now, activityTypes)
 	}
 
 	claim, err := scanClaim(row)
@@ -794,21 +818,10 @@ func (b *PostgresBackend) dequeueOnce(ctx context.Context, workerID string, acti
 		return nil, databaseError(err, fmt.Sprintf("Failed to dequeue: %v", err))
 	}
 	a := &claim.Activity
-
-	detail := toDetail(map[string]any{"lease_deadline_ms": claim.LeaseDeadline.UnixMilli()})
-	if err := b.recordEvent(ctx, tx, a.ID, storage.EventDequeued, &workerID, detail); err != nil {
-		return nil, err
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, databaseError(err, fmt.Sprintf("Failed to commit dequeue: %v", err))
-	}
-
 	slog.Debug("Activity claimed",
 		"activity_id", a.ID,
 		"activity_type", a.ActivityType,
 		"priority", a.Priority)
-
 	return a, nil
 }
 
@@ -856,27 +869,24 @@ func (b *PostgresBackend) dequeueBatch(ctx context.Context, workerIDPrefix strin
 
 // dequeueBatchOnce claims once; reads nil means plain JSON only.
 func (b *PostgresBackend) dequeueBatchOnce(ctx context.Context, workerIDPrefix string, limit int, activityTypes, reads []string) ([]storage.DequeuedActivity, error) {
-	tx, err := b.pool.Begin(ctx)
-	if err != nil {
-		return nil, databaseError(err, fmt.Sprintf("Failed to begin batch dequeue transaction: %v", err))
-	}
-	defer tx.Rollback(ctx)
-
-	var rows pgx.Rows
-	lease := b.defaultLeaseMS.Load()
+	var (
+		rows pgx.Rows
+		err  error
+	)
+	lease, now := b.defaultLeaseMS.Load(), time.Now().UTC()
 	switch {
 	case reads == nil && len(activityTypes) == 0:
-		rows, err = tx.Query(ctx, dequeueBatchSQLAllTypes, workerIDPrefix, lease, b.queueName, limit)
+		rows, err = b.pool.Query(ctx, dequeueBatchSQLAllTypes, workerIDPrefix, lease, b.queueName, now, limit)
 	case reads == nil && len(activityTypes) == 1:
-		rows, err = tx.Query(ctx, dequeueBatchSQLOneType, workerIDPrefix, lease, b.queueName, limit, activityTypes[0])
+		rows, err = b.pool.Query(ctx, dequeueBatchSQLOneType, workerIDPrefix, lease, b.queueName, now, limit, activityTypes[0])
 	case reads == nil:
-		rows, err = tx.Query(ctx, dequeueBatchSQLManyTypes, workerIDPrefix, lease, b.queueName, limit, activityTypes)
+		rows, err = b.pool.Query(ctx, dequeueBatchSQLManyTypes, workerIDPrefix, lease, b.queueName, now, limit, activityTypes)
 	case len(activityTypes) == 0:
-		rows, err = tx.Query(ctx, dequeueBatchEncodedSQLAllTypes, workerIDPrefix, lease, b.queueName, limit, reads)
+		rows, err = b.pool.Query(ctx, dequeueBatchEncodedSQLAllTypes, workerIDPrefix, lease, b.queueName, now, limit, reads)
 	case len(activityTypes) == 1:
-		rows, err = tx.Query(ctx, dequeueBatchEncodedSQLOneType, workerIDPrefix, lease, b.queueName, limit, activityTypes[0], reads)
+		rows, err = b.pool.Query(ctx, dequeueBatchEncodedSQLOneType, workerIDPrefix, lease, b.queueName, now, limit, activityTypes[0], reads)
 	default:
-		rows, err = tx.Query(ctx, dequeueBatchEncodedSQLManyTypes, workerIDPrefix, lease, b.queueName, limit, activityTypes, reads)
+		rows, err = b.pool.Query(ctx, dequeueBatchEncodedSQLManyTypes, workerIDPrefix, lease, b.queueName, now, limit, activityTypes, reads)
 	}
 	if err != nil {
 		return nil, databaseError(err, fmt.Sprintf("Failed to batch dequeue: %v", err))
@@ -885,21 +895,12 @@ func (b *PostgresBackend) dequeueBatchOnce(ctx context.Context, workerIDPrefix s
 		return scanClaim(row)
 	})
 	if err != nil {
-		return nil, databaseError(err, fmt.Sprintf("Failed to read batch dequeue rows: %v", err))
+		return nil, databaseError(err, fmt.Sprintf("Failed to batch dequeue: %v", err))
 	}
 	if len(claims) == 0 {
 		return nil, nil
 	}
-
-	if err := b.recordDequeueEvents(ctx, tx, claims); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, databaseError(err, fmt.Sprintf("Failed to commit batch dequeue: %v", err))
-	}
-
 	slog.Debug("Activities claimed", "count", len(claims), "limit", limit)
-
 	return claims, nil
 }
 
@@ -968,17 +969,13 @@ func (b *PostgresBackend) ackSuccess(ctx context.Context, activityID uuid.UUID, 
 	// transaction means completion and result are atomic — a crash can't leave
 	// a completed activity with no result.
 	ar := &storage.ActivityResult{Data: result, State: storage.ResultOk, Serialization: serialization}
-	if err := b.storeResultTx(ctx, tx, activityID, activityID, ar, now, ""); err != nil {
-		return err
-	}
-
 	actTypeStr := ""
 	if actType != nil {
 		actTypeStr = *actType
 	}
-	detailMap := map[string]any{"activity_type": actTypeStr, "result_stored": true}
-
-	if err := b.recordEvent(ctx, tx, activityID, storage.EventCompleted, &workerID, toDetail(detailMap)); err != nil {
+	detail := toDetail(map[string]any{"activity_type": actTypeStr, "result_stored": true})
+	if err := execAll(ctx, tx, append(b.resultStmts(activityID, activityID, ar, now, ""),
+		b.eventStmt(activityID, storage.EventCompleted, &workerID, detail))...); err != nil {
 		return err
 	}
 
@@ -1033,49 +1030,9 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 	}
 
 	errorMessage := failure.Reason
-
-	// Non-retryable: go straight to failed
-	if !failure.Retryable {
-		_, err = tx.Exec(ctx, `
-			UPDATE runnerq_activities
-			SET status = 'failed',
-				completed_at = $1,
-				last_error = $2,
-				last_error_at = $3,
-				last_worker_id = $4,
-				current_worker_id = NULL,
-				lease_deadline_ms = NULL
-			WHERE id = $5 AND queue_name = $6 AND status = 'processing' AND current_worker_id = $4`,
-			now, errorMessage, now, workerID, activityID, b.queueName)
-		if err != nil {
-			return false, databaseError(err, fmt.Sprintf("Failed to mark as failed: %v", err))
-		}
-
-		res := &storage.ActivityResult{Data: toDetail(withFailure(map[string]any{
-			"error":     errorMessage,
-			"type":      "non_retryable",
-			"failed_at": now.Format(time.RFC3339),
-		}, failure.Details)), State: storage.ResultErr}
-		if err := b.storeResultTx(ctx, tx, activityID, activityID, res, now, ""); err != nil {
-			return false, err
-		}
-		if err := b.recordEvent(ctx, tx, activityID, storage.EventFailed, &workerID,
-			toDetail(withFailure(map[string]any{"retryable": false, "error": errorMessage}, failure.Details))); err != nil {
-			return false, err
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return false, databaseError(err, fmt.Sprintf("Failed to commit ack_failure: %v", err))
-		}
-		b.signalResult(activityID)
-		b.signalWork()
-		return false, nil
-	}
-
-	// Retryable: check if we can retry
 	canRetry := ar.maxRetries == 0 || (ar.retryCount+1) < ar.maxRetries
 
-	if canRetry {
+	if failure.Retryable && canRetry {
 		const overflowCap = int64(math.MaxInt64 / int64(time.Second))
 		baseDelay := int64(ar.retryDelaySeconds)
 		shift := min(ar.retryCount+1, 62)
@@ -1098,15 +1055,11 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		// is computed from the database clock in the UPDATE below, so retry
 		// timing is immune to app-clock skew (dequeue compares it to NOW()).
 		scheduledAt := now.Add(time.Duration(retryDelay) * time.Second)
-		newRetryCount := ar.retryCount + 1
 
-		// started_at reset to NULL alongside the flip to 'retrying' for the
-		// same reason as RequeueExpired: started_at carries "when did the
-		// current/last attempt start", and the failed attempt is no longer
-		// current. The next Dequeue (when scheduled_at fires) writes a
-		// fresh started_at for the new attempt. last_error_at preserves
-		// the failed-attempt timestamp for the runs-list sort.
-		_, err = tx.Exec(ctx, `
+		// started_at is cleared as in RequeueExpired: the failed attempt is no
+		// longer current, and the next claim writes a fresh one. last_error_at
+		// keeps the failed attempt's time for the runs-list sort.
+		if err := execAll(ctx, tx, stmt{`
 			UPDATE runnerq_activities
 			SET status = 'retrying',
 				retry_count = retry_count + 1,
@@ -1118,20 +1071,15 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 				lease_deadline_ms = NULL,
 				started_at = NULL
 			WHERE id = $5 AND queue_name = $6 AND status = 'processing' AND current_worker_id = $4`,
-			retryDelay, errorMessage, now, workerID, activityID, b.queueName)
-		if err != nil {
-			return false, databaseError(err, fmt.Sprintf("Failed to schedule retry: %v", err))
-		}
-
-		if err := b.recordEvent(ctx, tx, activityID, storage.EventRetrying, &workerID,
-			toDetail(withFailure(map[string]any{
-				"retry_count":  newRetryCount,
+			[]any{retryDelay, errorMessage, now, workerID, activityID, b.queueName},
+			"Failed to schedule retry"},
+			b.eventStmt(activityID, storage.EventRetrying, &workerID, toDetail(withFailure(map[string]any{
+				"retry_count":  ar.retryCount + 1,
 				"scheduled_at": scheduledAt.Format(time.RFC3339),
 				"error":        errorMessage,
-			}, failure.Details))); err != nil {
+			}, failure.Details)))); err != nil {
 			return false, err
 		}
-
 		if err := tx.Commit(ctx); err != nil {
 			return false, databaseError(err, fmt.Sprintf("Failed to commit ack_failure retry: %v", err))
 		}
@@ -1143,10 +1091,23 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 		return false, nil
 	}
 
-	// Dead letter queue - exhausted all retries
-	_, err = tx.Exec(ctx, `
+	// Terminal: a non-retryable failure fails the activity; a retryable one
+	// out of attempts dead-letters it.
+	deadLetter := failure.Retryable
+	status, resultType, eventType := "failed", "non_retryable", storage.EventFailed
+	eventDetail := map[string]any{"retryable": false, "error": errorMessage}
+	if deadLetter {
+		status, resultType, eventType = "dead_letter", "dead_letter", storage.EventDeadLetter
+		eventDetail = map[string]any{"error": errorMessage}
+	}
+	res := &storage.ActivityResult{Data: toDetail(withFailure(map[string]any{
+		"error":     errorMessage,
+		"type":      resultType,
+		"failed_at": now.Format(time.RFC3339),
+	}, failure.Details)), State: storage.ResultErr}
+	stmts := []stmt{{`
 		UPDATE runnerq_activities
-		SET status = 'dead_letter',
+		SET status = $7,
 			completed_at = $1,
 			last_error = $2,
 			last_error_at = $3,
@@ -1154,31 +1115,19 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 			current_worker_id = NULL,
 			lease_deadline_ms = NULL
 		WHERE id = $5 AND queue_name = $6 AND status = 'processing' AND current_worker_id = $4`,
-		now, errorMessage, now, workerID, activityID, b.queueName)
-	if err != nil {
-		return false, databaseError(err, fmt.Sprintf("Failed to move to DLQ: %v", err))
-	}
-
-	res := &storage.ActivityResult{Data: toDetail(withFailure(map[string]any{
-		"error":     errorMessage,
-		"type":      "dead_letter",
-		"failed_at": now.Format(time.RFC3339),
-	}, failure.Details)), State: storage.ResultErr}
-	if err := b.storeResultTx(ctx, tx, activityID, activityID, res, now, ""); err != nil {
+		[]any{now, errorMessage, now, workerID, activityID, b.queueName, status},
+		"Failed to record terminal failure"}}
+	stmts = append(stmts, b.resultStmts(activityID, activityID, res, now, "")...)
+	stmts = append(stmts, b.eventStmt(activityID, eventType, &workerID, toDetail(withFailure(eventDetail, failure.Details))))
+	if err := execAll(ctx, tx, stmts...); err != nil {
 		return false, err
 	}
-	if err := b.recordEvent(ctx, tx, activityID, storage.EventDeadLetter, &workerID,
-		toDetail(withFailure(map[string]any{"error": errorMessage}, failure.Details))); err != nil {
-		return false, err
-	}
-
 	if err := tx.Commit(ctx); err != nil {
-		return false, databaseError(err, fmt.Sprintf("Failed to commit ack_failure DLQ: %v", err))
+		return false, databaseError(err, fmt.Sprintf("Failed to commit ack_failure: %v", err))
 	}
-
 	b.signalResult(activityID)
 	b.signalWork()
-	return true, nil
+	return deadLetter, nil
 }
 
 func (b *PostgresBackend) ProcessScheduled(_ context.Context) (uint64, error) {
@@ -1260,30 +1209,28 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 		return 0, nil
 	}
 
+	var stmts []stmt
 	for _, r := range reaped {
 		if r.deadLetter {
 			// Store an error result so any parent awaiting this activity
-			// resolves instead of polling until its own timeout. Note the
+			// resolves instead of polling until its own timeout. The
 			// engine-side OnDeadLetter hook does not fire for reaper
-			// dead-letters — there is no live handler to call it on.
+			// dead-letters: there is no live handler to call it on.
 			res := &storage.ActivityResult{Data: toDetail(map[string]any{
 				"error":     leaseExpiredError,
 				"type":      "dead_letter",
 				"failed_at": now.Format(time.RFC3339),
 			}), State: storage.ResultErr}
-			if err := b.storeResultTx(ctx, tx, r.id, r.id, res, now, ""); err != nil {
-				return 0, err
-			}
-			if err := b.recordEvent(ctx, tx, r.id, storage.EventDeadLetter, nil,
-				toDetail(map[string]any{"error": leaseExpiredError, "reason": "lease_expired"})); err != nil {
-				return 0, err
-			}
+			stmts = append(stmts, b.resultStmts(r.id, r.id, res, now, "")...)
+			stmts = append(stmts, b.eventStmt(r.id, storage.EventDeadLetter, nil,
+				toDetail(map[string]any{"error": leaseExpiredError, "reason": "lease_expired"})))
 			continue
 		}
-		if err := b.recordEvent(ctx, tx, r.id, storage.EventRequeued, nil,
-			toDetail(map[string]any{"retry_count": r.retryCount, "reason": "lease_expired"})); err != nil {
-			return 0, err
-		}
+		stmts = append(stmts, b.eventStmt(r.id, storage.EventRequeued, nil,
+			toDetail(map[string]any{"retry_count": r.retryCount, "reason": "lease_expired"})))
+	}
+	if err := execAll(ctx, tx, stmts...); err != nil {
+		return 0, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -1806,6 +1753,13 @@ func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.Q
 	copiedKey.Key = key
 	copied.IdempotencyKey = &copiedKey
 	a = &copied
+	enqueueTx := func() error {
+		stmts, err := b.enqueueStmts(a)
+		if err != nil {
+			return err
+		}
+		return execAll(ctx, tx, stmts...)
+	}
 
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO runnerq_idempotency (queue_name, idempotency_key, activity_id, created_at, updated_at)
@@ -1818,7 +1772,7 @@ func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.Q
 
 	if tag.RowsAffected() > 0 {
 		// Fresh claim — enqueue in the same transaction.
-		if err := b.enqueueInTx(ctx, tx, a); err != nil {
+		if err := enqueueTx(); err != nil {
 			return nil, false, err
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -1858,7 +1812,7 @@ func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.Q
 			a.ID, b.queueName, key); err != nil {
 			return nil, false, databaseError(err, fmt.Sprintf("Failed to update key: %v", err))
 		}
-		if err := b.enqueueInTx(ctx, tx, a); err != nil {
+		if err := enqueueTx(); err != nil {
 			return nil, false, err
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -1879,8 +1833,10 @@ func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.Q
 
 	switch behavior {
 	case storage.BehaviorReturnExisting:
-		if err := b.linkChildTx(ctx, tx, a.ParentActivityID, existingID); err != nil {
-			return nil, false, err
+		if a.ParentActivityID != nil {
+			if err := execAll(ctx, tx, b.linkStmt(*a.ParentActivityID, existingID)); err != nil {
+				return nil, false, err
+			}
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return nil, false, databaseError(err, "failed to commit reused dependency")
