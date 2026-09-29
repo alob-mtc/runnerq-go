@@ -11,13 +11,10 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// Query: the storage.QueryStorage surface RunnerQ Cloud reads through —
-// canonical statuses, filters, keyset paging, projections, counts,
-// aggregates, events, steps and trees. Optional: skipped for backends that
-// do not implement QueryStorage.
-//
-// Queries span every queue in the store, so each test scopes itself with a
-// queue filter; that also proves the queue filter works.
+// Query (storage.QueryStorage, skipped when absent): canonical statuses,
+// filters, keyset paging, projections, counts, aggregates, events, steps and
+// trees. Queries span every queue in the store, so each test scopes itself
+// with a queue filter, which also proves that filter works.
 var queryTests = []conformanceTest{
 	{"CanonicalStatusesAndFields", testQueryCanonicalFields},
 	{"FiltersCombine", testQueryFilters},

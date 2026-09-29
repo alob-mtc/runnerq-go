@@ -52,9 +52,9 @@ func testAckSuccess(t *testing.T, h Harness) {
 	}
 }
 
-// A completion whose reply was lost is retried with the same token and the
-// same result: it must succeed without a second Completed event. The same
-// token with a different result is a conflict, and the row is unchanged.
+// Retrying a completion (lost reply) with the same token and result succeeds
+// without a second Completed event; a different result conflicts and leaves
+// the row unchanged.
 func testAckSuccessRetry(t *testing.T, h Harness) {
 	s := newSuite(t, h)
 	a := s.enqueueClaimed("w", activity())

@@ -8,12 +8,10 @@ import (
 	"github.com/google/uuid"
 )
 
-// CommandStorage applies RunnerQ Cloud commands (cancel, retry, run now,
-// reschedule, set priority, delete, signal) to the activities of the
-// backend's own queue. Commands are idempotent by Command.ID: a backend
-// records each applied command with its result for at least 24 hours and
-// replays that result when the same ID arrives again; the same ID with
-// different input (Fingerprint) is ErrConflict.
+// CommandStorage applies RunnerQ Cloud commands to the backend's own queue.
+// Commands are idempotent by Command.ID: the backend keeps each applied
+// command's result for at least 24 hours and replays it for the same ID; the
+// same ID with a different Fingerprint is ErrConflict.
 //
 // Per-target problems (not found, wrong state) are reported per item and do
 // not fail the command. A returned error means nothing was applied.
@@ -21,7 +19,6 @@ type CommandStorage interface {
 	ApplyCommand(ctx context.Context, cmd Command) (*CommandResult, error)
 }
 
-// CommandKind names a command.
 type CommandKind string
 
 const (
@@ -48,8 +45,7 @@ type CommandTarget struct {
 type Command struct {
 	// ID makes the command idempotent; empty disables the ledger.
 	ID string
-	// Fingerprint identifies the command's input, to detect an ID reused
-	// with different input.
+	// Fingerprint identifies the input, to detect a reused ID.
 	Fingerprint string
 	Kind        CommandKind
 	Target      CommandTarget
@@ -63,13 +59,12 @@ type Command struct {
 	// At is the new time (reschedule).
 	At time.Time
 	// Priority is the new priority (set_priority).
-	Priority ActivityPriority
-	// SignalName and SignalPayload are the signal (signal).
+	Priority      ActivityPriority
 	SignalName    string
 	SignalPayload json.RawMessage
 }
 
-// Command item outcomes.
+// CommandItem.Outcome values.
 const (
 	CommandApplied    = "applied"
 	CommandSkipped    = "skipped"
@@ -80,11 +75,10 @@ const (
 type CommandItem struct {
 	ID      uuid.UUID
 	Outcome string
-	// Status is the activity's canonical status after the command (or its
-	// current one when skipped).
+	// Status is the canonical status after the command (current if skipped).
 	Status string
 	// ErrKind and ErrMessage explain a skip: ErrNotFound, or ErrConflict for
-	// a target in the wrong state (failed precondition).
+	// a target in the wrong state.
 	ErrKind    StorageErrorKind
 	ErrMessage string
 }
@@ -103,8 +97,8 @@ type CommandResult struct {
 }
 
 // CheckpointID derives the id of an activity's named checkpoint (kind "run",
-// "sleep", "signal", ...). Engine and backends derive the same id, so a
-// signal stored by a backend is the one the handler's WaitForSignal reads.
+// "sleep", "signal", ...). Backends must use it so a signal they store is the
+// one the handler's WaitForSignal reads.
 func CheckpointID(activityID uuid.UUID, kind, name string) uuid.UUID {
 	return uuid.NewSHA1(activityID, []byte(kind+":"+name))
 }

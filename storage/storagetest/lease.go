@@ -8,9 +8,9 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// Lease recovery: a claim whose lease expired is presumed dead. The reaper
-// returns it to the queue as a failed attempt, and the old execution can no
-// longer act on it — while a live execution can keep its claim alive.
+// Lease recovery: an expired claim is presumed dead; the reaper requeues it as
+// a failed attempt and the old execution can no longer act on it. A live
+// execution can keep renewing its claim.
 var leaseTests = []conformanceTest{
 	{"ReaperRequeuesExpiredLeasesOnly", testReaperRequeuesExpired},
 	{"ReaperCountsAttemptAndDeadLetters", testReaperAttemptAccounting},

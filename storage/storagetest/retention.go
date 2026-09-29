@@ -10,9 +10,9 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// Retention: terminal workflow trees older than their TTL are deleted whole
-// — activities, events, results and checkpoints, idempotency keys — and
-// nothing else is.
+// Retention: terminal trees older than their TTL are deleted whole
+// (activities, events, results, checkpoints, idempotency keys), and nothing
+// else is.
 var retentionTests = []conformanceTest{
 	{"SweepsWholeTerminalTrees", testRetentionSweepsTrees},
 	{"KeepsTreesWithLiveDescendants", testRetentionKeepsLiveTrees},
@@ -30,10 +30,9 @@ type tree struct {
 	key                     string
 }
 
-// finishTree runs a two-activity workflow to its end through the public
-// surface: the root spawns a keyed child, parks on it, the child stores a
-// checkpoint and completes, the root wakes and ends with rootOutcome
-// ("completed" or "failed").
+// finishTree runs a two-activity workflow to its end: the root spawns a keyed
+// child and parks on it, the child stores a checkpoint and completes, and the
+// root wakes and ends with rootOutcome ("completed" or "failed").
 func (s *suite) finishTree(rootOutcome string) tree {
 	s.t.Helper()
 	root := s.enqueueClaimed("r1", activity(withType("root")))

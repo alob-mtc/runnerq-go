@@ -1,9 +1,8 @@
 package storage
 
-// ManagedMaintenanceStorage identifies services that perform lease recovery and
-// retention independently of SDK workers. Configure retention on the service;
-// engine retention settings are rejected to avoid silently ignoring a policy.
-// Existing backends without this capability keep worker-owned maintenance.
+// ManagedMaintenanceStorage marks services that run lease recovery and
+// retention themselves. Engine retention settings are then rejected rather
+// than silently ignored; configure retention on the service.
 type ManagedMaintenanceStorage interface {
 	MaintenanceManaged() bool
 }

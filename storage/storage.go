@@ -54,10 +54,9 @@ type QueuedActivity struct {
 	ParentActivityID     *uuid.UUID
 	RootActivityID       uuid.UUID
 	Depth                uint16
-	// Serialization is the payload's encoding: empty for plain JSON (json-v1),
-	// which is all the Go SDK writes. Other SDKs set their own (the TypeScript
-	// SDK's native superjson-v1); backends store it with the payload and return
-	// it with claims.
+	// Serialization is the payload's encoding: empty means plain JSON
+	// (json-v1), all the Go SDK writes. The TypeScript SDK sets superjson-v1;
+	// backends store it with the payload and return it with claims.
 	Serialization string `json:",omitempty"`
 }
 
@@ -70,9 +69,8 @@ type IdempotencyKeyConfig struct {
 	Behavior IdempotencyBehavior
 }
 
-// IdempotencyResult is returned by EnqueueIdempotent when an existing activity
-// already owns the idempotency key. ExistingParentID is the parent recorded on
-// that activity (may be nil for legacy or root activities).
+// IdempotencyResult describes the existing activity that already owns an
+// idempotency key. ExistingParentID is nil for root or legacy activities.
 type IdempotencyResult struct {
 	ExistingID       uuid.UUID
 	ExistingParentID *uuid.UUID
@@ -81,29 +79,22 @@ type IdempotencyResult struct {
 // DequeuedActivity is an activity claimed by a worker.
 type DequeuedActivity struct {
 	Activity QueuedActivity
-	// LeaseID is the execution token recorded as the claim's worker ID. Every
-	// fenced acknowledgement (AckSuccess, AckFailure, Yield, ...) presents it.
-	// Batch claims return a distinct token per activity.
+	// LeaseID is the execution token recorded as the claim's worker ID and
+	// presented by every fenced acknowledgement. Unique per claimed activity.
 	LeaseID       string
 	Attempt       uint32
 	LeaseDeadline time.Time
 }
 
-// BatchQueueStorage is an optional capability: a backend that can claim
-// several runnable activities in one round trip. The engine detects it with a
-// type assertion and, when present, replaces its per-slot Dequeue loops with
-// one dispatcher that claims exactly as many activities as it has idle slots.
-// Backends without it keep working through QueueStorage.Dequeue.
+// BatchQueueStorage is an optional capability for claiming several activities
+// in one round trip; when present the engine claims exactly as many as it has
+// idle slots instead of looping Dequeue per slot.
 //
-// DequeueBatch claims at most limit activities, selected and ordered by the
-// same eligibility rules as Dequeue, and returns each with its own unique
-// LeaseID. The engine passes a fresh workerIDPrefix on every call and
-// implementations derive each LeaseID from it (for example
-// "<prefix>:<activity id>"), so a token can never collide with a claim made by
-// another call. timeout has Dequeue's meaning: zero is a single non-blocking
-// probe; a positive value blocks until at least one activity is claimable or
-// the timeout elapses. An empty result with a nil error means nothing became
-// claimable in time.
+// DequeueBatch claims at most limit activities under Dequeue's eligibility and
+// ordering rules. workerIDPrefix is fresh per call; each LeaseID must be unique
+// and derived from it (e.g. "<prefix>:<activity id>") so tokens never collide
+// across calls. timeout means what it does for Dequeue; an empty result with a
+// nil error means nothing became claimable in time.
 type BatchQueueStorage interface {
 	DequeueBatch(ctx context.Context, workerIDPrefix string, limit int, timeout time.Duration, activityTypes []string) ([]DequeuedActivity, error)
 }
@@ -112,15 +103,12 @@ type BatchQueueStorage interface {
 type ActivityResult struct {
 	Data  json.RawMessage
 	State ResultState
-	// Serialization is Data's encoding; empty for plain JSON (json-v1), as for
-	// QueuedActivity.Serialization.
+	// Serialization is Data's encoding, as for QueuedActivity.Serialization.
 	Serialization string `json:",omitempty"`
 }
 
-// StepRecord is one durable checkpoint of an activity (a ctx.Run or ctx.Sleep
-// step), decoded for inspection. Kind is "run"/"sleep"; Name is the
-// user-supplied step name. Data is the stored result (for Run) or the persisted
-// wake deadline (for Sleep).
+// StepRecord is one durable Run or Sleep checkpoint, decoded for inspection.
+// Kind is "run" or "sleep"; Data is the Run result or the Sleep wake deadline.
 type StepRecord struct {
 	Kind      string
 	Name      string
@@ -129,17 +117,16 @@ type StepRecord struct {
 	CreatedAt time.Time
 }
 
-// RetentionPolicy controls how long terminal workflow trees are kept before
-// the retention sweeper deletes them (activities, events, results including
-// Run/Sleep checkpoints, and idempotency keys). A zero duration means "keep
-// forever" for that class. The deletion unit is the whole tree rooted at a
-// terminal root with no non-terminal descendants — never individual rows, so
-// a retried parent can never find its children's results missing.
+// RetentionPolicy sets how long terminal workflow trees are kept before the
+// sweeper deletes their activities, events, results (checkpoints included) and
+// idempotency keys. Zero keeps that class forever. The unit is the whole tree
+// under a terminal root with no non-terminal descendants, never single rows,
+// so a retried parent never finds its children's results missing.
 type RetentionPolicy struct {
-	// Completed applies to trees whose root finished with status completed.
+	// Completed applies to trees whose root completed.
 	Completed time.Duration
-	// Failed applies to trees whose root is failed, dead_letter or cancelled — kept on
-	// a separate clock so operators can hold failures longer for inspection.
+	// Failed applies to failed, dead_letter or cancelled roots, on a separate
+	// clock so failures can be held longer for inspection.
 	Failed time.Duration
 }
 
@@ -148,29 +135,27 @@ type FailureKind struct {
 	Retryable bool
 	Reason    string
 	IsTimeout bool
-	// Details is a structured account of the failure (the TypeScript SDK
-	// records name, message, stack, code and cause), stored in the error
-	// result as "failure". Empty for the Go SDK.
+	// Details is the structured failure (the TypeScript SDK's name, message,
+	// stack, code and cause), stored in the error result as "failure". Empty
+	// for the Go SDK.
 	Details json.RawMessage `json:",omitempty"`
 }
 
-// NewRetryableFailure creates a retryable failure.
 func NewRetryableFailure(reason string) FailureKind {
 	return FailureKind{Retryable: true, Reason: reason}
 }
 
-// NewNonRetryableFailure creates a non-retryable failure.
 func NewNonRetryableFailure(reason string) FailureKind {
 	return FailureKind{Retryable: false, Reason: reason}
 }
 
-// NewTimeoutFailure creates a timeout failure (treated as retryable).
+// NewTimeoutFailure returns a retryable timeout failure.
 func NewTimeoutFailure() FailureKind {
 	return FailureKind{Retryable: true, Reason: "Activity execution timed out", IsTimeout: true}
 }
 
-// ActivitySnapshot is an activity's stored state, as the conformance suite
-// reads it back (storagetest.Reader).
+// ActivitySnapshot is an activity's stored state as storagetest.Reader
+// returns it.
 type ActivitySnapshot struct {
 	ID                uuid.UUID         `json:"id"`
 	ActivityType      string            `json:"activity_type"`
@@ -211,20 +196,17 @@ const (
 	EventFailed     ActivityEventType = "Failed"
 	EventRetrying   ActivityEventType = "Retrying"
 	EventDeadLetter ActivityEventType = "DeadLetter"
-	// EventRequeued records the reaper returning an expired-lease activity to
-	// the pending state for another attempt.
+	// EventRequeued: the reaper returned an expired-lease activity to pending.
 	EventRequeued ActivityEventType = "Requeued"
-	// EventYielded records a durable Sleep or signal wait parking the
-	// activity until its wake time without consuming a retry.
-	EventYielded ActivityEventType = "Yielded"
-	// EventSignaled records an external signal delivered to an activity.
+	// EventYielded: a durable wait parked the activity without consuming a retry.
+	EventYielded       ActivityEventType = "Yielded"
 	EventSignaled      ActivityEventType = "Signaled"
 	EventLeaseExtended ActivityEventType = "LeaseExtended"
 	EventResultStored  ActivityEventType = "ResultStored"
-	// EventSpawnLinked records a secondary parent's link to an existing activity
-	// when an idempotency reuse causes a different parent to claim ownership.
+	// EventSpawnLinked: idempotency reuse linked another parent to an existing
+	// activity.
 	EventSpawnLinked ActivityEventType = "SpawnLinked"
-	// Command events: operator actions applied through CommandStorage.
+	// Operator actions applied through CommandStorage.
 	EventCancelled       ActivityEventType = "Cancelled"
 	EventRetried         ActivityEventType = "Retried"
 	EventRedriven        ActivityEventType = "Redriven"
@@ -242,7 +224,7 @@ type ActivityEvent struct {
 	Detail     json.RawMessage   `json:"detail,omitempty"`
 }
 
-// DeadLetterRecord is an activity in the dead letter queue.
+// DeadLetterRecord is a dead-lettered activity.
 type DeadLetterRecord struct {
 	Activity ActivitySnapshot `json:"activity"`
 	Error    string           `json:"error"`
@@ -254,13 +236,10 @@ type ResultStorage interface {
 	GetResult(ctx context.Context, activityID uuid.UUID) (*ActivityResult, error)
 }
 
-// ResultWaiter is an optional capability: backends that can block efficiently
-// until a result exists (e.g. via LISTEN/NOTIFY) implement it, and futures
-// use it instead of polling GetResult. The wait must work across processes —
-// the caller awaiting a result is routinely a different process from the
-// worker that produces it, connected only through the shared database.
-// Implementations must return once the result exists, or with the context's
-// error on cancellation.
+// ResultWaiter is an optional capability for blocking until a result exists
+// (e.g. via LISTEN/NOTIFY) instead of polling GetResult. The wait must work
+// across processes: the waiter and the producing worker usually share only the
+// database. It returns once the result exists, or with ctx's error.
 type ResultWaiter interface {
 	WaitForResult(ctx context.Context, activityID uuid.UUID) (*ActivityResult, error)
 }
@@ -270,108 +249,80 @@ type QueueStorage interface {
 	ResultStorage
 
 	Enqueue(ctx context.Context, activity QueuedActivity) error
-	// Dequeue claims the next runnable activity. timeout is the maximum time
-	// to block waiting for work when the queue is empty (0 = single
-	// non-blocking attempt); (nil, nil) means nothing became claimable.
+	// Dequeue claims the next runnable activity, blocking up to timeout for
+	// work (0: one non-blocking attempt); (nil, nil) means nothing was claimable.
 	Dequeue(ctx context.Context, workerID string, timeout time.Duration, activityTypes []string) (*QueuedActivity, error)
-	// AckSuccess marks an activity as completed and persists its result.
-	// Implementations MUST store the result atomically with the status change
-	// and MUST write a result record even when result is nil, so callers
-	// awaiting the result can always resolve once the activity completes.
-	// workerID is a unique execution token, not a reusable worker-slot label.
-	// Retrying an identical committed acknowledgement with the same token must
-	// succeed; a stale/conflicting acknowledgement must not change the row.
+	// AckSuccess completes an activity. The result MUST be stored atomically
+	// with the status change, and a result record MUST be written even when
+	// result is nil so waiters always resolve. workerID is the unique execution
+	// token: retrying an identical committed ack with it must succeed; a stale
+	// or conflicting ack must not change the row.
 	AckSuccess(ctx context.Context, activityID uuid.UUID, result json.RawMessage, workerID string) error
-	// AckFailure records a failure once per execution token. Retrying the same
-	// committed failure returns its original dead-letter decision without
-	// consuming another execution attempt. Returns true for dead-lettering.
+	// AckFailure records a failure once per execution token and reports whether
+	// the activity was dead-lettered. Retrying the same committed failure
+	// returns the original decision without consuming another attempt.
 	AckFailure(ctx context.Context, activityID uuid.UUID, failure FailureKind, workerID string) (bool, error)
 	ProcessScheduled(ctx context.Context) (uint64, error)
 	RequeueExpired(ctx context.Context, batchSize int) (uint64, error)
-	// Yield reschedules a processing activity to wake at wakeAt WITHOUT
-	// counting a retry — the engine uses it when a durable Sleep's wake time
-	// doesn't fit the current attempt's timeout budget. Must be fenced on
-	// workerID like AckSuccess/AckFailure (only the claiming worker may
-	// yield) and return an ErrClaimLost error when the row is no longer
-	// claimed by that worker. kind ("sleep"/"signal"/"await") and step (the step or
-	// signal name) describe the wait for observability and are recorded on the
-	// Yielded event only; both may be empty and no row state depends on them.
+	// Yield parks a processing activity until wakeAt WITHOUT counting a retry
+	// (for durable waits longer than the attempt's timeout). Fenced on workerID
+	// like the acks: returns ErrClaimLost when that worker no longer holds the
+	// claim. kind ("sleep"/"signal"/"await") and step are recorded on the
+	// Yielded event only; either may be empty.
 	Yield(ctx context.Context, activityID uuid.UUID, wakeAt time.Time, workerID, kind, step string) error
 	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
-	// StoreResult persists a result row. ownerActivityID is the activity
-	// whose lifetime governs the row: pass the activity's own ID for normal
-	// results, or the handler's activity ID for Run/Sleep checkpoints whose
-	// activityID is synthetic. step is the checkpoint's human identity
-	// ("kind:name", e.g. "run:create-transfer") for the console's step history,
-	// or "" for an activity's own result. The retention sweeper deletes result
-	// rows together with their owner's workflow tree.
+	// StoreResult persists a result row. ownerActivityID governs its lifetime
+	// (retention deletes it with the owner's tree): the activity itself for its
+	// own result, or the handler's activity for a checkpoint with a synthetic
+	// activityID. step is the checkpoint's "kind:name" (e.g.
+	// "run:create-transfer"), or "" for an activity's own result.
 	StoreResult(ctx context.Context, activityID uuid.UUID, ownerActivityID uuid.UUID, result ActivityResult, step string) error
-	// WakeWaiting makes a yield-parked ('waiting') activity immediately
-	// runnable; false when the activity is in any other state. The engine
-	// uses it to close the park race (a result committing between a
-	// handler's final check and its park landing produces no wake of its
-	// own).
+	// WakeWaiting makes a parked ('waiting') activity runnable now; false in
+	// any other state. It closes the race where a result commits between a
+	// handler's last check and its park, which produces no wake of its own.
 	WakeWaiting(ctx context.Context, activityID uuid.UUID) (bool, error)
-	// SignalActivity delivers an external signal to an activity: it stores
-	// payload as a result row under signalID (owned by activityID, so the
-	// retention sweeper collects it with the tree) and, if the target is
-	// parked (yielded waiting for the signal), makes it immediately runnable.
-	// Atomic: store + wake commit together. Repeated signals with the same
-	// signalID overwrite the payload (last write wins). name is the human
-	// signal name, recorded on the result row (as "signal:<name>") and the
-	// Signaled event so the console can show which signal was delivered; ""
-	// is allowed. Must return a not-found error when no activity row matches
-	// activityID — silently storing signals for nonexistent activities would
-	// leak uncollectable rows.
+	// SignalActivity stores payload as a result row under signalID, owned by
+	// activityID, and wakes the activity if parked; store and wake commit
+	// atomically. The same signalID again overwrites (last write wins). name
+	// (may be "") is recorded as "signal:<name>" on the row and on the Signaled
+	// event. Must return a not-found error for an unknown activityID, or the
+	// row would never be collected.
 	SignalActivity(ctx context.Context, activityID uuid.UUID, signalID uuid.UUID, name string, payload json.RawMessage) error
-	// LookupIdempotencyActivityID returns the activity ID that currently owns
-	// idempotencyKey in this queue, so a caller can address a signal by
-	// business idempotency key instead of by internal activity ID (see
-	// runnerq.SignalActivityByKey). The idempotency table's PRIMARY KEY makes
-	// this at most one activity. Returns a not-found error when no activity
-	// holds the key (never claimed, or completed and retention-swept).
+	// LookupIdempotencyActivityID returns the one activity that owns
+	// idempotencyKey in this queue (see runnerq.SignalActivityByKey), or a
+	// not-found error when none does (never claimed, or retention-swept).
 	LookupIdempotencyActivityID(ctx context.Context, idempotencyKey string) (uuid.UUID, error)
-	// CleanupExpired deletes terminal workflow trees older than the policy's
-	// TTLs, up to batchSize roots per call, and returns the number of root
-	// trees deleted. Implementations must (a) only delete trees whose root is
-	// terminal AND has no non-terminal descendants, (b) delete the tree's
-	// activities, events, results (by activity AND by owner), and idempotency
-	// keys together, and (c) coordinate so concurrent sweepers don't duplicate
-	// work (returning 0 when another sweeper holds the lease is correct).
+	// CleanupExpired deletes up to batchSize terminal trees older than the
+	// policy allows and returns how many. It must (a) delete only trees whose
+	// root is terminal with no non-terminal descendants, (b) delete the tree's
+	// activities, events, results (by activity AND by owner) and idempotency
+	// keys together, and (c) keep concurrent sweepers from duplicating work
+	// (returning 0 while another holds the lease is correct).
 	CleanupExpired(ctx context.Context, policy RetentionPolicy, batchSize int) (uint64, error)
-	// EnqueueIdempotent claims the activity's idempotency key AND enqueues the
-	// activity in a single atomic operation. A nil result with a nil error
-	// means the activity was enqueued (the caller MUST NOT call Enqueue
-	// separately — doing so would double-enqueue). If a row already owns the
-	// key and the configured behavior keeps it, the result describes the
-	// existing activity (its id and the parent_activity_id recorded on it)
-	// and nothing was enqueued.
-	//
-	// The claim and the enqueue MUST be atomic: a crash can never leave a
-	// claimed key pointing at an activity that was never enqueued, which
-	// would permanently brick the key.
+	// EnqueueIdempotent claims the idempotency key and enqueues the activity
+	// atomically, so a crash never leaves a key claimed by an activity that
+	// was never enqueued (bricking the key). (nil, nil) means it was enqueued;
+	// callers MUST NOT also call Enqueue. When an existing owner is kept under
+	// the key's behavior, the result describes it and nothing is enqueued.
 	EnqueueIdempotent(ctx context.Context, activity *QueuedActivity) (*IdempotencyResult, error)
-	// RecordSpawnLinked records that parentID logically spawned childID, even
-	// though no new activity row was created (idempotency reuse). Best-effort:
-	// callers should log but not fail on errors.
+	// RecordSpawnLinked records that parentID spawned the existing childID
+	// (idempotency reuse). Best-effort: callers log errors and continue.
 	RecordSpawnLinked(ctx context.Context, childID, parentID uuid.UUID) error
-	// SchedulesNatively returns true if dequeue handles scheduled activities natively.
+	// SchedulesNatively reports whether due scheduled activities become
+	// claimable without the engine calling ProcessScheduled.
 	SchedulesNatively() bool
 }
 
-// Storage is the surface a backend must provide: the queue and its results.
-// The conformance suite in storage/storagetest states the behaviour the
-// engine relies on as tests; a new backend runs it from its own test file and
-// passes before it can be trusted with durable execution. Reading and
-// commanding activities from outside the engine is QueryStorage and
-// CommandStorage, both optional.
+// Storage is the surface a backend must provide. A new backend must pass the
+// storage/storagetest conformance suite before it is trusted with durable
+// execution. QueryStorage and CommandStorage are optional.
 type Storage interface {
 	QueueStorage
 	ResultStorage
 }
 
-// LeaseConfigurer is an optional interface backends can implement to accept
-// the lease duration from the engine configuration at startup.
+// LeaseConfigurer is an optional capability that receives the engine's lease
+// duration at startup.
 type LeaseConfigurer interface {
 	SetLeaseMS(leaseMS int64)
 }

@@ -1,10 +1,9 @@
 // Package storagetest is the conformance suite for storage.Storage backends.
 //
-// The durable-execution guarantees RunnerQ makes — claimed once, fenced
+// RunnerQ's durable-execution guarantees (claimed once, fenced
 // acknowledgements, lease recovery, checkpoints that survive replay, parents
-// that wake when awaited results arrive, atomic idempotency — are all promises the
-// storage backend keeps; the engine only composes them. This suite states
-// those promises as tests, so a backend that passes it can be swapped in for
+// woken by awaited results, atomic idempotency) are kept by the backend; the
+// engine only composes them. A backend that passes this suite can replace
 // another without the engine noticing.
 //
 // A backend's own test file runs the suite through a Harness:
@@ -13,17 +12,13 @@
 //		storagetest.Run(t, myHarness{})
 //	}
 //
-// Every test opens a fresh backend on its own queue name and drives it through
-// storage.Storage and the optional interfaces alone. The harness supplies
-// only what those interfaces cannot express: opening a backend on a named
-// queue, and moving a lease into the past.
+// Each test opens a fresh backend on its own queue and drives it only through
+// storage.Storage and the optional interfaces; the harness supplies what those
+// can't express: opening a named queue and expiring a lease.
 //
-// The optional interfaces durable execution depends on — CheckpointStorage,
-// DependencyStorage, AttemptLeaseStorage, SpawnStorage — are required: their
-// tests fail when the backend lacks them. BatchQueueStorage and ResultWaiter
-// are optimisations the engine can do without; their tests are skipped.
-// QueryStorage and CommandStorage serve RunnerQ Cloud; their tests are
-// skipped for backends without them.
+// CheckpointStorage, DependencyStorage, AttemptLeaseStorage and SpawnStorage
+// are required: their tests fail without them. Tests for BatchQueueStorage,
+// ResultWaiter, QueryStorage and CommandStorage are skipped when absent.
 package storagetest
 
 import (
@@ -41,24 +36,20 @@ import (
 
 // Harness adapts one backend implementation to the suite.
 type Harness interface {
-	// Open returns a backend serving queue, closed by t.Cleanup. The backend
-	// must also implement Reader, which the suite uses to check what was
-	// stored. Two calls
-	// with the same queue must return independent handles that share the
-	// store — the suite uses that to stand in for two processes.
+	// Open returns a backend serving queue, closed by t.Cleanup, that also
+	// implements Reader. Two calls with the same queue must return independent
+	// handles on the same store; the suite uses them as two processes.
 	Open(t *testing.T, queue string) storage.Storage
-	// ExpireLease moves the lease of a processing activity into the past, as
-	// the passage of time would, so the backend's own RequeueExpired sees it.
+	// ExpireLease moves a processing activity's lease into the past so the
+	// backend's RequeueExpired recovers it.
 	ExpireLease(ctx context.Context, b storage.Storage, activityID uuid.UUID) error
 }
 
-// wait is the suite's bound on operations that block on another party:
-// blocking claims, result waits, event delivery. Generous enough for a slow
-// CI database, short enough that a missed wake fails the run instead of
-// hanging it.
+// wait bounds operations that block on another party: long enough for a slow
+// CI database, short enough that a missed wake fails instead of hanging.
 const wait = 10 * time.Second
 
-// Run executes the whole suite against h.
+// Run runs the whole suite against h.
 func Run(t *testing.T, h Harness) {
 	t.Helper()
 	for _, g := range []struct {
@@ -87,9 +78,8 @@ type conformanceTest struct {
 	fn   func(t *testing.T, h Harness)
 }
 
-// Reader is what the suite reads to check the state a backend stored. It
-// isn't part of storage.Storage, since the engine never reads these: a
-// backend provides it for its conformance run.
+// Reader lets the suite check what a backend stored. The engine never uses it,
+// so it is not part of storage.Storage.
 type Reader interface {
 	GetActivity(ctx context.Context, activityID uuid.UUID) (*storage.ActivitySnapshot, error)
 	GetActivityEvents(ctx context.Context, activityID uuid.UUID, limit int) ([]storage.ActivityEvent, error)
@@ -99,8 +89,6 @@ type Reader interface {
 	ListDeadLetter(ctx context.Context, offset, limit int) ([]storage.DeadLetterRecord, error)
 }
 
-// suite is the per-test environment: a queue name and the primary handle,
-// with its Reader for checking what was stored.
 type suite struct {
 	t     *testing.T
 	h     Harness
@@ -121,14 +109,14 @@ func newSuite(t *testing.T, h Harness) *suite {
 	return &suite{t: t, h: h, queue: queue, b: b, r: r, ctx: context.Background()}
 }
 
-// another opens a second handle on the suite's queue: a separate process.
+// another opens a second handle on the queue, standing in for another process.
 func (s *suite) another() storage.Storage {
 	s.t.Helper()
 	return s.h.Open(s.t, s.queue)
 }
 
-// activity is a runnable activity with the suite's defaults; options adjust
-// it. The 30s timeout keeps leases comfortably in the future.
+// activity builds a runnable activity; the 30s timeout keeps leases well in
+// the future.
 func activity(opts ...func(*storage.QueuedActivity)) storage.QueuedActivity {
 	a := storage.QueuedActivity{
 		ID:             uuid.New(),
@@ -189,8 +177,7 @@ func (s *suite) enqueue(a storage.QueuedActivity) storage.QueuedActivity {
 	return a
 }
 
-// promote runs the scheduled-activity processor for backends that need it,
-// so due scheduled/retrying rows become claimable through Dequeue.
+// promote runs ProcessScheduled for backends that don't schedule natively.
 func (s *suite) promote() {
 	s.t.Helper()
 	if s.b.SchedulesNatively() {
@@ -201,7 +188,7 @@ func (s *suite) promote() {
 	}
 }
 
-// tryClaim is one non-blocking claim; nil when nothing is claimable.
+// tryClaim makes one non-blocking claim; nil when nothing is claimable.
 func (s *suite) tryClaim(worker string, types ...string) *storage.QueuedActivity {
 	s.t.Helper()
 	s.promote()
@@ -212,7 +199,6 @@ func (s *suite) tryClaim(worker string, types ...string) *storage.QueuedActivity
 	return got
 }
 
-// claim claims exactly want under worker's token and fails otherwise.
 func (s *suite) claim(worker string, want storage.QueuedActivity, types ...string) {
 	s.t.Helper()
 	got := s.tryClaim(worker, types...)
@@ -221,7 +207,6 @@ func (s *suite) claim(worker string, want storage.QueuedActivity, types ...strin
 	}
 }
 
-// claimNothing asserts the queue has nothing claimable right now.
 func (s *suite) claimNothing(types ...string) {
 	s.t.Helper()
 	if got := s.tryClaim("nobody", types...); got != nil {
@@ -229,7 +214,6 @@ func (s *suite) claimNothing(types ...string) {
 	}
 }
 
-// enqueueClaimed enqueues a and claims it as worker.
 func (s *suite) enqueueClaimed(worker string, a storage.QueuedActivity) storage.QueuedActivity {
 	s.t.Helper()
 	s.enqueue(a)
@@ -249,10 +233,8 @@ func (s *suite) snapshot(id uuid.UUID) storage.ActivitySnapshot {
 	return *snap
 }
 
-// snapshotStatus maps a row's status — the vocabulary of the status filters
-// on ListRecentRoots/ListRecentActivities — to the display name
-// ActivitySnapshot.Status carries. Both are part of the contract: the
-// console filters by the former and renders the latter.
+// snapshotStatus maps each row status to the display name
+// ActivitySnapshot.Status carries; both vocabularies are part of the contract.
 var snapshotStatus = map[string]string{
 	"pending":     "Pending",
 	"processing":  "Running",
@@ -265,8 +247,7 @@ var snapshotStatus = map[string]string{
 	"cancelled":   "Cancelled",
 }
 
-// status returns the activity's row status (the filter vocabulary), derived
-// from its snapshot's display name.
+// status returns the activity's row status, derived from its snapshot.
 func (s *suite) status(id uuid.UUID) string {
 	s.t.Helper()
 	display := s.snapshot(id).Status
@@ -337,7 +318,6 @@ func (s *suite) expire(id uuid.UUID) {
 	}
 }
 
-// reap runs the reaper and asserts how many rows it recovered.
 func (s *suite) reap(want uint64) {
 	s.t.Helper()
 	n, err := s.b.RequeueExpired(s.ctx, 100)
@@ -346,8 +326,7 @@ func (s *suite) reap(want uint64) {
 	}
 }
 
-// wantKind asserts err is a storage error of the given kind — the engine
-// classifies outcomes by kind, so the kind is part of the contract.
+// wantKind asserts err's storage error kind, which the engine branches on.
 func wantKind(t *testing.T, err error, kind storage.StorageErrorKind, what string) {
 	t.Helper()
 	se, ok := storage.IsStorageError(err)
@@ -356,9 +335,8 @@ func wantKind(t *testing.T, err error, kind storage.StorageErrorKind, what strin
 	}
 }
 
-// need returns the optional interface a durable-execution feature relies on,
-// failing the test when the backend lacks it: without these the engine still
-// runs, but not with the guarantees this suite certifies.
+// need returns an interface durable execution relies on, failing the test
+// when the backend lacks it.
 func need[T any](t *testing.T, b storage.Storage) T {
 	t.Helper()
 	x, ok := b.(T)
@@ -369,8 +347,8 @@ func need[T any](t *testing.T, b storage.Storage) T {
 	return x
 }
 
-// optional returns an optional interface, skipping the test when absent —
-// for capabilities the engine has a fallback for (batch claims, result waits).
+// optional returns an interface the engine can do without, skipping the test
+// when absent.
 func optional[T any](t *testing.T, b storage.Storage) T {
 	t.Helper()
 	x, ok := b.(T)
@@ -381,7 +359,6 @@ func optional[T any](t *testing.T, b storage.Storage) T {
 	return x
 }
 
-// receive waits for one value with the suite's timeout.
 func receive[T any](t *testing.T, ch <-chan T, what string) T {
 	t.Helper()
 	select {
