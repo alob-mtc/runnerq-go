@@ -64,11 +64,9 @@ type WorkerConfig struct {
 	// default) keeps everything forever.
 	Retention *RetentionConfig `json:"retention,omitempty"`
 
-	// ShutdownGraceSeconds bounds the entire shutdown drain — worker loops,
-	// in-flight activity goroutines, and worker-pool deregistration all run
-	// in parallel under this single
-	// budget. When the budget expires, Start() returns even if some
-	// goroutines are still in flight (those are then orphaned for the
+	// ShutdownGraceSeconds bounds the entire shutdown drain: intake loops and
+	// in-flight activities. When the budget expires, Start() returns even if
+	// some goroutines are still in flight (those are then orphaned for the
 	// remaining process lifetime, which is fine on a SIGTERM). Default 30s.
 	ShutdownGraceSeconds *uint64 `json:"shutdown_grace_seconds,omitempty"`
 

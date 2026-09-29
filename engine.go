@@ -426,8 +426,7 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// Stop may have cancelled intake during pool registration.
-
+	// Stop may have been called while the engine was starting.
 	if !e.running.Load() {
 		slog.Info("Shutdown requested during startup")
 	} else {
@@ -448,13 +447,10 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	// budget expires).
 	e.stop()
 
-	// Phase 2: drain. Single shutdown grace covering everything in parallel —
-	// worker loops, in-flight activity goroutines, and pool
-	// deregistration. Previous design ran them sequentially with
-	// per-stage timeouts (wg.Wait unbounded + 30s + 10s + 5s) which on a
-	// busy engine could push shutdown past a minute and time out the
-	// orchestrator's SIGTERM grace. Worst case is now ShutdownGraceSeconds
-	// regardless of how many goroutines are still in flight.
+	// Phase 2: drain, bounded by one shutdown grace. wg covers the intake
+	// loops and maintenance processors started above, and in-flight
+	// activities run inside the intake goroutines, so it covers them too.
+	// Worst case is ShutdownGraceSeconds however many are still in flight.
 	graceSec := uint64(30)
 	if e.config.ShutdownGraceSeconds != nil {
 		graceSec = max(*e.config.ShutdownGraceSeconds, 1)
@@ -462,51 +458,27 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	graceCtx, graceCancel := context.WithTimeout(context.Background(), time.Duration(graceSec)*time.Second)
 	defer graceCancel()
 
-	type drainTask struct {
-		name string
-		fn   func()
-	}
-	tasks := []drainTask{
-		// Worker loops, reaper, scheduled processor, heartbeat — everything
-		// that wg.Add'd into the supervisor wg above. In-flight activities
-		// run inside the worker goroutines, so they're covered too.
-		{"workers", func() { wg.Wait() }},
-	}
-
-	done := make(chan string, len(tasks))
-	var drains sync.WaitGroup
-	for _, t := range tasks {
-		drains.Go(func() {
-			t.fn()
-			done <- t.name
-		})
-	}
-	drainsDone := make(chan struct{})
-	go func() { drains.Wait(); close(drainsDone) }()
+	drained := make(chan struct{})
+	go func() { wg.Wait(); close(drained) }()
 	defer func() {
 		engineCancel()
 		finish := func() { e.mu.Lock(); e.active = false; e.mu.Unlock() }
 		select {
-		case <-drainsDone:
+		case <-drained:
 			finish()
 		default:
-			go func() { <-drainsDone; finish() }()
+			go func() { <-drained; finish() }()
 		}
 	}()
 
-	finished := 0
-	for finished < len(tasks) {
-		select {
-		case name := <-done:
-			slog.Debug("Shutdown drain complete", "stage", name)
-			finished++
-		case <-graceCtx.Done():
-			pending := len(tasks) - finished
-			slog.Warn("Shutdown grace exceeded; returning with drains in flight",
-				"grace_seconds", graceSec, "pending_drains", pending)
-			signal.Stop(sigCh)
-			return nil
-		}
+	select {
+	case <-drained:
+		slog.Debug("Shutdown drain complete")
+	case <-graceCtx.Done():
+		slog.Warn("Shutdown grace exceeded; returning with activities in flight",
+			"grace_seconds", graceSec)
+		signal.Stop(sigCh)
+		return nil
 	}
 
 	signal.Stop(sigCh)
