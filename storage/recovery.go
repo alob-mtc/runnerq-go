@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -29,6 +30,22 @@ type CheckpointStorage interface {
 type SpawnStorage interface {
 	EnqueueForWorker(ctx context.Context, a QueuedActivity, ownerID uuid.UUID, workerID string) error
 	EnqueueIdempotentForWorker(ctx context.Context, a *QueuedActivity, ownerID uuid.UUID, workerID string) (*IdempotencyResult, error)
+}
+
+// EncodedStorage serves workers whose payloads and results carry an encoding
+// (the TypeScript SDK's native superjson-v1 besides plain JSON), for the calls
+// whose arguments can't carry one. The Go SDK never needs it: its claims take
+// plain JSON only, and a QueuedActivity or ActivityResult carries its own
+// Serialization everywhere else.
+//
+// DequeueBatchEncoded is DequeueBatch claiming only activities whose input is
+// in one of serializations (empty or "json-v1" is plain JSON). AckSuccessEncoded
+// is AckSuccess with the result's encoding, and SignalActivityEncoded is
+// SignalActivity with the payload's.
+type EncodedStorage interface {
+	DequeueBatchEncoded(ctx context.Context, workerIDPrefix string, limit int, timeout time.Duration, activityTypes []string, serializations []string) ([]DequeuedActivity, error)
+	AckSuccessEncoded(ctx context.Context, activityID uuid.UUID, result json.RawMessage, serialization string, workerID string) error
+	SignalActivityEncoded(ctx context.Context, activityID uuid.UUID, signalID uuid.UUID, name string, payload json.RawMessage, serialization string) error
 }
 
 // DependencyStorage keeps result consumers independent of parent lineage.

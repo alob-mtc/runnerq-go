@@ -53,10 +53,11 @@ func (b *PostgresBackend) StoreCheckpoint(ctx context.Context, id, owner uuid.UU
 	if result.State == storage.ResultErr {
 		state = "Err"
 	}
+	serialization := storedSerialization(result.Serialization)
 	tag, err := tx.Exec(ctx, `INSERT INTO runnerq_results
-		(activity_id, queue_name, state, data, created_at, owner_activity_id, step)
-		VALUES ($1, $2, $3, $4, NOW(), $5, NULLIF($6, ''))
-		ON CONFLICT (activity_id) DO NOTHING`, id, b.queueName, state, result.Data, owner, step)
+		(activity_id, queue_name, state, data, created_at, owner_activity_id, step, serialization)
+		VALUES ($1, $2, $3, $4, NOW(), $5, NULLIF($6, ''), $7)
+		ON CONFLICT (activity_id) DO NOTHING`, id, b.queueName, state, result.Data, owner, step, serialization)
 	if err != nil {
 		return databaseError(err, "failed to store checkpoint")
 	}
@@ -64,8 +65,8 @@ func (b *PostgresBackend) StoreCheckpoint(ctx context.Context, id, owner uuid.UU
 		var same bool
 		err = tx.QueryRow(ctx, `SELECT queue_name = $2 AND state = $3
 			AND data IS NOT DISTINCT FROM $4::jsonb AND owner_activity_id IS NOT DISTINCT FROM $5::uuid
-			AND COALESCE(step, '') = $6 FROM runnerq_results WHERE activity_id = $1`,
-			id, b.queueName, state, result.Data, owner, step).Scan(&same)
+			AND COALESCE(step, '') = $6 AND serialization = $7 FROM runnerq_results WHERE activity_id = $1`,
+			id, b.queueName, state, result.Data, owner, step, serialization).Scan(&same)
 		if err != nil {
 			return databaseError(err, "failed to reconcile checkpoint")
 		}
