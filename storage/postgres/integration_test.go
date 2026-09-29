@@ -625,6 +625,11 @@ func TestEncodedStorageRoundTrips(t *testing.T) {
 	if c.Activity.ID != native.ID || c.Activity.Serialization != "superjson-v1" {
 		t.Fatalf("claimed %+v", c.Activity)
 	}
+	// Only the encodings asked for: none claims nothing, and plain JSON isn't
+	// implied.
+	if none, err := b.DequeueBatchEncoded(ctx, "ts", 10, 0, nil, nil); err != nil || len(none) != 0 {
+		t.Fatalf("no encodings claimed %d, %v", len(none), err)
+	}
 
 	checkpoint := uuid.New()
 	step := storage.ActivityResult{Data: json.RawMessage(`{"json":1}`), State: storage.ResultOk, Serialization: "superjson-v1"}
@@ -707,6 +712,9 @@ func TestFailureDetailsKept(t *testing.T) {
 	if err != nil || c == nil {
 		t.Fatal(err)
 	}
+	if _, err := b.AckFailure(ctx, a.ID, storage.FailureKind{Reason: "x", Details: json.RawMessage(`{not json`)}, "w1"); !isKind(err, storage.ErrInvalidArgument) {
+		t.Fatalf("malformed details: %v", err)
+	}
 	details := json.RawMessage(`{"name":"TypeError","message":"bad input","stack":"at handler"}`)
 	if _, err := b.AckFailure(ctx, a.ID, storage.FailureKind{Reason: "bad input", Details: details}, "w1"); err != nil {
 		t.Fatal(err)
@@ -727,4 +735,9 @@ func TestFailureDetailsKept(t *testing.T) {
 	if err := json.Unmarshal(stored.Failure, &failure); err != nil || failure["name"] != "TypeError" || failure["stack"] != "at handler" {
 		t.Fatalf("failure %s: %v", stored.Failure, err)
 	}
+}
+
+func isKind(err error, kind storage.StorageErrorKind) bool {
+	se, ok := storage.IsStorageError(err)
+	return ok && se.Kind == kind
 }

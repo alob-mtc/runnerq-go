@@ -828,11 +828,14 @@ func (b *PostgresBackend) DequeueBatch(ctx context.Context, workerIDPrefix strin
 // DequeueBatchEncoded is DequeueBatch for a worker that reads the given
 // encodings (EncodedStorage).
 func (b *PostgresBackend) DequeueBatchEncoded(ctx context.Context, workerIDPrefix string, limit int, maxBlock time.Duration, activityTypes []string, serializations []string) ([]storage.DequeuedActivity, error) {
-	reads := []string{storage.SerializationJSON}
+	// Only what the caller reads: an empty entry is plain JSON, and no
+	// encodings claim nothing.
+	if len(serializations) == 0 {
+		return nil, nil
+	}
+	reads := make([]string, 0, len(serializations))
 	for _, s := range serializations {
-		if s != "" && s != storage.SerializationJSON {
-			reads = append(reads, s)
-		}
+		reads = append(reads, storedSerialization(s))
 	}
 	return b.dequeueBatch(ctx, workerIDPrefix, limit, maxBlock, activityTypes, reads)
 }
@@ -991,6 +994,11 @@ func (b *PostgresBackend) ackSuccess(ctx context.Context, activityID uuid.UUID, 
 }
 
 func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, failure storage.FailureKind, workerID string) (bool, error) {
+	// Details go into the error result and events as JSON: reject what isn't,
+	// before anything changes, rather than record the failure without them.
+	if len(failure.Details) > 0 && !json.Valid(failure.Details) {
+		return false, &storage.StorageError{Kind: storage.ErrInvalidArgument, Message: "failure details must be JSON", Field: "failure.Details"}
+	}
 	now := time.Now().UTC()
 
 	tx, err := b.pool.Begin(ctx)
