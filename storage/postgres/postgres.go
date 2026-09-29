@@ -95,6 +95,9 @@ func (b *PostgresBackend) Close() {
 	b.pool.Close()
 }
 
+// QueueName is the queue this backend claims from and commands act on.
+func (b *PostgresBackend) QueueName() string { return b.queueName }
+
 // SetLeaseMS updates the default lease duration. Implements storage.LeaseConfigurer.
 func (b *PostgresBackend) SetLeaseMS(leaseMS int64) {
 	b.defaultLeaseMS.Store(leaseMS)
