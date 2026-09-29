@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"os"
 	"os/signal"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/alob-mtc/runnerq-go/executor"
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
@@ -58,6 +60,14 @@ type WorkerEngine struct {
 	inflight  sync.Map
 	revokers  sync.Map  // id -> context.CancelCauseFunc of the running handler
 	startedAt time.Time // guarded by mu; zero until Start
+
+	// counts counts the metrics the engine emits for Snapshot, and passes
+	// them on to the configured sink; metrics is always counts.
+	counts      *countingMetrics
+	hostname    string
+	sdk         executor.SDK
+	observers   []executor.Observer // guarded by mu
+	servedTypes []string            // guarded by mu; set by Start
 }
 
 // Interrupt stops the handler this engine is running for activityID, as if
@@ -95,14 +105,49 @@ func (e *WorkerEngine) InFlight() []InFlightActivity {
 	return out
 }
 
-// executorState is what the engine is doing now, for backends that report
-// it (storage.ExecutorReportingStorage).
-func (e *WorkerEngine) executorState() storage.ExecutorState {
-	st := storage.ExecutorState{Draining: e.Draining()}
-	for _, a := range e.InFlight() {
-		st.Running = append(st.Running, storage.RunningActivity{ID: a.ID, Type: a.Type, Attempt: a.Attempt, StartedAt: a.StartedAt})
+// Snapshot is this executor as it is now: who it is, what it's running and
+// what it has done since it was built. The Cloud agent and executor.Observers
+// read it; it's safe to call at any time, from any goroutine.
+func (e *WorkerEngine) Snapshot() executor.Snapshot {
+	e.mu.Lock()
+	types := slices.Clone(e.servedTypes)
+	started := e.startedAt
+	e.mu.Unlock()
+	if types == nil {
+		types = e.ActivityTypes()
 	}
-	return st
+	snap := executor.Snapshot{
+		Info: executor.Info{
+			ID:             e.instanceID,
+			Queue:          e.config.QueueName,
+			ActivityTypes:  types,
+			MaxConcurrency: e.config.MaxConcurrentActivities,
+			StartedAt:      started,
+			Hostname:       e.hostname,
+			SDK:            e.sdk,
+			Labels:         maps.Clone(e.config.Labels),
+		},
+		State:    executor.State{Draining: e.Draining()},
+		Counters: e.counts.counters(),
+		At:       time.Now().UTC(),
+	}
+	for _, a := range e.InFlight() {
+		snap.State.Running = append(snap.State.Running, executor.Running{ID: a.ID, Type: a.Type, Attempt: a.Attempt, StartedAt: a.StartedAt})
+	}
+	return snap
+}
+
+// Observe tells o when this engine starts and stops executing, so it can
+// report the executor (by reading its Snapshot) while it runs. A backend
+// that is an executor.Observer is attached without asking. Call Observe
+// before Start.
+func (e *WorkerEngine) Observe(o executor.Observer) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.active {
+		panic("cannot add an executor observer while engine is active")
+	}
+	e.observers = append(e.observers, o)
 }
 
 // StartedAt is when Start was last called, or zero.
@@ -136,14 +181,18 @@ func NewWorkerEngineWithBackend(backend storage.Storage, config WorkerConfig) *W
 
 	adapter := newBackendQueueAdapter(backend, config.ActivityTypes)
 	shutdownCh := make(chan struct{})
+	counts := newCountingMetrics(NoopMetrics{})
 	return &WorkerEngine{
 		queue:      adapter,
 		backend:    backend,
 		handlers:   make(map[string]ActivityHandler),
 		config:     config,
 		shutdownCh: shutdownCh,
-		metrics:    NoopMetrics{},
+		metrics:    counts,
+		counts:     counts,
 		instanceID: uuid.New().String(),
+		hostname:   executor.Hostname(),
+		sdk:        executor.ThisSDK(),
 	}
 }
 
@@ -157,7 +206,7 @@ func (e *WorkerEngine) SetMetrics(sink MetricsSink) {
 	if sink == nil {
 		sink = NoopMetrics{}
 	}
-	e.metrics = sink
+	e.counts.sink = sink
 }
 
 // Backend returns the storage backend the engine runs on.
@@ -299,6 +348,11 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	}
 	e.active = true
 	e.startedAt = time.Now().UTC()
+	e.servedTypes = slices.Clone(types)
+	observers := slices.Clone(e.observers)
+	if o, ok := e.backend.(executor.Observer); ok {
+		observers = append(observers, o)
+	}
 	e.running.Store(true)
 	// Parent cancellation stops intake below. Handler and persistence lifetime
 	// ends after the drain, including when the caller uses a signal context.
@@ -311,12 +365,9 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	e.mu.Unlock()
 	defer engineCancel()
 	slog.Info("Starting worker engine", "max_concurrent_activities", e.config.MaxConcurrentActivities)
-	if r, ok := e.backend.(storage.ExecutorReportingStorage); ok {
-		r.ExecutorStarted(storage.ExecutorInfo{
-			ID: e.instanceID, Queue: e.config.QueueName, ActivityTypes: slices.Clone(types),
-			MaxConcurrency: e.config.MaxConcurrentActivities, StartedAt: e.StartedAt(),
-		}, e.executorState)
-		defer r.ExecutorStopped(e.instanceID)
+	for _, o := range observers {
+		o.ExecutorStarted(e)
+		defer o.ExecutorStopped(e.instanceID)
 	}
 
 	var wg sync.WaitGroup
@@ -631,9 +682,12 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 		return
 	}
 
+	now := time.Now().UTC()
 	e.inflight.Store(activityID, InFlightActivity{
-		ID: activityID, Type: activityType, Attempt: int(act.RetryCount) + 1, StartedAt: time.Now().UTC(),
+		ID: activityID, Type: activityType, Attempt: int(act.RetryCount) + 1, StartedAt: now,
 	})
+	e.metrics.IncCounter(metricStarted, 1)
+	e.metrics.ObserveDuration(metricClaimLag, claimLag(act, now))
 	defer e.inflight.Delete(activityID)
 
 	activityTimeout := time.Duration(act.TimeoutSeconds) * time.Second
@@ -1117,5 +1171,17 @@ func (e *WorkerEngine) persistFailure(ctx context.Context, act *activity, reason
 		dead, err = e.queue.MarkFailed(ctx, act, reason, retryable, worker)
 		return err
 	})
+	if err == nil && dead {
+		e.metrics.IncCounter(metricDeadLettered, 1)
+	}
 	return
+}
+
+// claimLag is how long act waited, from when it was due, to start at now.
+func claimLag(act *activity, now time.Time) time.Duration {
+	due := act.CreatedAt
+	if act.ScheduledAt != nil && act.ScheduledAt.After(due) {
+		due = *act.ScheduledAt
+	}
+	return max(now.Sub(due), 0)
 }

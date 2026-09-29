@@ -17,7 +17,6 @@ import "github.com/alob-mtc/runnerq-go/conductor"
 agent, err := conductor.Start(ctx, engine, conductor.Config{
     URL:          "wss://cloud.runnerq.dev",
     APIKey:       os.Getenv("RUNNERQ_CONDUCTOR_KEY"),
-    Labels:       map[string]string{"region": "eu-west-1"},
     AllowControl: true, // let operators run commands; omit for read-only
 })
 if err != nil {
@@ -29,7 +28,10 @@ engine.Start(ctx)
 
 - **Workers only.** Start one agent per engine. Each engine appears in the
   Cloud as an executor, identified by `engine.InstanceID()`, with its live
-  in-flight activities pushed as periodic reports.
+  in-flight activities and counters pushed as periodic reports.
+- **Labels.** Tag the worker with `WorkerConfig.Labels` (region, deploy
+  version); the Cloud shows them whichever way the worker reports.
+  `conductor.Config.Labels` adds to them and wins on a clash.
 - **Queries, not views.** The Cloud reads through the backend's
   `storage.QueryStorage` (filters, keyset paging, counts, aggregates, events,
   steps, trees). Backends without it serve only live executor state.
@@ -99,15 +101,34 @@ The default is `runnerq.NoopMetrics`. Counters currently emitted:
 
 | Counter | Meaning |
 |---|---|
+| `activity_started` | claimed, and its handler started here |
 | `activity_completed` | completed successfully |
 | `activity_retry` | requested a retry |
 | `activity_failed_non_retry` | failed permanently |
 | `activity_timeout` | exceeded its timeout |
+| `activity_dead_lettered` | ran out of attempts (after a retry request or a timeout) |
 | `activity_claim_lost` | the execution lost its claim — cancelled mid-handler by the heartbeat, or its ack was rejected by the fence (the replacement execution owns the outcome) |
 | `activity_heartbeat_failed` | a claim renewal failed and will be retried on the next beat |
 | `activity_yielded` | parked for a durable wait (sleep/signal/await) |
 | `activity_trees_swept` | workflow trees deleted by retention |
 
-> Duration/gauge instrumentation (`ObserveDuration`, queue-depth gauges,
-> per-type labels) is not yet wired — the metrics surface is counters only for
-> now. A richer Prometheus-shaped surface is on the roadmap.
+Durations go to `ObserveDuration`: `activity_claim_lag` is how long an
+activity waited, from when it was due, until a worker started it, and
+`activity_completion_persistence` how long recording a completion took.
+
+> Gauges (queue depth) and per-type labels are not wired yet. A richer
+> Prometheus-shaped surface is on the roadmap.
+
+## Executor snapshots
+
+`engine.Snapshot()` is the engine as it is now: its identity (id, queue,
+activity types, concurrency, host, SDK version, labels), what it's running,
+whether it's draining, and counters since it was built (claimed, succeeded,
+retried, failed, timed out, dead-lettered, claims lost, heartbeat failures,
+last claim lag). The counters come from the same metrics the sink sees.
+
+Everything that reports a worker reads it: the Cloud agent for its hello and
+reports, and a storage backend that implements `executor.Observer`, which the
+engine tells when it starts and stops (the RunnerQ Cloud storage adapter
+reports hosted workers this way). Attach your own with `engine.Observe(o)`
+before `Start`.

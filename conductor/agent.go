@@ -32,11 +32,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
-	"os"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,7 +55,6 @@ const (
 	maxMessageBytes  = 4 << 20
 	// defaultReportInterval applies until the Cloud sets one.
 	defaultReportInterval = 15 * time.Second
-	sdkModulePath         = "github.com/alob-mtc/runnerq-go"
 )
 
 // Config configures the agent.
@@ -76,7 +74,9 @@ type Config struct {
 	// every response, whatever mode the Cloud asks for.
 	MetadataOnly bool
 	// Labels are free-form executor tags (region, deploy version) the Cloud
-	// can filter and group executors by.
+	// can filter and group executors by. They're added to the engine's own
+	// (WorkerConfig.Labels), and win on a clash; prefer those, which every
+	// way of reporting to the Cloud carries.
 	Labels map[string]string
 	// MaxConcurrentRequests bounds requests served at once (default 16).
 	// Requests beyond it are answered "resource_exhausted" instead of queueing.
@@ -342,21 +342,29 @@ func (a *Agent) session(ctx context.Context) error {
 }
 
 func (a *Agent) handshake(ctx context.Context, conn *websocket.Conn) (welcome, error) {
-	host, _ := os.Hostname()
-	ex := executorInfo{
-		ID:             a.engine.InstanceID(),
-		Hostname:       host,
-		Queues:         []string{a.engine.QueueName()},
-		ActivityTypes:  a.engine.ActivityTypes(),
-		MaxConcurrency: a.engine.MaxConcurrentActivities(),
-		Labels:         a.cfg.Labels,
+	info := a.engine.Snapshot().Info
+	labels := info.Labels
+	if len(a.cfg.Labels) > 0 {
+		labels = maps.Clone(labels)
+		if labels == nil {
+			labels = map[string]string{}
+		}
+		maps.Copy(labels, a.cfg.Labels)
 	}
-	if started := a.engine.StartedAt(); !started.IsZero() {
-		ex.StartedAt = ts(started)
+	ex := executorInfo{
+		ID:             info.ID,
+		Hostname:       info.Hostname,
+		Queues:         []string{info.Queue},
+		ActivityTypes:  info.ActivityTypes,
+		MaxConcurrency: info.MaxConcurrency,
+		Labels:         labels,
+	}
+	if !info.StartedAt.IsZero() {
+		ex.StartedAt = ts(info.StartedAt)
 	}
 	req, err := newRequest("hello", typeHello, hello{
 		ProtocolVersions: []int{protocolVersion},
-		SDK:              sdkInfo{Name: "runnerq-go", Version: sdkVersion(), Language: "go"},
+		SDK:              sdkInfo{Name: info.SDK.Name, Version: info.SDK.Version, Language: info.SDK.Language},
 		Executor:         ex,
 		Capabilities:     a.h.capabilities(),
 		Limits:           limits{MaxFrameBytes: maxMessageBytes, MaxConcurrentRequests: a.cfg.MaxConcurrentRequests},
@@ -554,26 +562,6 @@ func newEvent(msgType string, data any) (envelope, error) {
 
 func errorResponse(req envelope, e *wireError) envelope {
 	return envelope{V: req.V, Kind: kindResponse, ID: req.ID, Type: req.Type, Error: e}
-}
-
-// sdkVersion reports the runnerq-go module version compiled into the binary.
-func sdkVersion() string {
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		return "unknown"
-	}
-	if info.Main.Path == sdkModulePath {
-		return info.Main.Version
-	}
-	for _, dep := range info.Deps {
-		if dep.Path == sdkModulePath {
-			if dep.Replace != nil {
-				return dep.Replace.Version
-			}
-			return dep.Version
-		}
-	}
-	return "unknown"
 }
 
 // SessionID is the current Cloud session id, or "" while disconnected.

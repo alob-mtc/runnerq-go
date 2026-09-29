@@ -348,6 +348,21 @@ type executorState struct {
 	InFlight       int               `json:"in_flight"`
 	Running        []runningActivity `json:"running,omitempty"`
 	Draining       bool              `json:"draining"`
+	Counters       *executorCounters `json:"counters,omitempty"`
+}
+
+// executorCounters is what an executor has done since it started: counts of
+// activity outcomes, and how long its latest claim waited.
+type executorCounters struct {
+	Claimed           uint64 `json:"claimed"`
+	Succeeded         uint64 `json:"succeeded"`
+	Retried           uint64 `json:"retried"`
+	Failed            uint64 `json:"failed"`
+	TimedOut          uint64 `json:"timed_out"`
+	DeadLettered      uint64 `json:"dead_lettered"`
+	ClaimsLost        uint64 `json:"claims_lost"`
+	HeartbeatFailures uint64 `json:"heartbeat_failures"`
+	ClaimLagMS        int64  `json:"claim_lag_ms"`
 }
 
 // --- commands ---

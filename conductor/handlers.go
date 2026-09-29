@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/alob-mtc/runnerq-go"
+	"github.com/alob-mtc/runnerq-go/executor"
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
@@ -527,20 +528,30 @@ func (h *handlers) treesGet(ctx context.Context, data json.RawMessage) (any, err
 // state is this executor's live state. withRunning adds the in-flight list
 // (describe) rather than just its size (periodic reports).
 func (h *handlers) state(withRunning bool) executorState {
-	inflight := h.engine.InFlight()
-	started := h.engine.StartedAt()
-	if started.IsZero() {
-		started = h.started
+	return stateOf(h.engine.Snapshot(), h.started, withRunning)
+}
+
+// stateOf is a snapshot's state on the wire. The uptime counts from started
+// when the engine hasn't started.
+func stateOf(snap executor.Snapshot, started time.Time, withRunning bool) executorState {
+	if !snap.Info.StartedAt.IsZero() {
+		started = snap.Info.StartedAt
 	}
+	c := snap.Counters
 	st := executorState{
-		ID:             h.engine.InstanceID(),
-		UptimeMS:       time.Since(started).Milliseconds(),
-		MaxConcurrency: h.engine.MaxConcurrentActivities(),
-		InFlight:       len(inflight),
-		Draining:       h.engine.Draining(),
+		ID:             snap.Info.ID,
+		UptimeMS:       snap.At.Sub(started).Milliseconds(),
+		MaxConcurrency: snap.Info.MaxConcurrency,
+		InFlight:       len(snap.State.Running),
+		Draining:       snap.State.Draining,
+		Counters: &executorCounters{
+			Claimed: c.Claimed, Succeeded: c.Succeeded, Retried: c.Retried, Failed: c.Failed,
+			TimedOut: c.TimedOut, DeadLettered: c.DeadLettered, ClaimsLost: c.ClaimsLost,
+			HeartbeatFailures: c.HeartbeatFailures, ClaimLagMS: c.LastClaimLag.Milliseconds(),
+		},
 	}
 	if withRunning {
-		for _, a := range inflight {
+		for _, a := range snap.State.Running {
 			st.Running = append(st.Running, runningActivity{
 				ActivityID: a.ID.String(), Type: a.Type, Attempt: a.Attempt, StartedAt: ts(a.StartedAt),
 			})
