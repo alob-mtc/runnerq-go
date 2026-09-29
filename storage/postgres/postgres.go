@@ -587,10 +587,15 @@ const (
 	// forcing a top-1 sort over the whole eligible backlog on every claim
 	// (verified with EXPLAIN ANALYZE on a 200k-row backlog: external merge
 	// sort vs a 0.2ms index walk).
+	// Go handlers take plain JSON: an input in another encoding (the
+	// TypeScript SDK's native superjson-v1) is left for a worker that can
+	// read it. One primary-key probe per candidate row.
 	claimEligibleSQL = `
 			WHERE queue_name = $3
 			  AND status IN ('pending', 'scheduled', 'retrying', 'waiting')
-			  AND (status = 'pending' OR scheduled_at <= NOW())`
+			  AND (status = 'pending' OR scheduled_at <= NOW())
+			  AND NOT EXISTS (SELECT 1 FROM runnerq_inputs i
+			      WHERE i.activity_id = runnerq_activities.id AND i.serialization <> 'json-v1')`
 	claimOrderSQL = `
 			ORDER BY
 				priority DESC,
