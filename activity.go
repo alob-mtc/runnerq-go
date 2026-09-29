@@ -165,7 +165,6 @@ func newActivity(activityType string, payload json.RawMessage, option *ActivityO
 		Status:               StatusPending,
 		CreatedAt:            time.Now().UTC(),
 		ScheduledAt:          scheduledAt,
-		RetryCount:           0,
 		MaxRetries:           maxRetries,
 		TimeoutSeconds:       timeoutSeconds,
 		RetryDelaySeconds:    1,
@@ -173,6 +172,5 @@ func newActivity(activityType string, payload json.RawMessage, option *ActivityO
 		Metadata:             metadata,
 		IdempotencyKey:       idempotencyKey,
 		RootActivityID:       id,
-		Depth:                0,
 	}
 }

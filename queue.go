@@ -40,7 +40,7 @@ type activityQueue interface {
 	MarkCompleted(ctx context.Context, a *activity, result json.RawMessage, workerID string) error
 	// MarkFailed marks an activity as failed. Returns true if moved to dead letter queue.
 	MarkFailed(ctx context.Context, a *activity, errorMessage string, retryable bool, workerID string) (bool, error)
-	ProcessScheduledActivities(ctx context.Context) ([]*activity, error)
+	ProcessScheduledActivities(ctx context.Context) error
 	// Yield parks a processing activity as scheduled until wakeAt without
 	// consuming a retry. Used by durable Sleep/WaitForSignal/await. kind and
 	// step describe the wait for observability (recorded on the Yielded event).
@@ -51,7 +51,6 @@ type activityQueue interface {
 	// not Enqueue separately. A non-nil result means an existing activity owns
 	// the key and nothing was enqueued.
 	EnqueueIdempotent(ctx context.Context, a *activity) (*storage.IdempotencyResult, error)
-	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
 	// StoreResult persists a result row. owner is the activity whose workflow
 	// tree governs the row's lifetime (the activity itself for normal results;
 	// the handler's activity for Run/Sleep checkpoints). step is the
@@ -214,16 +213,11 @@ func storageBehaviorToOnDuplicate(b storage.IdempotencyBehavior) OnDuplicate {
 }
 
 func (a *backendQueueAdapter) Enqueue(ctx context.Context, act *activity) error {
-	queued := activityToQueued(act)
-	return a.backend.Enqueue(ctx, queued)
+	return a.backend.Enqueue(ctx, activityToQueued(act))
 }
 
 func (a *backendQueueAdapter) Dequeue(ctx context.Context, timeout time.Duration, workerID string) (*activity, error) {
-	var types []string
-	if len(a.activityTypes) > 0 {
-		types = a.activityTypes
-	}
-	q, err := a.backend.Dequeue(ctx, workerID, timeout, types)
+	q, err := a.backend.Dequeue(ctx, workerID, timeout, a.activityTypes)
 	if err != nil {
 		return nil, err
 	}
@@ -270,12 +264,9 @@ func (a *backendQueueAdapter) MarkFailed(ctx context.Context, act *activity, err
 	return a.backend.AckFailure(ctx, act.ID, failure, workerID)
 }
 
-func (a *backendQueueAdapter) ProcessScheduledActivities(ctx context.Context) ([]*activity, error) {
+func (a *backendQueueAdapter) ProcessScheduledActivities(ctx context.Context) error {
 	_, err := a.backend.ProcessScheduled(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return nil, nil
+	return err
 }
 
 func (a *backendQueueAdapter) RequeueExpired(ctx context.Context, maxToProcess int) (uint64, error) {
@@ -291,36 +282,16 @@ func (a *backendQueueAdapter) EnqueueIdempotent(ctx context.Context, act *activi
 	return a.backend.EnqueueIdempotent(ctx, &queued)
 }
 
-func (a *backendQueueAdapter) ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error) {
-	return a.backend.ExtendLease(ctx, activityID, extendBy)
-}
-
 func (a *backendQueueAdapter) StoreResult(ctx context.Context, activityID uuid.UUID, owner uuid.UUID, result activityResult, step string) error {
-	backendResult := storage.ActivityResult{
-		Data:  result.Data,
-		State: storage.ResultState(result.State),
-	}
-	return a.backend.StoreResult(ctx, activityID, owner, backendResult, step)
+	return a.backend.StoreResult(ctx, activityID, owner, storage.ActivityResult{Data: result.Data, State: storage.ResultState(result.State)}, step)
 }
 
 func (a *backendQueueAdapter) GetResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error) {
-	backendResult, err := a.backend.GetResult(ctx, activityID)
-	if err != nil {
+	r, err := a.backend.GetResult(ctx, activityID)
+	if err != nil || r == nil {
 		return nil, err
 	}
-	if backendResult == nil {
-		return nil, nil
-	}
-
-	var data json.RawMessage
-	if backendResult.Data != nil {
-		data = backendResult.Data
-	}
-
-	return &activityResult{
-		Data:  data,
-		State: ResultState(backendResult.State),
-	}, nil
+	return &activityResult{Data: r.Data, State: ResultState(r.State)}, nil
 }
 
 // WaitForResult blocks until the activity's result exists. Backends that
@@ -329,14 +300,11 @@ func (a *backendQueueAdapter) GetResult(ctx context.Context, activityID uuid.UUI
 // backends this falls back to polling GetResult every 100ms.
 func (a *backendQueueAdapter) WaitForResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error) {
 	if rw, ok := a.backend.(storage.ResultWaiter); ok {
-		backendResult, err := rw.WaitForResult(ctx, activityID)
+		r, err := rw.WaitForResult(ctx, activityID)
 		if err != nil {
 			return nil, err
 		}
-		return &activityResult{
-			Data:  backendResult.Data,
-			State: ResultState(backendResult.State),
-		}, nil
+		return &activityResult{Data: r.Data, State: ResultState(r.State)}, nil
 	}
 
 	for {

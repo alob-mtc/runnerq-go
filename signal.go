@@ -22,7 +22,7 @@ func SignalActivity(ctx context.Context, backend storage.Storage, activityID uui
 	if name == "" {
 		return &WorkerError{Kind: ErrQueue, Message: "signal name must be non-empty"}
 	}
-	sigID := deriveCheckpointID(activityID, "signal", name)
+	sigID := storage.CheckpointID(activityID, "signal", name)
 	if err := backend.SignalActivity(ctx, activityID, sigID, name, payload); err != nil {
 		return signalDeliveryError(err)
 	}
@@ -65,7 +65,7 @@ func SignalActivityByKey(ctx context.Context, backend storage.Storage, activityT
 	if idempotencyKey == "" {
 		return &WorkerError{Kind: ErrQueue, Message: "idempotency key must be non-empty"}
 	}
-	activityID, err := backend.LookupIdempotencyActivityID(ctx, idempotencyStorageKey(idempotencyKey, activityType))
+	activityID, err := backend.LookupIdempotencyActivityID(ctx, storage.BusinessIdempotencyKey(idempotencyKey, activityType))
 	if err != nil {
 		return signalDeliveryError(err)
 	}

@@ -55,17 +55,11 @@ type ActivityContext struct {
 	queue activityQueue
 }
 
-// deriveCheckpointID derives the stable identity of a named checkpoint of an
-// activity. UUIDv5 over (activity ID, kind:name) — any process deriving the
-// same (activity, kind, name) gets the same ID, which is what lets a retried
-// handler find a previous attempt's stored value, and an external process
-// address a signal at a waiting activity.
-func deriveCheckpointID(activityID uuid.UUID, kind, name string) uuid.UUID {
-	return storage.CheckpointID(activityID, kind, name)
-}
-
+// checkpointID is the stable id of a named checkpoint: every process derives
+// the same one, so a retried handler finds a previous attempt's value and an
+// external process can address a signal at a waiting activity.
 func (c ActivityContext) checkpointID(kind, name string) uuid.UUID {
-	return deriveCheckpointID(c.ActivityID, kind, name)
+	return storage.CheckpointID(c.ActivityID, kind, name)
 }
 
 // Run executes fn as a named, checkpointed step: its successful result (or

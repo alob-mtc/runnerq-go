@@ -82,32 +82,29 @@ const awaitParkGrace = 2 * time.Second
 // Called from outside a handler (a server process holding a future), it
 // blocks until the result exists or ctx is done.
 func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error) {
-	queue := f.queue
-	grace := awaitParkGrace
 	scoped, inHandler := ctx.Value(attemptQueueKey{}).(*attemptQueue)
-	if inHandler {
-		if scoped.awaitGrace > 0 {
-			grace = scoped.awaitGrace
-		}
-		if err := scoped.registerFuture(ctx, f.activityID); err != nil {
-			return nil, err
-		}
-		// Rehydrated futures also need the executing activity's retry/lease
-		// policy, even though their original handle had no execution scope.
-		copy := *scoped
-		copy.activityQueue = f.queue
-		if original, ok := f.queue.(*attemptQueue); ok {
-			copy.activityQueue = original.activityQueue
-		}
-		queue = &copy
-	}
 	if !inHandler {
-		result, err := queue.WaitForResult(ctx, f.activityID)
+		result, err := f.queue.WaitForResult(ctx, f.activityID)
 		if err != nil {
 			return nil, err
 		}
 		return translateResult(result)
 	}
+	grace := awaitParkGrace
+	if scoped.awaitGrace > 0 {
+		grace = scoped.awaitGrace
+	}
+	if err := scoped.registerFuture(ctx, f.activityID); err != nil {
+		return nil, err
+	}
+	// Rehydrated futures also need the executing activity's retry/lease
+	// policy, even though their original handle had no execution scope.
+	attemptQ := *scoped
+	attemptQ.activityQueue = f.queue
+	if original, ok := f.queue.(*attemptQueue); ok {
+		attemptQ.activityQueue = original.activityQueue
+	}
+	queue := &attemptQ
 
 	// In-handler: wait in-process up to the grace (clamped to the handler's
 	// remaining budget, same margin policy as Sleep), then park.
@@ -143,13 +140,11 @@ func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error)
 }
 
 func translateResult(result *activityResult) (json.RawMessage, error) {
-	switch result.State {
-	case ResultOk:
+	if result.State == ResultOk {
 		return result.Data, nil
-	default:
-		resultJSON, _ := json.Marshal(result.Data)
-		return nil, &WorkerError{Kind: ErrCustom, Message: string(resultJSON)}
 	}
+	resultJSON, _ := json.Marshal(result.Data)
+	return nil, &WorkerError{Kind: ErrCustom, Message: string(resultJSON)}
 }
 
 // ActivityBuilder builds and executes activities with fluent configuration.
@@ -208,16 +203,6 @@ func (b *ActivityBuilder) MaxRetryDelay(d time.Duration) *ActivityBuilder {
 func (b *ActivityBuilder) Delay(d time.Duration) *ActivityBuilder {
 	b.delay = &d
 	return b
-}
-
-// idempotencyStorageKey is the actual key stored in the idempotency table for
-// a user-supplied key on an activity of activityType. User keys are namespaced
-// by activity type so the same business key can be reused across distinct
-// activity types without colliding. SignalActivityByKey reconstructs the same
-// composite to address a workflow by its business key — keep the two in lockstep
-// by routing both through this single function.
-func idempotencyStorageKey(userKey, activityType string) string {
-	return storage.BusinessIdempotencyKey(userKey, activityType)
 }
 
 // IdempotencyKeyOption sets the idempotency key and behavior for duplicate detection.
@@ -315,7 +300,9 @@ func (b *ActivityBuilder) Execute(ctx context.Context) (*ActivityFuture, error) 
 		}
 		var idempKey *IdempotencyConfig
 		if b.idempotencyKey != nil {
-			idempKey = &IdempotencyConfig{Key: idempotencyStorageKey(b.idempotencyKey.Key, b.activityType), Behavior: b.idempotencyKey.Behavior}
+			// Keys are namespaced by activity type; SignalActivityByKey derives
+			// the same stored key.
+			idempKey = &IdempotencyConfig{Key: storage.BusinessIdempotencyKey(b.idempotencyKey.Key, b.activityType), Behavior: b.idempotencyKey.Behavior}
 		}
 		option = &ActivityOption{
 			Priority:             b.priority,

@@ -7,10 +7,6 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// ---------------------------------------------------------------------------
-// ActivityError
-// ---------------------------------------------------------------------------
-
 // ActivityError represents an error from activity handler execution.
 // Retryable indicates whether the activity should be retried.
 type ActivityError struct {
@@ -45,10 +41,6 @@ func (e *ActivityError) IsRetryable() bool {
 type RetryableError interface {
 	IsRetryable() bool
 }
-
-// ---------------------------------------------------------------------------
-// WorkerError
-// ---------------------------------------------------------------------------
 
 // WorkerErrorKind classifies worker engine errors.
 type WorkerErrorKind int
@@ -156,13 +148,7 @@ func WorkerErrorFromStorage(err error) *WorkerError {
 	switch se.Kind {
 	case storage.ErrUnavailable:
 		return &WorkerError{Kind: ErrBackend, Message: se.Message, Cause: err}
-	case storage.ErrConflict:
-		return &WorkerError{Kind: ErrQueue, Message: se.Message, Cause: err}
-	case storage.ErrNotFound:
-		return &WorkerError{Kind: ErrQueue, Message: se.Message, Cause: err}
-	case storage.ErrInternal:
-		return &WorkerError{Kind: ErrQueue, Message: se.Message, Cause: err}
-	case storage.ErrSerialization:
+	case storage.ErrConflict, storage.ErrNotFound, storage.ErrInternal, storage.ErrSerialization:
 		return &WorkerError{Kind: ErrQueue, Message: se.Message, Cause: err}
 	case storage.ErrConfiguration:
 		return &WorkerError{Kind: ErrConfiguration, Message: se.Message, Cause: err}

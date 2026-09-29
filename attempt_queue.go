@@ -10,6 +10,12 @@ import (
 	"github.com/google/uuid"
 )
 
+// attemptQueueKey carries the executing attempt's queue on a handler's
+// context. Its presence tells an in-handler ActivityFuture.GetResult (which
+// may yield-park the activity) from an external caller's await, which must
+// block: there is no activity row to park.
+type attemptQueueKey struct{}
+
 // Scoped to one execution. Checkpoint persistence outlives the handler deadline
 // during recovery, but remains bounded by engine shutdown and claim ownership.
 type attemptQueue struct {

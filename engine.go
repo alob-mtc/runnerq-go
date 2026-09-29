@@ -249,12 +249,7 @@ func (e *WorkerEngine) InstanceID() string {
 func (e *WorkerEngine) ActivityTypes() []string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	types := make([]string, 0, len(e.handlers))
-	for t := range e.handlers {
-		types = append(types, t)
-	}
-	slices.Sort(types)
-	return types
+	return slices.Sorted(maps.Keys(e.handlers))
 }
 
 // RegisterActivity registers a handler under an activity type derived from
@@ -334,10 +329,7 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	}
 	types := slices.Clone(e.config.ActivityTypes)
 	if len(types) == 0 {
-		for t := range e.handlers {
-			types = append(types, t)
-		}
-		slices.Sort(types)
+		types = slices.Sorted(maps.Keys(e.handlers))
 	}
 	for _, t := range types {
 		if _, ok := e.handlers[t]; !ok {
@@ -448,7 +440,7 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	// guaranteed to fail their ack and rerun. engineCtx is cancelled by the
 	// deferred engineCancel once the drain below finishes (or the grace
 	// budget expires).
-	e.stop()
+	e.Stop()
 
 	// Phase 2: drain, bounded by one shutdown grace. wg covers the intake
 	// loops and maintenance processors started above, and in-flight
@@ -489,18 +481,14 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop initiates a graceful shutdown of the worker engine.
+// Stop begins a graceful shutdown: intake stops, and Start returns once
+// in-flight activities have finished (bounded by the shutdown grace).
+//
+// Stop is phase 1 of shutdown. It leaves the engine context alive so
+// in-flight handlers can finish and ack; cancelling it here would make a
+// handler that completes during the drain fail its ack and rerun elsewhere.
+// Start performs the drain (phase 2) and the final cancel (phase 3).
 func (e *WorkerEngine) Stop() {
-	e.stop()
-}
-
-// stop is phase 1 of shutdown: it stops work intake (dequeue/poll loops) but
-// deliberately leaves the engine context alive so in-flight handlers can
-// finish and ack. Cancelling everything here — as earlier versions did — meant
-// a handler that completed during the drain acked with a dead context, failed,
-// and was guaranteed to rerun on another worker. Start performs the drain
-// (phase 2) and the final engine-context cancel (phase 3).
-func (e *WorkerEngine) stop() {
 	slog.Info("Stopping worker engine")
 	e.mu.Lock()
 	e.running.Store(false)
@@ -763,16 +751,14 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 func (e *WorkerEngine) safeHandle(handler ActivityHandler, ctx ActivityContext, payload json.RawMessage) (result json.RawMessage, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			var errMsg string
+			msg := "panic (unknown)"
 			switch v := r.(type) {
 			case string:
-				errMsg = fmt.Sprintf("panic: %s", v)
+				msg = "panic: " + v
 			case error:
-				errMsg = fmt.Sprintf("panic: %s", v.Error())
-			default:
-				errMsg = "panic (unknown)"
+				msg = "panic: " + v.Error()
 			}
-			err = NewRetryError(errMsg)
+			err = NewRetryError(msg)
 		}
 	}()
 	return handler.Handle(ctx, payload)
@@ -851,11 +837,12 @@ func (e *WorkerEngine) handleYield(ctx context.Context, act *activity, ys *yield
 		return
 	}
 	res, err := e.queue.GetResult(ctx, ys.recheck)
-	if err != nil || res == nil {
-		if err != nil {
-			slog.Warn("Post-park recheck failed; the park deadline will recover",
-				"activity_id", activityID, "error", err)
-		}
+	if err != nil {
+		slog.Warn("Post-park recheck failed; the park deadline will recover",
+			"activity_id", activityID, "error", err)
+		return
+	}
+	if res == nil {
 		return
 	}
 	if _, err := e.backend.WakeWaiting(ctx, act.ID); err != nil {
@@ -865,13 +852,17 @@ func (e *WorkerEngine) handleYield(ctx context.Context, act *activity, ys *yield
 }
 
 func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity, handler ActivityHandler, payload json.RawMessage, reason string, workerLabel string, workerID int) {
-	activityID, activityType := act.ID, act.ActivityType
 	e.metrics.IncCounter(metricRetried, 1)
-	slog.Warn("Activity requesting retry", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "reason", reason)
+	slog.Warn("Activity requesting retry", "worker_id", workerID, "activity_id", act.ID, "activity_type", act.ActivityType, "reason", reason)
+	e.retryOrDeadLetter(ctx, act, handler, payload, reason, workerLabel, workerID)
+}
 
+// retryOrDeadLetter records a retryable failure and, when it was the last
+// attempt, runs the handler's dead-letter hook.
+func (e *WorkerEngine) retryOrDeadLetter(ctx context.Context, act *activity, handler ActivityHandler, payload json.RawMessage, reason string, workerLabel string, workerID int) {
 	deadLettered, err := e.persistFailure(ctx, act, reason, true, workerLabel)
 	if err != nil {
-		slog.Error("Failed to mark activity for retry", "worker_id", workerID, "activity_id", activityID, "error", err)
+		slog.Error("Failed to record activity failure", "worker_id", workerID, "activity_id", act.ID, "error", err)
 		return
 	}
 	if deadLettered {
@@ -880,31 +871,18 @@ func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity
 }
 
 func (e *WorkerEngine) handleNonRetryableFailure(ctx context.Context, act *activity, reason string, workerLabel string, workerID int) {
-	activityID, activityType := act.ID, act.ActivityType
 	e.metrics.IncCounter(metricFailed, 1)
-	slog.Error("Activity failed", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "reason", reason)
-
-	// The error result row is written inside the AckFailure transaction by the
-	// backend, so no separate result-storage step is needed here.
+	slog.Error("Activity failed", "worker_id", workerID, "activity_id", act.ID, "activity_type", act.ActivityType, "reason", reason)
+	// The backend writes the error result in the same transaction.
 	if _, err := e.persistFailure(ctx, act, reason, false, workerLabel); err != nil {
-		slog.Error("Failed to mark activity as failed", "worker_id", workerID, "activity_id", activityID, "error", err)
+		slog.Error("Failed to record activity failure", "worker_id", workerID, "activity_id", act.ID, "error", err)
 	}
 }
 
 func (e *WorkerEngine) handleTimeout(ctx context.Context, act *activity, handler ActivityHandler, payload json.RawMessage, workerLabel string, workerID int, timeout time.Duration) {
-	activityID, activityType := act.ID, act.ActivityType
 	e.metrics.IncCounter(metricTimedOut, 1)
-	errorMsg := "Activity execution timed out"
-	slog.Error("Activity timed out", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "timeout", timeout)
-
-	deadLettered, err := e.persistFailure(ctx, act, errorMsg, true, workerLabel)
-	if err != nil {
-		slog.Error("Failed to mark activity as failed", "worker_id", workerID, "activity_id", activityID, "error", err)
-		return
-	}
-	if deadLettered {
-		e.callDeadLetter(ctx, act, handler, payload, errorMsg)
-	}
+	slog.Error("Activity timed out", "worker_id", workerID, "activity_id", act.ID, "activity_type", act.ActivityType, "timeout", timeout)
+	e.retryOrDeadLetter(ctx, act, handler, payload, "Activity execution timed out", workerLabel, workerID)
 }
 
 // callDeadLetter runs the handler's dead-letter hook for an activity whose
@@ -944,7 +922,7 @@ func (e *WorkerEngine) runScheduledProcessor(ctx context.Context) {
 			slog.Debug("Scheduled activities processor stopped")
 			return
 		case <-ticker.C:
-			if _, err := e.queue.ProcessScheduledActivities(ctx); err != nil {
+			if err := e.queue.ProcessScheduledActivities(ctx); err != nil {
 				slog.Error("Failed to process scheduled activities", "error", err)
 			}
 		}
@@ -1093,46 +1071,30 @@ func (b *WorkerEngineBuilder) ShutdownGrace(d time.Duration) *WorkerEngineBuilde
 	return b
 }
 
-// Build creates the WorkerEngine with configured settings.
+// Build creates the WorkerEngine. It fails when no backend is set.
 func (b *WorkerEngineBuilder) Build() (*WorkerEngine, error) {
-	maxConcurrent := 10
-	if b.maxWorkers != nil {
-		maxConcurrent = *b.maxWorkers
-	}
-	pollIntervalSec := uint64(5)
-	if b.pollInterval != nil {
-		pollIntervalSec = uint64(b.pollInterval.Seconds())
-	}
-
 	if b.backend == nil {
 		return nil, &WorkerError{
 			Kind:    ErrConfiguration,
 			Message: "No backend configured. Call .Backend(yourBackend) before .Build(). Use PostgresBackend for PostgreSQL.",
 		}
 	}
-
-	queueName := "default"
+	config := DefaultWorkerConfig()
 	if b.queueName != nil {
-		queueName = *b.queueName
+		config.QueueName = *b.queueName
 	}
-
-	reaperInterval := uint64(5)
-	reaperBatch := 100
-
-	config := WorkerConfig{
-		QueueName:                   queueName,
-		MaxConcurrentActivities:     maxConcurrent,
-		SchedulePollIntervalSeconds: &pollIntervalSec,
-		ReaperIntervalSeconds:       &reaperInterval,
-		ReaperBatchSize:             &reaperBatch,
-		ActivityTypes:               b.activityTypes,
-		Retention:                   b.retention,
+	if b.maxWorkers != nil {
+		config.MaxConcurrentActivities = *b.maxWorkers
 	}
+	pollIntervalSec := uint64(5)
+	if b.pollInterval != nil {
+		pollIntervalSec = uint64(b.pollInterval.Seconds())
+	}
+	config.SchedulePollIntervalSeconds = &pollIntervalSec
+	config.ActivityTypes = b.activityTypes
+	config.Retention = b.retention
 	if b.shutdownGrace != nil {
-		secs := uint64((*b.shutdownGrace).Seconds())
-		if secs == 0 {
-			secs = 1
-		}
+		secs := max(uint64(b.shutdownGrace.Seconds()), 1)
 		config.ShutdownGraceSeconds = &secs
 	}
 
@@ -1140,7 +1102,6 @@ func (b *WorkerEngineBuilder) Build() (*WorkerEngine, error) {
 	if b.metrics != nil {
 		engine.SetMetrics(b.metrics)
 	}
-
 	return engine, nil
 }
 
