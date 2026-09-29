@@ -443,8 +443,6 @@ func toDetail(kv map[string]any) json.RawMessage {
 	return data
 }
 
-func strPtr(s string) *string { return &s }
-
 // ============================================================================
 // QueueStorage Implementation
 // ============================================================================
