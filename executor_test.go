@@ -182,3 +182,45 @@ func TestClaimLag(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+func TestEngineSignalsChanges(t *testing.T) {
+	b := newLifecycleBackend()
+	cfg := DefaultWorkerConfig()
+	cfg.MaxConcurrentActivities = 1
+	e := NewWorkerEngineWithBackend(b, cfg)
+	var _ executor.Notifier = e
+	entered, release := make(chan struct{}), make(chan struct{})
+	e.RegisterActivityWithName("charge", &funcHandler{fn: func(ActivityContext, json.RawMessage) (json.RawMessage, error) {
+		close(entered)
+		<-release
+		return json.RawMessage(`true`), nil
+	}})
+	changed := func(ch <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(4 * time.Second):
+			t.Fatalf("no change signalled when %s", what)
+		}
+	}
+
+	started := e.Changed()
+	b.claims <- storage.QueuedActivity{ID: uuid.New(), ActivityType: "charge", TimeoutSeconds: 30}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- e.Start(ctx) }()
+	receive(t, entered)
+	changed(started, "an activity started")
+
+	finished := e.Changed()
+	close(release)
+	receive(t, b.ack)
+	changed(finished, "an activity finished")
+
+	draining := e.Changed()
+	cancel()
+	changed(draining, "the drain began")
+	if err := receive(t, done); err != nil {
+		t.Fatal(err)
+	}
+}

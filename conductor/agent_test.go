@@ -366,6 +366,22 @@ func TestExecutorDescribeAndReports(t *testing.T) {
 	}
 }
 
+func TestReportsChanges(t *testing.T) {
+	g := newFakeGateway(t, sessionConfig{ReportIntervalMS: 60_000})
+	e := nopEngine(t)
+	startAgent(t, e, g, Config{})
+	g.waitHello()
+	g.waitEvent(typeExecutorReport) // on connect
+
+	// A drain beginning is reported without waiting out the interval.
+	e.Stop()
+	evt := g.waitEvent(typeExecutorReport)
+	var st executorState
+	if err := json.Unmarshal(evt.Data, &st); err != nil || !st.Draining {
+		t.Fatalf("report after the stop: %s", evt.Data)
+	}
+}
+
 func TestProtocolErrors(t *testing.T) {
 	g := newFakeGateway(t, sessionConfig{})
 	startAgent(t, nopEngine(t), g, Config{})

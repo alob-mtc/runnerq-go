@@ -45,6 +45,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 
 	"github.com/alob-mtc/runnerq-go"
+	"github.com/alob-mtc/runnerq-go/executor"
 )
 
 const (
@@ -55,6 +56,8 @@ const (
 	maxMessageBytes  = 4 << 20
 	// defaultReportInterval applies until the Cloud sets one.
 	defaultReportInterval = 15 * time.Second
+	// reportMinGap spaces the reports an executor's changes trigger.
+	reportMinGap = time.Second
 )
 
 // Config configures the agent.
@@ -430,20 +433,14 @@ func (a *Agent) applyConfig(c sessionConfig) {
 // reportLoop pushes executor.report on connect and then at the interval the
 // Cloud asked for, so dashboards do not poll.
 func (a *Agent) reportLoop(ctx context.Context, conn *websocket.Conn) {
-	for {
+	every := func() time.Duration { return time.Duration(a.reportEvery.Load()) }
+	executor.Report(ctx, a.engine, every, reportMinGap, func() {
 		if evt, err := newEvent(typeExecutorReport, a.h.state(false)); err == nil {
 			wctx, cancel := context.WithTimeout(ctx, writeTimeout)
 			_ = wsjson.Write(wctx, conn, evt)
 			cancel()
 		}
-		t := time.NewTimer(time.Duration(a.reportEvery.Load()))
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			return
-		case <-t.C:
-		}
-	}
+	})
 }
 
 func (a *Agent) readLoop(ctx context.Context, conn *websocket.Conn, st *streams) error {
