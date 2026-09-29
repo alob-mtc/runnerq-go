@@ -84,7 +84,8 @@ const awaitParkGrace = 2 * time.Second
 func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error) {
 	queue := f.queue
 	grace := awaitParkGrace
-	if scoped, ok := ctx.Value(attemptQueueKey{}).(*attemptQueue); ok {
+	scoped, inHandler := ctx.Value(attemptQueueKey{}).(*attemptQueue)
+	if inHandler {
 		if scoped.awaitGrace > 0 {
 			grace = scoped.awaitGrace
 		}
@@ -100,7 +101,7 @@ func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error)
 		}
 		queue = &copy
 	}
-	if !inHandlerScope(ctx) {
+	if !inHandler {
 		result, err := queue.WaitForResult(ctx, f.activityID)
 		if err != nil {
 			return nil, err
@@ -424,8 +425,9 @@ func (w *ActivityExecutor) executeActivity(ctx context.Context, activityType str
 		// Positional identity: a retried parent re-issuing this exact spawn
 		// derives the same key and reattaches to the existing child instead
 		// of duplicating it. The "rq:step:" prefix keeps the derived keyspace
-		// disjoint from user-supplied idempotency keys (which are suffixed
-		// with the activity type, never prefixed like this).
+		// disjoint from user-supplied idempotency keys (which are encoded
+		// with the activity type under the "rq:key:v2:" prefix; see
+		// storage.BusinessIdempotencyKey).
 		a.IdempotencyKey = &IdempotencyConfig{
 			Key:      fmt.Sprintf("rq:step:%s:%s:%s", a.RootActivityID, w.lineage.parentID, step),
 			Behavior: ReturnExisting,
@@ -464,14 +466,10 @@ func (w *ActivityExecutor) executeActivity(ctx context.Context, activityType str
 		return &ActivityFuture{queue: w.queue, activityID: existing.ExistingID}, nil
 	}
 
-	if a.ScheduledAt == nil {
-		if err := w.queue.Enqueue(ctx, a); err != nil {
-			return nil, WorkerErrorFromStorage(err)
-		}
-	} else {
-		if err := w.queue.ScheduleActivity(ctx, a); err != nil {
-			return nil, WorkerErrorFromStorage(err)
-		}
+	// A scheduled activity is enqueued the same way: the backend holds it
+	// until its ScheduledAt.
+	if err := w.queue.Enqueue(ctx, a); err != nil {
+		return nil, WorkerErrorFromStorage(err)
 	}
 
 	return &ActivityFuture{queue: w.queue, activityID: activityID}, nil

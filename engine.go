@@ -426,8 +426,7 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// Stop may have cancelled intake during pool registration.
-
+	// Stop may have been called while the engine was starting.
 	if !e.running.Load() {
 		slog.Info("Shutdown requested during startup")
 	} else {
@@ -448,13 +447,10 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	// budget expires).
 	e.stop()
 
-	// Phase 2: drain. Single shutdown grace covering everything in parallel —
-	// worker loops, in-flight activity goroutines, and pool
-	// deregistration. Previous design ran them sequentially with
-	// per-stage timeouts (wg.Wait unbounded + 30s + 10s + 5s) which on a
-	// busy engine could push shutdown past a minute and time out the
-	// orchestrator's SIGTERM grace. Worst case is now ShutdownGraceSeconds
-	// regardless of how many goroutines are still in flight.
+	// Phase 2: drain, bounded by one shutdown grace. wg covers the intake
+	// loops and maintenance processors started above, and in-flight
+	// activities run inside the intake goroutines, so it covers them too.
+	// Worst case is ShutdownGraceSeconds however many are still in flight.
 	graceSec := uint64(30)
 	if e.config.ShutdownGraceSeconds != nil {
 		graceSec = max(*e.config.ShutdownGraceSeconds, 1)
@@ -462,51 +458,27 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 	graceCtx, graceCancel := context.WithTimeout(context.Background(), time.Duration(graceSec)*time.Second)
 	defer graceCancel()
 
-	type drainTask struct {
-		name string
-		fn   func()
-	}
-	tasks := []drainTask{
-		// Worker loops, reaper, scheduled processor, heartbeat — everything
-		// that wg.Add'd into the supervisor wg above. In-flight activities
-		// run inside the worker goroutines, so they're covered too.
-		{"workers", func() { wg.Wait() }},
-	}
-
-	done := make(chan string, len(tasks))
-	var drains sync.WaitGroup
-	for _, t := range tasks {
-		drains.Go(func() {
-			t.fn()
-			done <- t.name
-		})
-	}
-	drainsDone := make(chan struct{})
-	go func() { drains.Wait(); close(drainsDone) }()
+	drained := make(chan struct{})
+	go func() { wg.Wait(); close(drained) }()
 	defer func() {
 		engineCancel()
 		finish := func() { e.mu.Lock(); e.active = false; e.mu.Unlock() }
 		select {
-		case <-drainsDone:
+		case <-drained:
 			finish()
 		default:
-			go func() { <-drainsDone; finish() }()
+			go func() { <-drained; finish() }()
 		}
 	}()
 
-	finished := 0
-	for finished < len(tasks) {
-		select {
-		case name := <-done:
-			slog.Debug("Shutdown drain complete", "stage", name)
-			finished++
-		case <-graceCtx.Done():
-			pending := len(tasks) - finished
-			slog.Warn("Shutdown grace exceeded; returning with drains in flight",
-				"grace_seconds", graceSec, "pending_drains", pending)
-			signal.Stop(sigCh)
-			return nil
-		}
+	select {
+	case <-drained:
+		slog.Debug("Shutdown drain complete")
+	case <-graceCtx.Done():
+		slog.Warn("Shutdown grace exceeded; returning with activities in flight",
+			"grace_seconds", graceSec)
+		signal.Stop(sigCh)
+		return nil
 	}
 
 	signal.Stop(sigCh)
@@ -715,10 +687,9 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	defer revoke(nil)
 	e.revokers.Store(activityID, revoke)
 	defer e.revokers.Delete(activityID)
-	// Mark the context as handler-scoped so in-handler GetResult calls may
-	// yield-park this activity; awaits outside a handler block normally.
-	timeoutCtx = withHandlerScope(timeoutCtx)
-
+	// Carrying the attempt queue marks the context as handler-scoped, so
+	// in-handler GetResult calls may yield-park this activity; awaits outside
+	// a handler block normally.
 	attemptQ := &attemptQueue{activityQueue: e.queue, backend: e.backend, owner: act.ID, worker: workerLabel, persistenceCtx: ctx, metrics: e.metrics, awaitGrace: e.awaitGrace}
 	timeoutCtx = context.WithValue(timeoutCtx, attemptQueueKey{}, attemptQ)
 	scopedExecutor := newActivityExecutor(attemptQ, e.config.MaxActivityDepth).scopedForChild(act)
@@ -759,14 +730,14 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	// yield that raced the deadline is still honored as a yield.
 	var ys *yieldPark
 	if errors.As(handlerErr, &ys) {
-		e.handleYield(ctx, act, ys, workerLabel, workerID, activityID, activityType)
+		e.handleYield(ctx, act, ys, workerLabel, workerID)
 		return
 	}
 
 	// A successfully returned outcome is worth persisting even if the handler
 	// deadline elapsed during checkpoint recovery. Ownership still fences it.
 	if handlerErr == nil {
-		e.handleSuccess(ctx, act, result, workerLabel, workerID, activityID, activityType)
+		e.handleSuccess(ctx, act, result, workerLabel, workerID)
 		return
 	}
 	if se, ok := storage.IsStorageError(handlerErr); ok && se.Kind == storage.ErrClaimLost {
@@ -776,14 +747,14 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	}
 	retryable := retryableError(handlerErr)
 	if !retryable {
-		e.handleNonRetryableFailure(ctx, act, handlerErr.Error(), workerLabel, workerID, activityID, activityType)
+		e.handleNonRetryableFailure(ctx, act, handlerErr.Error(), workerLabel, workerID)
 		return
 	}
 	if timeoutCtx.Err() == context.DeadlineExceeded {
-		e.handleTimeout(ctx, act, handler, actCtx, payloadForDL, workerLabel, workerID, activityID, activityType, activityTimeout)
+		e.handleTimeout(ctx, act, handler, payloadForDL, workerLabel, workerID, activityTimeout)
 		return
 	}
-	e.handleRetryableFailure(ctx, act, handler, actCtx, payloadForDL, handlerErr.Error(), workerLabel, workerID, activityID, activityType)
+	e.handleRetryableFailure(ctx, act, handler, payloadForDL, handlerErr.Error(), workerLabel, workerID)
 }
 
 // safeHandle calls the handler with panic recovery.
@@ -805,7 +776,8 @@ func (e *WorkerEngine) safeHandle(handler ActivityHandler, ctx ActivityContext, 
 	return handler.Handle(ctx, payload)
 }
 
-func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result json.RawMessage, workerLabel string, workerID int, activityID any, activityType string) {
+func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result json.RawMessage, workerLabel string, workerID int) {
+	activityID, activityType := act.ID, act.ActivityType
 	started := time.Now()
 	e.metrics.IncCounter("activity_completion_pending_started", 1)
 	defer func() {
@@ -833,7 +805,8 @@ func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result 
 // On failure the row simply stays processing: its lease expires, the reaper
 // requeues it, and the handler replays to the same Sleep — degraded latency
 // and one consumed retry, not lost work.
-func (e *WorkerEngine) handleYield(ctx context.Context, act *activity, ys *yieldPark, workerLabel string, workerID int, activityID any, activityType string) {
+func (e *WorkerEngine) handleYield(ctx context.Context, act *activity, ys *yieldPark, workerLabel string, workerID int) {
+	activityID, activityType := act.ID, act.ActivityType
 	// Recheck waits periodically even if this process dies immediately after
 	// park commits. The original signal/timer deadline remains checkpointed;
 	// this only schedules a replay to discover a result or repark safely.
@@ -889,7 +862,8 @@ func (e *WorkerEngine) handleYield(ctx context.Context, act *activity, ys *yield
 	}
 }
 
-func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity, handler ActivityHandler, actCtx ActivityContext, payloadForDL json.RawMessage, reason string, workerLabel string, workerID int, activityID any, activityType string) {
+func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity, handler ActivityHandler, payload json.RawMessage, reason string, workerLabel string, workerID int) {
+	activityID, activityType := act.ID, act.ActivityType
 	e.metrics.IncCounter("activity_retry", 1)
 	slog.Warn("Activity requesting retry", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "reason", reason)
 
@@ -899,22 +873,12 @@ func (e *WorkerEngine) handleRetryableFailure(ctx context.Context, act *activity
 		return
 	}
 	if deadLettered {
-		dlCtx := ActivityContext{
-			ActivityID:       act.ID,
-			ActivityType:     activityType,
-			RetryCount:       0,
-			Metadata:         make(map[string]string),
-			Ctx:              ctx,
-			ActivityExecutor: newActivityExecutor(e.queue, e.config.MaxActivityDepth).scopedForChild(act),
-			ParentActivityID: act.ParentActivityID,
-			RootActivityID:   act.RootActivityID,
-			Depth:            act.Depth,
-		}
-		e.callDeadLetter(handler, dlCtx, payloadForDL, reason)
+		e.callDeadLetter(ctx, act, handler, payload, reason)
 	}
 }
 
-func (e *WorkerEngine) handleNonRetryableFailure(ctx context.Context, act *activity, reason string, workerLabel string, workerID int, activityID any, activityType string) {
+func (e *WorkerEngine) handleNonRetryableFailure(ctx context.Context, act *activity, reason string, workerLabel string, workerID int) {
+	activityID, activityType := act.ID, act.ActivityType
 	e.metrics.IncCounter("activity_failed_non_retry", 1)
 	slog.Error("Activity failed", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "reason", reason)
 
@@ -925,7 +889,8 @@ func (e *WorkerEngine) handleNonRetryableFailure(ctx context.Context, act *activ
 	}
 }
 
-func (e *WorkerEngine) handleTimeout(ctx context.Context, act *activity, handler ActivityHandler, actCtx ActivityContext, payloadForDL json.RawMessage, workerLabel string, workerID int, activityID any, activityType string, timeout time.Duration) {
+func (e *WorkerEngine) handleTimeout(ctx context.Context, act *activity, handler ActivityHandler, payload json.RawMessage, workerLabel string, workerID int, timeout time.Duration) {
+	activityID, activityType := act.ID, act.ActivityType
 	e.metrics.IncCounter("activity_timeout", 1)
 	errorMsg := "Activity execution timed out"
 	slog.Error("Activity timed out", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType, "timeout", timeout)
@@ -936,29 +901,30 @@ func (e *WorkerEngine) handleTimeout(ctx context.Context, act *activity, handler
 		return
 	}
 	if deadLettered {
-		dlCtx := ActivityContext{
-			ActivityID:       act.ID,
-			ActivityType:     activityType,
-			RetryCount:       0,
-			Metadata:         make(map[string]string),
-			Ctx:              ctx,
-			ActivityExecutor: newActivityExecutor(e.queue, e.config.MaxActivityDepth).scopedForChild(act),
-			ParentActivityID: act.ParentActivityID,
-			RootActivityID:   act.RootActivityID,
-			Depth:            act.Depth,
-		}
-		e.callDeadLetter(handler, dlCtx, payloadForDL, errorMsg)
+		e.callDeadLetter(ctx, act, handler, payload, errorMsg)
 	}
 }
 
-func (e *WorkerEngine) callDeadLetter(handler ActivityHandler, ctx ActivityContext, payload json.RawMessage, reason string) {
+// callDeadLetter runs the handler's dead-letter hook for an activity whose
+// last attempt just failed, recovering a panicking hook.
+func (e *WorkerEngine) callDeadLetter(ctx context.Context, act *activity, handler ActivityHandler, payload json.RawMessage, reason string) {
 	defer func() {
 		if r := recover(); r != nil {
 			e.metrics.IncCounter("activity_dead_letter_hook_panic", 1)
-			slog.Error("Dead-letter hook panicked", "activity_id", ctx.ActivityID, "panic", r)
+			slog.Error("Dead-letter hook panicked", "activity_id", act.ID, "panic", r)
 		}
 	}()
-	handler.OnDeadLetter(ctx, payload, reason)
+	handler.OnDeadLetter(ActivityContext{
+		ActivityID:       act.ID,
+		ActivityType:     act.ActivityType,
+		RetryCount:       0,
+		Metadata:         make(map[string]string),
+		Ctx:              ctx,
+		ActivityExecutor: newActivityExecutor(e.queue, e.config.MaxActivityDepth).scopedForChild(act),
+		ParentActivityID: act.ParentActivityID,
+		RootActivityID:   act.RootActivityID,
+		Depth:            act.Depth,
+	}, payload, reason)
 }
 
 func (e *WorkerEngine) runScheduledProcessor(ctx context.Context) {

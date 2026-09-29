@@ -12,10 +12,8 @@ package postgres
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -100,42 +98,6 @@ func hasEvent(t *testing.T, b *PostgresBackend, id uuid.UUID, eventType string) 
 	return false
 }
 
-// Tier 0.1: completion and result storage are atomic, and a result row is
-// written even for a nil handler result so awaiting parents always resolve.
-func TestAckSuccessAlwaysStoresResult(t *testing.T) {
-	b := testBackend(t)
-	ctx := context.Background()
-
-	a := testActivity(3)
-	if err := b.Enqueue(ctx, a); err != nil {
-		t.Fatalf("enqueue: %v", err)
-	}
-	claimed, err := b.Dequeue(ctx, "w1", time.Second, nil)
-	if err != nil || claimed == nil {
-		t.Fatalf("dequeue: claimed=%v err=%v", claimed, err)
-	}
-
-	if err := b.AckSuccess(ctx, a.ID, nil, "w1"); err != nil {
-		t.Fatalf("ack success: %v", err)
-	}
-
-	res, err := b.GetResult(ctx, a.ID)
-	if err != nil {
-		t.Fatalf("get result: %v", err)
-	}
-	if res == nil {
-		t.Fatal("completed activity has no result row — awaiting parents would hang forever")
-	}
-	if res.State != storage.ResultOk {
-		t.Fatalf("result state = %v, want Ok", res.State)
-	}
-	if status, _ := activityStatus(t, b, a.ID); status != "completed" {
-		t.Fatalf("status = %q, want completed", status)
-	}
-}
-
-// storage.BatchQueueStorage: one round trip claims up to limit rows in the
-// order Dequeue would have taken them, each with its own fenced token.
 // Go claims only plain-JSON inputs: an activity the TypeScript SDK enqueued
 // in its native encoding stays queued for a TypeScript worker, however high
 // its priority.
@@ -169,6 +131,10 @@ func TestClaimsSkipInputsGoCannotRead(t *testing.T) {
 	}
 }
 
+// storage.BatchQueueStorage: one round trip claims up to limit rows in the
+// order Dequeue would have taken them, each with its own fenced token. Beyond
+// the conformance suite's batch test, this pins the token format
+// (prefix:activityID) this backend derives.
 func TestDequeueBatchClaimsInDequeueOrderWithFencedTokens(t *testing.T) {
 	b := testBackend(t)
 	ctx := context.Background()
@@ -233,127 +199,6 @@ func TestDequeueBatchClaimsInDequeueOrderWithFencedTokens(t *testing.T) {
 	}
 }
 
-// The three static type-filter forms (none / one / many) and the limit.
-func TestDequeueBatchTypeFilterForms(t *testing.T) {
-	b := testBackend(t)
-	ctx := context.Background()
-
-	for _, typ := range []string{"a", "a", "b", "b", "c", "c"} {
-		a := testActivity(3)
-		a.ActivityType = typ
-		if err := b.Enqueue(ctx, a); err != nil {
-			t.Fatalf("enqueue: %v", err)
-		}
-	}
-	claimTypes := func(prefix string, limit int, filter []string) []string {
-		t.Helper()
-		claims, err := b.DequeueBatch(ctx, prefix, limit, 0, filter)
-		if err != nil {
-			t.Fatalf("batch dequeue %v: %v", filter, err)
-		}
-		types := make([]string, 0, len(claims))
-		for _, c := range claims {
-			types = append(types, c.Activity.ActivityType)
-		}
-		return types
-	}
-
-	if got := claimTypes("one", 10, []string{"a"}); len(got) != 2 || got[0] != "a" || got[1] != "a" {
-		t.Fatalf("one-type filter claimed %v, want [a a]", got)
-	}
-	got := claimTypes("many", 3, []string{"b", "c"})
-	if len(got) != 3 {
-		t.Fatalf("many-type filter with limit 3 claimed %v", got)
-	}
-	for _, typ := range got {
-		if typ == "a" {
-			t.Fatalf("many-type filter [b c] claimed type a: %v", got)
-		}
-	}
-	if got := claimTypes("all", 10, nil); len(got) != 1 || got[0] == "a" {
-		t.Fatalf("unfiltered claim got %v, want the single remaining b/c row", got)
-	}
-}
-
-// Two processes claiming in bulk from one queue never receive the same row.
-func TestDequeueBatchConcurrentClaimersNeverOverlap(t *testing.T) {
-	queueName := "t_" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
-	b1, b2 := testBackendNamed(t, queueName), testBackendNamed(t, queueName)
-	ctx := context.Background()
-
-	const total = 40
-	for range total {
-		if err := b1.Enqueue(ctx, testActivity(3)); err != nil {
-			t.Fatalf("enqueue: %v", err)
-		}
-	}
-
-	var mu sync.Mutex
-	seen := make(map[uuid.UUID]string, total)
-	var wg sync.WaitGroup
-	for i, b := range []*PostgresBackend{b1, b2} {
-		wg.Go(func() {
-			for round := 0; ; round++ {
-				claims, err := b.DequeueBatch(ctx, fmt.Sprintf("claimer-%d-%d", i, round), 7, 0, nil)
-				if err != nil {
-					t.Errorf("claimer %d: %v", i, err)
-					return
-				}
-				if len(claims) == 0 {
-					return
-				}
-				mu.Lock()
-				for _, c := range claims {
-					if prev, dup := seen[c.Activity.ID]; dup {
-						t.Errorf("activity %s claimed twice: %s and %s", c.Activity.ID, prev, c.LeaseID)
-					}
-					seen[c.Activity.ID] = c.LeaseID
-				}
-				mu.Unlock()
-			}
-		})
-	}
-	wg.Wait()
-	if len(seen) != total {
-		t.Fatalf("claimed %d distinct activities, want %d", len(seen), total)
-	}
-}
-
-// A blocking batch claim parks on the work signal and wakes when a row lands.
-func TestDequeueBatchBlocksUntilWorkIsSignalled(t *testing.T) {
-	b := testBackend(t)
-	ctx := context.Background()
-
-	type outcome struct {
-		claims []storage.DequeuedActivity
-		err    error
-		took   time.Duration
-	}
-	done := make(chan outcome, 1)
-	start := time.Now()
-	go func() {
-		claims, err := b.DequeueBatch(ctx, "blocker", 5, 10*time.Second, nil)
-		done <- outcome{claims: claims, err: err, took: time.Since(start)}
-	}()
-
-	time.Sleep(300 * time.Millisecond)
-	a := testActivity(3)
-	if err := b.Enqueue(ctx, a); err != nil {
-		t.Fatalf("enqueue: %v", err)
-	}
-	select {
-	case o := <-done:
-		if o.err != nil || len(o.claims) != 1 || o.claims[0].Activity.ID != a.ID {
-			t.Fatalf("blocking claim returned n=%d err=%v", len(o.claims), o.err)
-		}
-		if o.took > 5*time.Second {
-			t.Fatalf("blocking claim took %v; it should wake on the enqueue signal, not the deadline", o.took)
-		}
-	case <-time.After(8 * time.Second):
-		t.Fatal("blocking claim did not return after work was enqueued")
-	}
-}
-
 // A batch token is fenced exactly like a single-claim token: once the lease
 // expires and the row is reclaimed, the old token can no longer ack.
 func TestStaleBatchTokenCannotAck(t *testing.T) {
@@ -389,76 +234,6 @@ func TestStaleBatchTokenCannotAck(t *testing.T) {
 	}
 	if err := b.AckSuccess(ctx, a.ID, json.RawMessage(`"fresh"`), fresh[0].LeaseID); err != nil {
 		t.Fatalf("owning token ack failed: %v", err)
-	}
-}
-
-// Tier 0.2 (backend half): a worker whose lease expired and whose activity was
-// reclaimed by another worker cannot ack it.
-func TestStaleWorkerCannotAck(t *testing.T) {
-	b := testBackend(t)
-	ctx := context.Background()
-
-	a := testActivity(5)
-	if err := b.Enqueue(ctx, a); err != nil {
-		t.Fatalf("enqueue: %v", err)
-	}
-	if claimed, err := b.Dequeue(ctx, "stale-worker", time.Second, nil); err != nil || claimed == nil {
-		t.Fatalf("first dequeue: claimed=%v err=%v", claimed, err)
-	}
-
-	expireLease(t, b, a.ID)
-	if n, err := b.RequeueExpired(ctx, 10); err != nil || n != 1 {
-		t.Fatalf("requeue expired: n=%d err=%v", n, err)
-	}
-	if claimed, err := b.Dequeue(ctx, "fresh-worker", time.Second, nil); err != nil || claimed == nil {
-		t.Fatalf("second dequeue: claimed=%v err=%v", claimed, err)
-	}
-
-	if err := b.AckSuccess(ctx, a.ID, json.RawMessage(`"stale"`), "stale-worker"); err == nil {
-		t.Fatal("stale worker ack succeeded; it must be fenced out")
-	}
-	if status, _ := activityStatus(t, b, a.ID); status != "processing" {
-		t.Fatalf("status after stale ack = %q, want processing (still owned by fresh-worker)", status)
-	}
-	if err := b.AckSuccess(ctx, a.ID, json.RawMessage(`"fresh"`), "fresh-worker"); err != nil {
-		t.Fatalf("owning worker ack failed: %v", err)
-	}
-}
-
-// Tier 0.3: the idempotency-key claim and the enqueue commit atomically, and
-// duplicate spawns get the existing activity back.
-func TestEnqueueIdempotentClaimAndReuse(t *testing.T) {
-	b := testBackend(t)
-	ctx := context.Background()
-
-	first := testActivity(3)
-	first.IdempotencyKey = &storage.IdempotencyKeyConfig{Key: "job-42", Behavior: storage.BehaviorReturnExisting}
-	existing, err := b.EnqueueIdempotent(ctx, &first)
-	if err != nil {
-		t.Fatalf("first enqueue: %v", err)
-	}
-	if existing != nil {
-		t.Fatalf("first enqueue returned existing %v, want fresh claim", existing.ExistingID)
-	}
-	if status, _ := activityStatus(t, b, first.ID); status != "pending" {
-		t.Fatalf("first activity status = %q, want pending", status)
-	}
-
-	second := testActivity(3)
-	second.IdempotencyKey = first.IdempotencyKey
-	existing, err = b.EnqueueIdempotent(ctx, &second)
-	if err != nil {
-		t.Fatalf("second enqueue: %v", err)
-	}
-	if existing == nil || existing.ExistingID != first.ID {
-		t.Fatalf("second enqueue existing = %+v, want %s", existing, first.ID)
-	}
-	var count int
-	if err := b.pool.QueryRow(ctx, `SELECT COUNT(*) FROM runnerq_activities WHERE id = $1`, second.ID).Scan(&count); err != nil {
-		t.Fatalf("count: %v", err)
-	}
-	if count != 0 {
-		t.Fatal("duplicate spawn created a second activity row")
 	}
 }
 
@@ -498,56 +273,6 @@ func TestEnqueueIdempotentRepairsOrphanedKey(t *testing.T) {
 	}
 	if pointsAt != a.ID {
 		t.Fatalf("key points at %s, want %s", pointsAt, a.ID)
-	}
-}
-
-// Tier 0.4: lease expiry counts as a failed attempt; exhausted activities go
-// to the dead-letter queue (with a result row so parents resolve) instead of
-// looping forever, and both paths record events.
-func TestReaperRetryAccountingAndDeadLetter(t *testing.T) {
-	b := testBackend(t)
-	ctx := context.Background()
-
-	a := testActivity(2) // dead-letter on the second expired lease
-	if err := b.Enqueue(ctx, a); err != nil {
-		t.Fatalf("enqueue: %v", err)
-	}
-
-	if claimed, err := b.Dequeue(ctx, "w1", time.Second, nil); err != nil || claimed == nil {
-		t.Fatalf("dequeue 1: claimed=%v err=%v", claimed, err)
-	}
-	expireLease(t, b, a.ID)
-	if n, err := b.RequeueExpired(ctx, 10); err != nil || n != 1 {
-		t.Fatalf("requeue 1: n=%d err=%v", n, err)
-	}
-	status, retryCount := activityStatus(t, b, a.ID)
-	if status != "pending" || retryCount != 1 {
-		t.Fatalf("after reap 1: status=%q retry_count=%d, want pending/1", status, retryCount)
-	}
-	if !hasEvent(t, b, a.ID, storage.EventRequeued) {
-		t.Fatal("no Requeued event recorded for reaped activity")
-	}
-
-	if claimed, err := b.Dequeue(ctx, "w2", time.Second, nil); err != nil || claimed == nil {
-		t.Fatalf("dequeue 2: claimed=%v err=%v", claimed, err)
-	}
-	expireLease(t, b, a.ID)
-	if n, err := b.RequeueExpired(ctx, 10); err != nil || n != 1 {
-		t.Fatalf("requeue 2: n=%d err=%v", n, err)
-	}
-	status, retryCount = activityStatus(t, b, a.ID)
-	if status != "dead_letter" || retryCount != 2 {
-		t.Fatalf("after reap 2: status=%q retry_count=%d, want dead_letter/2", status, retryCount)
-	}
-	if !hasEvent(t, b, a.ID, storage.EventDeadLetter) {
-		t.Fatal("no DeadLetter event recorded")
-	}
-	res, err := b.GetResult(ctx, a.ID)
-	if err != nil {
-		t.Fatalf("get result: %v", err)
-	}
-	if res == nil || res.State != storage.ResultErr {
-		t.Fatalf("dead-lettered activity result = %+v, want Err result so parents resolve", res)
 	}
 }
 

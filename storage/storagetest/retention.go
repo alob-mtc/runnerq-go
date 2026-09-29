@@ -72,9 +72,9 @@ func (s *suite) age() {
 	time.Sleep(retentionTTL + 500*time.Millisecond)
 }
 
-func (s *suite) sweep(policy storage.RetentionPolicy, batch int, want uint64) {
+func (s *suite) sweep(policy storage.RetentionPolicy, want uint64) {
 	s.t.Helper()
-	n, err := s.b.CleanupExpired(s.ctx, policy, batch)
+	n, err := s.b.CleanupExpired(s.ctx, policy, 100)
 	if err != nil || n != want {
 		s.t.Fatalf("cleanup: n=%d err=%v, want %d", n, err, want)
 	}
@@ -115,13 +115,13 @@ func testRetentionSweepsTrees(t *testing.T, h Harness) {
 	s := newSuite(t, h)
 	old := s.finishTree("completed")
 	s.wantTree(old, true)
-	s.sweep(storage.RetentionPolicy{}, 100, 0) // zero TTLs keep everything
+	s.sweep(storage.RetentionPolicy{}, 0) // zero TTLs keep everything
 	s.age()
 	fresh := s.finishTree("completed")
-	s.sweep(storage.RetentionPolicy{Completed: retentionTTL}, 100, 1)
+	s.sweep(storage.RetentionPolicy{Completed: retentionTTL}, 1)
 	s.wantTree(old, false)
 	s.wantTree(fresh, true)
-	s.sweep(storage.RetentionPolicy{Completed: retentionTTL}, 100, 0)
+	s.sweep(storage.RetentionPolicy{Completed: retentionTTL}, 0)
 }
 
 // A root that is terminal while a descendant is not keeps the whole tree.
@@ -133,7 +133,7 @@ func testRetentionKeepsLiveTrees(t *testing.T, h Harness) {
 		t.Fatal(err)
 	}
 	s.age()
-	s.sweep(storage.RetentionPolicy{Completed: retentionTTL}, 100, 0)
+	s.sweep(storage.RetentionPolicy{Completed: retentionTTL}, 0)
 	if snap, err := s.r.GetActivity(s.ctx, root.ID); err != nil || snap == nil {
 		t.Fatalf("root with a live child was swept: %v", err)
 	}
@@ -141,7 +141,7 @@ func testRetentionKeepsLiveTrees(t *testing.T, h Harness) {
 	if err := s.b.AckSuccess(s.ctx, child.ID, nil, "c"); err != nil {
 		t.Fatal(err)
 	}
-	s.sweep(storage.RetentionPolicy{Completed: retentionTTL}, 100, 1)
+	s.sweep(storage.RetentionPolicy{Completed: retentionTTL}, 1)
 }
 
 func testRetentionSeparateTTLs(t *testing.T, h Harness) {
@@ -149,10 +149,10 @@ func testRetentionSeparateTTLs(t *testing.T, h Harness) {
 	completed := s.finishTree("completed")
 	failed := s.finishTree("failed")
 	s.age()
-	s.sweep(storage.RetentionPolicy{Failed: retentionTTL}, 100, 1)
+	s.sweep(storage.RetentionPolicy{Failed: retentionTTL}, 1)
 	s.wantTree(failed, false)
 	s.wantTree(completed, true)
-	s.sweep(storage.RetentionPolicy{Completed: retentionTTL}, 100, 1)
+	s.sweep(storage.RetentionPolicy{Completed: retentionTTL}, 1)
 	s.wantTree(completed, false)
 }
 

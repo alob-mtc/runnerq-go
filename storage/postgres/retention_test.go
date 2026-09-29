@@ -132,52 +132,10 @@ func assertTreeGone(t *testing.T, b *PostgresBackend, tree retentionTree, label 
 	}
 }
 
-// The sweep deletes a whole expired terminal tree — activities, events,
-// results (including checkpoint rows with synthetic IDs, by owner), the
-// checkpoint's events, and idempotency keys — while leaving fresh trees and
-// trees with non-terminal descendants untouched.
-func TestCleanupExpiredSweepsTerminalTrees(t *testing.T) {
-	b := testBackend(t)
-	ctx := context.Background()
-
-	oldDone := plantTree(t, b, "completed", "completed", 2*time.Hour)
-	fresh := plantTree(t, b, "completed", "completed", time.Minute)
-	guarded := plantTree(t, b, "completed", "processing", 2*time.Hour) // child still running
-
-	n, err := b.CleanupExpired(ctx, storage.RetentionPolicy{Completed: time.Hour}, 100)
-	if err != nil {
-		t.Fatalf("cleanup: %v", err)
-	}
-	if n != 1 {
-		t.Fatalf("swept %d trees, want exactly 1", n)
-	}
-	assertTreeGone(t, b, oldDone, "expired tree")
-	assertTreePresent(t, b, fresh, "fresh tree")
-	assertTreePresent(t, b, guarded, "tree with running child")
-}
-
-// Completed and failed trees age on separate clocks; zero TTL keeps forever.
-func TestCleanupExpiredSeparateTTLs(t *testing.T) {
-	b := testBackend(t)
-	ctx := context.Background()
-
-	oldCompleted := plantTree(t, b, "completed", "completed", 2*time.Hour)
-	oldFailed := plantTree(t, b, "dead_letter", "completed", 2*time.Hour)
-
-	// Completed: keep forever (0). Failed: 1h TTL.
-	n, err := b.CleanupExpired(ctx, storage.RetentionPolicy{Failed: time.Hour}, 100)
-	if err != nil {
-		t.Fatalf("cleanup: %v", err)
-	}
-	if n != 1 {
-		t.Fatalf("swept %d trees, want 1 (only the failed one)", n)
-	}
-	assertTreeGone(t, b, oldFailed, "expired failed tree")
-	assertTreePresent(t, b, oldCompleted, "completed tree under zero TTL")
-}
-
 // Only one sweeper runs per queue: while another session holds the advisory
 // lock, CleanupExpired no-ops instead of contending.
+// The sweep after release also checks every table a tree spans, including
+// runnerq_inputs, which the conformance suite cannot see.
 func TestCleanupExpiredLeadership(t *testing.T) {
 	b := testBackend(t)
 	ctx := context.Background()
@@ -251,41 +209,5 @@ func TestCleanupExpiredHandlesLegacyNullRootID(t *testing.T) {
 	n, err = b.CleanupExpired(ctx, storage.RetentionPolicy{Completed: time.Hour}, 100)
 	if err != nil || n != 0 {
 		t.Fatalf("second pass: n=%d err=%v, want 0", n, err)
-	}
-}
-
-// Batch size limits roots per call; repeated calls drain the backlog.
-func TestCleanupExpiredBatches(t *testing.T) {
-	b := testBackend(t)
-	ctx := context.Background()
-
-	for range 3 {
-		plantTree(t, b, "completed", "completed", 2*time.Hour)
-	}
-
-	total := uint64(0)
-	for i := 0; i < 5 && total < 3; i++ {
-		n, err := b.CleanupExpired(ctx, storage.RetentionPolicy{Completed: time.Hour}, 2)
-		if err != nil {
-			t.Fatalf("cleanup pass %d: %v", i, err)
-		}
-		if n > 2 {
-			t.Fatalf("batch returned %d roots, cap was 2", n)
-		}
-		if n == 0 {
-			break
-		}
-		total += n
-	}
-	if total != 3 {
-		t.Fatalf("drained %d trees, want 3", total)
-	}
-	var remaining int
-	if err := b.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM runnerq_activities WHERE queue_name=$1`, b.queueName).Scan(&remaining); err != nil {
-		t.Fatalf("count: %v", err)
-	}
-	if remaining != 0 {
-		t.Fatalf("%d activities remain after drain, want 0", remaining)
 	}
 }

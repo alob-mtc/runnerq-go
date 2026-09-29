@@ -315,16 +315,14 @@ type QueueStorage interface {
 	// SignalActivity delivers an external signal to an activity: it stores
 	// payload as a result row under signalID (owned by activityID, so the
 	// retention sweeper collects it with the tree) and, if the target is
-	// parked as scheduled (yielded waiting for the signal), makes it
-	// immediately runnable. Must return a not-found error when no activity
-	// row matches activityID — silently storing signals for nonexistent
-	// activities would leak uncollectable rows. Atomic: store + wake commit
-	// together. Repeated signals with the same signalID overwrite the
-	// payload (last write wins).
-	// SignalActivity stores a signal payload under signalID (owned by the
-	// target activity) and wakes the target if parked. name is the human signal
-	// name, recorded on the result row (as "signal:<name>") and the Signaled
-	// event so the console can show which signal was delivered; "" is allowed.
+	// parked (yielded waiting for the signal), makes it immediately runnable.
+	// Atomic: store + wake commit together. Repeated signals with the same
+	// signalID overwrite the payload (last write wins). name is the human
+	// signal name, recorded on the result row (as "signal:<name>") and the
+	// Signaled event so the console can show which signal was delivered; ""
+	// is allowed. Must return a not-found error when no activity row matches
+	// activityID — silently storing signals for nonexistent activities would
+	// leak uncollectable rows.
 	SignalActivity(ctx context.Context, activityID uuid.UUID, signalID uuid.UUID, name string, payload json.RawMessage) error
 	// LookupIdempotencyActivityID returns the activity ID that currently owns
 	// idempotencyKey in this queue, so a caller can address a signal by

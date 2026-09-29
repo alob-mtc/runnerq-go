@@ -40,7 +40,6 @@ type activityQueue interface {
 	MarkCompleted(ctx context.Context, a *activity, result json.RawMessage, workerID string) error
 	// MarkFailed marks an activity as failed. Returns true if moved to dead letter queue.
 	MarkFailed(ctx context.Context, a *activity, errorMessage string, retryable bool, workerID string) (bool, error)
-	ScheduleActivity(ctx context.Context, a *activity) error
 	ProcessScheduledActivities(ctx context.Context) ([]*activity, error)
 	// Yield parks a processing activity as scheduled until wakeAt without
 	// consuming a retry. Used by durable Sleep/WaitForSignal/await. kind and
@@ -271,15 +270,6 @@ func (a *backendQueueAdapter) MarkFailed(ctx context.Context, act *activity, err
 	return a.backend.AckFailure(ctx, act.ID, failure, workerID)
 }
 
-func (a *backendQueueAdapter) ScheduleActivity(ctx context.Context, act *activity) error {
-	queued := activityToQueued(act)
-	if queued.ScheduledAt == nil {
-		now := time.Now().UTC()
-		queued.ScheduledAt = &now
-	}
-	return a.backend.Enqueue(ctx, queued)
-}
-
 func (a *backendQueueAdapter) ProcessScheduledActivities(ctx context.Context) ([]*activity, error) {
 	_, err := a.backend.ProcessScheduled(ctx)
 	if err != nil {
@@ -336,7 +326,7 @@ func (a *backendQueueAdapter) GetResult(ctx context.Context, activityID uuid.UUI
 // WaitForResult blocks until the activity's result exists. Backends that
 // implement storage.ResultWaiter (the Postgres backend does) provide an
 // efficient notification-driven wait that works across processes; for other
-// backends this falls back to the legacy 100ms poll.
+// backends this falls back to polling GetResult every 100ms.
 func (a *backendQueueAdapter) WaitForResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error) {
 	if rw, ok := a.backend.(storage.ResultWaiter); ok {
 		backendResult, err := rw.WaitForResult(ctx, activityID)

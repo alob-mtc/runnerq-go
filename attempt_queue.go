@@ -58,19 +58,6 @@ func (q *attemptQueue) Enqueue(ctx context.Context, a *activity) error {
 	return q.activityQueue.Enqueue(ctx, a)
 }
 
-func (q *attemptQueue) ScheduleActivity(ctx context.Context, a *activity) error {
-	b, ok := q.backend.(storage.SpawnStorage)
-	if !ok {
-		return q.activityQueue.ScheduleActivity(ctx, a)
-	}
-	queued := activityToQueued(a)
-	if queued.ScheduledAt == nil {
-		now := time.Now().UTC()
-		queued.ScheduledAt = &now
-	}
-	return b.EnqueueForWorker(ctx, queued, q.owner, q.worker)
-}
-
 func (q *attemptQueue) EnqueueIdempotent(ctx context.Context, a *activity) (*storage.IdempotencyResult, error) {
 	if b, ok := q.backend.(storage.SpawnStorage); ok {
 		queued := activityToQueued(a)

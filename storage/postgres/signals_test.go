@@ -61,22 +61,6 @@ func TestBlockingDequeueWakesAcrossProcesses(t *testing.T) {
 	}
 }
 
-// Blocking Dequeue must respect its block window on a queue that stays empty.
-func TestBlockingDequeueTimesOut(t *testing.T) {
-	b := testBackend(t)
-	start := time.Now()
-	claimed, err := b.Dequeue(context.Background(), "w1", 500*time.Millisecond, nil)
-	if err != nil {
-		t.Fatalf("dequeue: %v", err)
-	}
-	if claimed != nil {
-		t.Fatalf("claimed %v from an empty queue", claimed.ID)
-	}
-	if elapsed := time.Since(start); elapsed < 400*time.Millisecond || elapsed > 3*time.Second {
-		t.Fatalf("empty blocking dequeue returned after %v, want ~500ms", elapsed)
-	}
-}
-
 // A future awaited in one process must resolve when a different process
 // completes the activity. This is the scenario the suspend-stress "poll
 // storm" came from: previously each waiter hammered the results table at
@@ -151,44 +135,5 @@ func TestWaitForResultAlreadyStored(t *testing.T) {
 	}
 	if res == nil || res.State != storage.ResultOk {
 		t.Fatalf("result = %+v, want Ok", res)
-	}
-}
-
-// The three dequeue query forms must each claim the right rows.
-func TestDequeueTypeFilters(t *testing.T) {
-	b := testBackend(t)
-	ctx := context.Background()
-
-	mk := func(actType string) storage.QueuedActivity {
-		a := testActivity(3)
-		a.ActivityType = actType
-		return a
-	}
-	aa, ab, ac := mk("type_a"), mk("type_b"), mk("type_c")
-	for _, a := range []storage.QueuedActivity{aa, ab, ac} {
-		if err := b.Enqueue(ctx, a); err != nil {
-			t.Fatalf("enqueue %s: %v", a.ActivityType, err)
-		}
-	}
-
-	// Single-type form.
-	got, err := b.Dequeue(ctx, "w", 0, []string{"type_b"})
-	if err != nil || got == nil || got.ID != ab.ID {
-		t.Fatalf("single-type dequeue = %+v err=%v, want %s", got, err, ab.ID)
-	}
-	// Multi-type form: oldest of the listed types first (same priority).
-	got, err = b.Dequeue(ctx, "w", 0, []string{"type_a", "type_c"})
-	if err != nil || got == nil || got.ID != aa.ID {
-		t.Fatalf("multi-type dequeue = %+v err=%v, want %s", got, err, aa.ID)
-	}
-	// Untyped form claims what's left.
-	got, err = b.Dequeue(ctx, "w", 0, nil)
-	if err != nil || got == nil || got.ID != ac.ID {
-		t.Fatalf("untyped dequeue = %+v err=%v, want %s", got, err, ac.ID)
-	}
-	// Filtered dequeue must not claim other types.
-	got, err = b.Dequeue(ctx, "w", 0, []string{"type_a"})
-	if err != nil || got != nil {
-		t.Fatalf("dequeue of exhausted type = %+v err=%v, want nil", got, err)
 	}
 }

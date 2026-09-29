@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync"
 	"testing"
 	"time"
 
@@ -73,124 +72,6 @@ func TestCompletionReconcilesDuplicateAndRejectsConflict(t *testing.T) {
 		t.Fatalf("completion events=%d err=%v", n, err)
 	}
 }
-func TestCheckpointImmutableAndFencedAfterReclaim(t *testing.T) {
-	b := testBackend(t)
-	ctx := context.Background()
-	a := testActivity(3)
-	claimTestActivity(t, b, a, "old")
-	id := uuid.New()
-	r := storage.ActivityResult{Data: json.RawMessage(`"original"`), State: storage.ResultOk}
-	for range 2 {
-		if err := b.StoreCheckpoint(ctx, id, a.ID, "old", r, "run:charge"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := b.StoreCheckpoint(ctx, id, a.ID, "old", storage.ActivityResult{Data: json.RawMessage(`"changed"`)}, "run:charge"); err == nil {
-		t.Fatal("checkpoint overwritten")
-	}
-	expireLease(t, b, a.ID)
-	if n, err := b.RequeueExpired(ctx, 10); err != nil || n != 1 {
-		t.Fatalf("reaper %d %v", n, err)
-	}
-	if _, err := b.Dequeue(ctx, "new", 0, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.StoreCheckpoint(ctx, uuid.New(), a.ID, "old", r, "run:late"); err == nil {
-		t.Fatal("stale checkpoint accepted")
-	}
-	if err := b.AckSuccess(ctx, a.ID, r.Data, "old"); err == nil {
-		t.Fatal("stale completion accepted")
-	}
-	if ok, err := b.ExtendLeaseForWorker(ctx, a.ID, "old", time.Hour); err != nil || ok {
-		t.Fatalf("stale renewal %v %v", ok, err)
-	}
-	stored, err := b.GetResult(ctx, id)
-	if err != nil || string(stored.Data) != `"original"` {
-		t.Fatalf("checkpoint changed: %v %v", stored, err)
-	}
-}
-func TestAttemptRenewalNeverShortensLease(t *testing.T) {
-	b := testBackend(t)
-	ctx := context.Background()
-	a := testActivity(3)
-	claimTestActivity(t, b, a, "owner")
-	var before, after int64
-	if err := b.pool.QueryRow(ctx, `SELECT lease_deadline_ms FROM runnerq_activities WHERE id=$1`, a.ID).Scan(&before); err != nil {
-		t.Fatal(err)
-	}
-	if ok, err := b.ExtendLeaseForWorker(ctx, a.ID, "owner", time.Millisecond); err != nil || !ok {
-		t.Fatalf("renew %v %v", ok, err)
-	}
-	if err := b.pool.QueryRow(ctx, `SELECT lease_deadline_ms FROM runnerq_activities WHERE id=$1`, a.ID).Scan(&after); err != nil {
-		t.Fatal(err)
-	}
-	if after < before {
-		t.Fatalf("shortened lease %d -> %d", before, after)
-	}
-}
-func TestFailureAcknowledgementRetryDoesNotConsumeAnotherAttempt(t *testing.T) {
-	for _, max := range []uint32{0, 1, 3} {
-		t.Run(fmt.Sprint(max), func(t *testing.T) {
-			b := testBackend(t)
-			ctx := context.Background()
-			a := testActivity(max)
-			claimTestActivity(t, b, a, "claim")
-			for range 2 {
-				dead, err := b.AckFailure(ctx, a.ID, storage.NewRetryableFailure("failed"), "claim")
-				if err != nil || dead != (max == 1) {
-					t.Fatalf("failure ack dead=%v err=%v", dead, err)
-				}
-			}
-			status, count := activityStatus(t, b, a.ID)
-			if max != 1 && count != 1 {
-				t.Fatalf("status=%s retry_count=%d", status, count)
-			}
-		})
-	}
-}
-
-func TestSharedResultWakesAllConsumers(t *testing.T) {
-	for _, outcome := range []string{"success", "failure", "reaper"} {
-		t.Run(outcome, func(t *testing.T) {
-			b := testBackend(t)
-			ctx := context.Background()
-			producer := testActivity(1)
-			producer.ActivityType = "producer"
-			claimTestActivity(t, b, producer, "producer")
-			waiters := []storage.QueuedActivity{testActivity(3), testActivity(3)}
-			for i, a := range waiters {
-				a.ActivityType = fmt.Sprintf("waiter%d", i)
-				waiters[i] = a
-				w := a.ActivityType
-				claimTestActivity(t, b, a, w)
-				if err := b.RegisterDependency(ctx, a.ID, producer.ID, w); err != nil {
-					t.Fatal(err)
-				}
-				if err := b.YieldForResult(ctx, a.ID, producer.ID, &producer.ID, time.Now().Add(time.Hour), w, "await", "child"); err != nil {
-					t.Fatal(err)
-				}
-			}
-			var err error
-			switch outcome {
-			case "success":
-				err = b.AckSuccess(ctx, producer.ID, nil, "producer")
-			case "failure":
-				_, err = b.AckFailure(ctx, producer.ID, storage.NewNonRetryableFailure("failed"), "producer")
-			case "reaper":
-				expireLease(t, b, producer.ID)
-				_, err = b.RequeueExpired(ctx, 10)
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, a := range waiters {
-				if status, _ := activityStatus(t, b, a.ID); status != "pending" {
-					t.Fatalf("consumer status=%s", status)
-				}
-			}
-		})
-	}
-}
 
 func TestChildCompletionWakesOnlyItsActiveWaiters(t *testing.T) {
 	newChild := func(t *testing.T, b *PostgresBackend, parent storage.QueuedActivity, name string) storage.QueuedActivity {
@@ -246,41 +127,6 @@ func TestChildCompletionWakesOnlyItsActiveWaiters(t *testing.T) {
 	})
 }
 
-func TestParkPublicationRaceAndLostReply(t *testing.T) {
-	b := testBackend(t)
-	ctx := context.Background()
-	for i := range 12 {
-		producer := testActivity(3)
-		producer.ActivityType = fmt.Sprintf("producer%d", i)
-		claimTestActivity(t, b, producer, "p")
-		a := testActivity(3)
-		a.ActivityType = fmt.Sprintf("waiter%d", i)
-		claimTestActivity(t, b, a, "w")
-		// No prior dependency: race first registration+park against publication.
-		start := make(chan struct{})
-		errs := make(chan error, 2)
-		var wg sync.WaitGroup
-		wg.Go(func() {
-			<-start
-			errs <- b.YieldForResult(ctx, a.ID, producer.ID, &producer.ID, time.Now().Add(time.Hour), "w", "await", "child")
-		})
-		wg.Go(func() { <-start; errs <- b.AckSuccess(ctx, producer.ID, nil, "p") })
-		close(start)
-		wg.Wait()
-		for range 2 {
-			if err := <-errs; err != nil {
-				t.Fatal(err)
-			}
-		}
-		if status, _ := activityStatus(t, b, a.ID); status != "pending" {
-			t.Fatalf("lost wake: %s", status)
-		}
-		// Retry the committed park after its early wake: must not repark it.
-		if err := b.YieldForResult(ctx, a.ID, producer.ID, &producer.ID, time.Now().Add(time.Hour), "w", "await", "child"); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
 func TestRetentionPinsSharedProducerUntilConsumerTreeFinishes(t *testing.T) {
 	b := testBackend(t)
 	ctx := context.Background()
@@ -416,47 +262,6 @@ func TestRetentionSkipsReferenceRegistrationLock(t *testing.T) {
 		t.Fatalf("cleanup crossed committed reference: n=%d err=%v", n, err)
 	}
 	assertTreePresent(t, b, producer, "producer pinned by concurrent registration")
-}
-
-func TestAttemptBudgetBoundariesMatchFailureAndReaper(t *testing.T) {
-	for _, reap := range []bool{false, true} {
-		for _, max := range []uint32{0, 1, 3} {
-			t.Run(fmt.Sprintf("reaper=%v/max=%d", reap, max), func(t *testing.T) {
-				b := testBackend(t)
-				ctx := context.Background()
-				a := testActivity(max)
-				if err := b.Enqueue(ctx, a); err != nil {
-					t.Fatal(err)
-				}
-				attempts := 3
-				if max == 1 {
-					attempts = 1
-				}
-				for i := range attempts {
-					worker := fmt.Sprintf("attempt-%d", i)
-					claimed, err := b.Dequeue(ctx, worker, 0, nil)
-					if err != nil || claimed == nil {
-						t.Fatalf("claim %d: %v %v", i, claimed, err)
-					}
-					if reap {
-						expireLease(t, b, a.ID)
-						if n, err := b.RequeueExpired(ctx, 10); err != nil || n != 1 {
-							t.Fatalf("reap %d %v", n, err)
-						}
-					} else {
-						if _, err := b.AckFailure(ctx, a.ID, storage.NewRetryableFailure("failure"), worker); err != nil {
-							t.Fatal(err)
-						}
-					}
-					status, _ := activityStatus(t, b, a.ID)
-					dead := max > 0 && i+1 >= int(max)
-					if (status == "dead_letter") != dead {
-						t.Fatalf("max=%d attempt=%d status=%s", max, i+1, status)
-					}
-				}
-			})
-		}
-	}
 }
 
 // pinnedTx opens a transaction the test drives by hand to stand in for one
@@ -766,62 +571,4 @@ func TestCleanupAndKeyReuseOrderOnIdempotencyRow(t *testing.T) {
 			t.Fatal("fresh activity was not enqueued")
 		}
 	})
-}
-
-// A spawn issued by an execution that has since lost its claim must not add a
-// child: the replacement execution issues the same spawns.
-func TestHandlerSpawnsAreFencedAfterReclaim(t *testing.T) {
-	b := testBackend(t)
-	ctx := context.Background()
-	parent := testActivity(3)
-	claimTestActivity(t, b, parent, "old")
-	child := func(key string) storage.QueuedActivity {
-		c := testActivity(3)
-		c.ParentActivityID, c.RootActivityID, c.Depth = &parent.ID, parent.ID, 1
-		if key != "" {
-			c.IdempotencyKey = &storage.IdempotencyKeyConfig{Key: key, Behavior: storage.BehaviorReturnExisting}
-		}
-		return c
-	}
-	live, keyed := child(""), child("rq:step:fence:"+parent.ID.String())
-	if err := b.EnqueueForWorker(ctx, live, parent.ID, "old"); err != nil {
-		t.Fatalf("owned spawn: %v", err)
-	}
-	if existing, err := b.EnqueueIdempotentForWorker(ctx, &keyed, parent.ID, "old"); err != nil || existing != nil {
-		t.Fatalf("owned keyed spawn: %v %v", existing, err)
-	}
-	expireLease(t, b, parent.ID)
-	if n, err := b.RequeueExpired(ctx, 10); err != nil || n != 1 {
-		t.Fatalf("reaper %d %v", n, err)
-	}
-	if got, err := b.Dequeue(ctx, "new", 0, nil); err != nil || got == nil || got.ID != parent.ID {
-		t.Fatalf("reclaim: %v %v", got, err)
-	}
-	stale, staleKeyed, staleReuse := child(""), child("rq:step:fence:late:"+parent.ID.String()), child(keyed.IdempotencyKey.Key)
-	lost := func(err error) bool {
-		se, ok := storage.IsStorageError(err)
-		return ok && se.Kind == storage.ErrClaimLost
-	}
-	if err := b.EnqueueForWorker(ctx, stale, parent.ID, "old"); !lost(err) {
-		t.Fatalf("stale spawn: %v", err)
-	}
-	if _, err := b.EnqueueIdempotentForWorker(ctx, &staleKeyed, parent.ID, "old"); !lost(err) {
-		t.Fatalf("stale keyed spawn: %v", err)
-	}
-	if _, err := b.EnqueueIdempotentForWorker(ctx, &staleReuse, parent.ID, "old"); !lost(err) {
-		t.Fatalf("stale reattach: %v", err)
-	}
-	if existing, err := b.EnqueueIdempotentForWorker(ctx, &staleReuse, parent.ID, "new"); err != nil || existing == nil || existing.ExistingID != keyed.ID {
-		t.Fatalf("replacement reattach: %v %v", existing, err)
-	}
-	var children, keys int
-	if err := b.pool.QueryRow(ctx, `SELECT count(*) FROM runnerq_activities WHERE parent_activity_id=$1`, parent.ID).Scan(&children); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.pool.QueryRow(ctx, `SELECT count(*) FROM runnerq_idempotency WHERE queue_name=$1 AND idempotency_key=$2`, b.queueName, staleKeyed.IdempotencyKey.Key).Scan(&keys); err != nil {
-		t.Fatal(err)
-	}
-	if children != 2 || keys != 0 {
-		t.Fatalf("children=%d stale keys=%d", children, keys)
-	}
 }
