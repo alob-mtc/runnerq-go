@@ -357,9 +357,11 @@ func TestExecutorDescribeAndReports(t *testing.T) {
 	if err := json.Unmarshal(evt.Data, &report); err != nil || string(report["id"]) != `"`+e.InstanceID()+`"` {
 		t.Fatalf("report %s: %v", evt.Data, err)
 	}
+	if string(report["claim_lag_ms"]) != "0" || string(report["heartbeat_failures"]) != "0" {
+		t.Fatalf("report %s", evt.Data)
+	}
 	var counters map[string]any
-	if err := json.Unmarshal(report["counters"], &counters); err != nil || counters["claimed"] != 0.0 || counters["claim_lag_ms"] != 0.0 ||
-		counters["dead_lettered"] != 0.0 || counters["heartbeat_failures"] != 0.0 {
+	if err := json.Unmarshal(report["counters"], &counters); err != nil || counters["claimed"] != 0.0 || counters["dead_lettered"] != 0.0 {
 		t.Fatalf("report counters %s: %v", report["counters"], err)
 	}
 }

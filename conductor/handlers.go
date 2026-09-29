@@ -539,15 +539,16 @@ func stateOf(snap executor.Snapshot, started time.Time, withRunning bool) execut
 	}
 	c := snap.Counters
 	st := executorState{
-		ID:             snap.Info.ID,
-		UptimeMS:       snap.At.Sub(started).Milliseconds(),
-		MaxConcurrency: snap.Info.MaxConcurrency,
-		InFlight:       len(snap.State.Running),
-		Draining:       snap.State.Draining,
+		ID:                snap.Info.ID,
+		UptimeMS:          snap.At.Sub(started).Milliseconds(),
+		MaxConcurrency:    snap.Info.MaxConcurrency,
+		InFlight:          len(snap.State.Running),
+		Draining:          snap.State.Draining,
+		ClaimLagMS:        c.LastClaimLag.Milliseconds(),
+		HeartbeatFailures: c.HeartbeatFailures,
 		Counters: &executorCounters{
 			Claimed: c.Claimed, Succeeded: c.Succeeded, Retried: c.Retried, Failed: c.Failed,
 			TimedOut: c.TimedOut, DeadLettered: c.DeadLettered, ClaimsLost: c.ClaimsLost,
-			HeartbeatFailures: c.HeartbeatFailures, ClaimLagMS: c.LastClaimLag.Milliseconds(),
 		},
 	}
 	if withRunning {
