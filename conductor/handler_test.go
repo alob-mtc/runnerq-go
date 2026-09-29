@@ -4,13 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+
+	"github.com/alob-mtc/runnerq-go/storage"
 )
 
 func TestHandlerServesStorage(t *testing.T) {
 	_, b, queue := pgEngine(t)
 	id := enqueue(t, b, `{"n":1}`)
 	ctx := context.Background()
-	h := NewHandler(b, HandlerConfig{Queue: queue, AllowControl: true})
+	h := NewHandler(b, HandlerConfig{AllowControl: true})
 
 	var caps map[string]json.RawMessage
 	if err := json.Unmarshal(h.Capabilities(), &caps); err != nil {
@@ -67,9 +69,38 @@ func TestHandlerServesStorage(t *testing.T) {
 		t.Fatal("bad id accepted")
 	}
 
-	readOnly := NewHandler(b, HandlerConfig{Queue: queue})
+	readOnly := NewHandler(b, HandlerConfig{})
 	if _, err := readOnly.Serve(ctx, typeActivitiesCancel, mustJSON(t, cancel)); err == nil || err.Code != string(codeUnsupported) {
 		t.Fatalf("command without AllowControl: %v", err)
+	}
+
+	// Commands act on the queue the backend reports: one that can't say
+	// which queue it acts on gets none, and still serves reads.
+	anonymous := NewHandler(unnamed{b, b, b}, HandlerConfig{AllowControl: true})
+	if _, err := anonymous.Serve(ctx, typeActivitiesCancel, mustJSON(t, cancel)); err == nil || err.Code != string(codeUnsupported) {
+		t.Fatalf("command on a backend with no queue: %v", err)
+	}
+	var anonCaps map[string]json.RawMessage
+	if json.Unmarshal(anonymous.Capabilities(), &anonCaps); anonCaps[typeActivitiesCancel] != nil || anonCaps[typeActivitiesList] == nil {
+		t.Fatalf("capabilities of a backend with no queue: %v", anonCaps)
+	}
+	if _, err := anonymous.Serve(ctx, typeActivitiesList, mustJSON(t, map[string]any{"filter": inQueue(queue)})); err != nil {
+		t.Fatalf("read on a backend with no queue: %v", err)
+	}
+}
+
+// unnamed is a backend that doesn't report its queue.
+type unnamed struct {
+	storage.Storage
+	storage.QueryStorage
+	storage.CommandStorage
+}
+
+func TestHandlerRecoversPanics(t *testing.T) {
+	h := NewHandler(unnamed{}, HandlerConfig{})
+	h.table["boom"] = func(context.Context, json.RawMessage) (any, error) { panic("boom") }
+	if _, err := h.Serve(context.Background(), "boom", nil); err == nil || err.Code != string(codeInternal) {
+		t.Fatalf("panic: %v", err)
 	}
 }
 
