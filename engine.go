@@ -1114,7 +1114,6 @@ func (b *WorkerEngineBuilder) Build() (*WorkerEngine, error) {
 		queueName = *b.queueName
 	}
 
-	leaseMS := uint64(60_000)
 	reaperInterval := uint64(5)
 	reaperBatch := 100
 
@@ -1122,7 +1121,6 @@ func (b *WorkerEngineBuilder) Build() (*WorkerEngine, error) {
 		QueueName:                   queueName,
 		MaxConcurrentActivities:     maxConcurrent,
 		SchedulePollIntervalSeconds: &pollIntervalSec,
-		LeaseMS:                     &leaseMS,
 		ReaperIntervalSeconds:       &reaperInterval,
 		ReaperBatchSize:             &reaperBatch,
 		ActivityTypes:               b.activityTypes,

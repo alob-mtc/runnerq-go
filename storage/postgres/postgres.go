@@ -33,12 +33,12 @@ type PostgresBackend struct {
 	watch     *watcher
 }
 
-// New creates a new PostgresBackend with default pool size 25 and lease 30s.
+// New creates a new PostgresBackend with default pool size 25 and lease 60s.
 // In multi-process deployments the operator should still pick a size that
 // matches the worker count via WithConfig (rule of thumb: maxWorkers + ~5
 // for reaper and scheduled-processor headroom).
 func New(ctx context.Context, databaseURL, queueName string) (*PostgresBackend, error) {
-	return WithConfig(ctx, databaseURL, queueName, 30_000, 25)
+	return WithConfig(ctx, databaseURL, queueName, 60_000, 25)
 }
 
 // WithConfig creates a new PostgresBackend with custom configuration.
