@@ -617,6 +617,10 @@ func TestEncodedStorageRoundTrips(t *testing.T) {
 	if claims, err := b.DequeueBatch(ctx, "go", 10, 0, nil); err != nil || len(claims) != 0 {
 		t.Fatalf("plain claim took %d, %v", len(claims), err)
 	}
+	// No encodings claim nothing, even with an activity waiting.
+	if none, err := b.DequeueBatchEncoded(ctx, "ts", 10, 0, nil, nil); err != nil || len(none) != 0 {
+		t.Fatalf("no encodings claimed %d, %v", len(none), err)
+	}
 	claims, err := b.DequeueBatchEncoded(ctx, "ts", 10, 0, nil, []string{"json-v1", "superjson-v1"})
 	if err != nil || len(claims) != 1 {
 		t.Fatalf("encoded claim: %d, %v", len(claims), err)
@@ -624,11 +628,6 @@ func TestEncodedStorageRoundTrips(t *testing.T) {
 	c := claims[0]
 	if c.Activity.ID != native.ID || c.Activity.Serialization != "superjson-v1" {
 		t.Fatalf("claimed %+v", c.Activity)
-	}
-	// Only the encodings asked for: none claims nothing, and plain JSON isn't
-	// implied.
-	if none, err := b.DequeueBatchEncoded(ctx, "ts", 10, 0, nil, nil); err != nil || len(none) != 0 {
-		t.Fatalf("no encodings claimed %d, %v", len(none), err)
 	}
 
 	checkpoint := uuid.New()
