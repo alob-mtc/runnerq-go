@@ -5,7 +5,6 @@ import (
 	"fmt"
 )
 
-// StorageErrorKind classifies storage errors.
 type StorageErrorKind int
 
 const (
@@ -18,18 +17,18 @@ const (
 	ErrTimeout
 	ErrDuplicateActivity
 	ErrIdempotencyConflict
-	// ErrClaimLost means the execution no longer owns the activity.
+	// ErrClaimLost: the execution no longer owns the activity.
 	ErrClaimLost
-	// ErrCheckpointConflict means an immutable checkpoint has a different outcome.
+	// ErrCheckpointConflict: an immutable checkpoint has a different outcome.
 	ErrCheckpointConflict
-	// ErrInvalidArgument means malformed or out-of-range input; Field names it.
+	// ErrInvalidArgument: malformed or out-of-range input named by Field.
 	ErrInvalidArgument
-	// ErrUnsupported means the backend cannot evaluate the request (a query
-	// field, operator, sort or aggregate it does not support); Field names it.
+	// ErrUnsupported: a query feature the backend cannot evaluate, named by
+	// Field.
 	ErrUnsupported
 )
 
-// StorageError represents a backend-agnostic error from storage operations.
+// StorageError is a backend-agnostic storage error.
 type StorageError struct {
 	Kind    StorageErrorKind
 	Message string
@@ -75,7 +74,7 @@ func (e *StorageError) Unwrap() error {
 	return e.Cause
 }
 
-// IsRetryable returns true if this error is potentially recoverable with a retry.
+// IsRetryable reports whether a retry may succeed.
 func (e *StorageError) IsRetryable() bool {
 	switch e.Kind {
 	case ErrUnavailable, ErrTimeout, ErrConflict:
@@ -84,8 +83,6 @@ func (e *StorageError) IsRetryable() bool {
 		return false
 	}
 }
-
-// Constructors for each error kind.
 
 func NewUnavailableError(msg string) *StorageError {
 	return &StorageError{Kind: ErrUnavailable, Message: msg}
@@ -123,7 +120,7 @@ func NewIdempotencyConflictError(msg string) *StorageError {
 	return &StorageError{Kind: ErrIdempotencyConflict, Message: msg}
 }
 
-// IsStorageError extracts a *StorageError from err (if any).
+// IsStorageError extracts a *StorageError from err's chain.
 func IsStorageError(err error) (*StorageError, bool) {
 	var se *StorageError
 	if errors.As(err, &se) {

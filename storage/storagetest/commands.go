@@ -11,11 +11,10 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// Commands: the storage.CommandStorage surface RunnerQ Cloud steers work
-// through — cancel (fencing a running claim, cascading to children, waking
-// awaiting parents), retry and redrive, run now, reschedule, set priority,
-// whole-tree delete, signals, filter targets, dry runs and the idempotency
-// ledger. Optional: skipped for backends without CommandStorage.
+// Commands (storage.CommandStorage, skipped when absent): cancel (fencing a
+// running claim, cascading to children, waking awaiting parents), retry and
+// redrive, run now, reschedule, set priority, whole-tree delete, signals,
+// filter targets, dry runs and the idempotency ledger.
 var commandTests = []conformanceTest{
 	{"CancelFinishesNonTerminalWork", testCancel},
 	{"CancelFencesTheRunningClaim", testCancelFencesClaim},

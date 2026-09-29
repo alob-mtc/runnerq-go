@@ -34,11 +34,9 @@ func (b *PostgresBackend) StoreCheckpoint(ctx context.Context, id, owner uuid.UU
 		return databaseError(err, "failed to begin checkpoint transaction")
 	}
 	defer tx.Rollback(ctx)
-	// Serialize with the reaper and acknowledgements. A stale execution cannot
-	// publish checkpoints even though its user function may still be running.
-	// This FOR UPDATE on the owner is also what orders the checkpoint against
-	// a consumer parking on it (see dependencies.go), so it must stay ahead of
-	// the insert and the wake below.
+	// Serializes with the reaper and acks so a stale execution cannot publish,
+	// and orders the checkpoint against a consumer parking on it (see
+	// dependencies.go): must stay ahead of the insert and the wake.
 	var claimed int
 	err = tx.QueryRow(ctx, `SELECT 1 FROM runnerq_activities
 		WHERE id = $1 AND queue_name = $2 AND status = 'processing' AND current_worker_id = $3
@@ -75,10 +73,9 @@ func (b *PostgresBackend) StoreCheckpoint(ctx context.Context, id, owner uuid.UU
 		}
 		return nil
 	}
-	if err := b.recordEvent(ctx, tx, id, storage.EventResultStored, &workerID, toDetail(map[string]any{"result_stored": true, "state": state})); err != nil {
-		return err
-	}
-	if err := b.wakeResultWaitersTx(ctx, tx, id); err != nil {
+	if err := execAll(ctx, tx,
+		b.eventStmt(id, storage.EventResultStored, &workerID, toDetail(map[string]any{"result_stored": true, "state": state})),
+		b.wakeStmt(id)); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -89,16 +86,14 @@ func (b *PostgresBackend) StoreCheckpoint(ctx context.Context, id, owner uuid.UU
 	return nil
 }
 
-// spawnFence identifies the execution a handler-issued spawn must still own.
 type spawnFence struct {
 	owner  uuid.UUID
 	worker string
 }
 
-// verifySpawnFenceTx holds the spawner's row FOR UPDATE for the rest of the
-// transaction, so the reaper cannot hand the activity to another execution
-// between the claim check and the child's insert. A nil fence is an unfenced
-// spawn from outside a handler.
+// verifySpawnFenceTx holds the spawner's row FOR UPDATE until commit so the
+// reaper cannot reassign it between the claim check and the child's insert.
+// A nil fence is an unfenced spawn from outside a handler.
 func (b *PostgresBackend) verifySpawnFenceTx(ctx context.Context, tx pgx.Tx, fence *spawnFence) error {
 	if fence == nil {
 		return nil

@@ -9,16 +9,14 @@ import (
 )
 
 // QueryStorage is the read surface RunnerQ Cloud queries through (see the
-// conductor package). It is a general query layer over activities, their
-// events and steps: filter, sort, project, paginate and aggregate, using the
-// Cloud's canonical, backend-neutral model.
+// conductor package): filter, sort, project, paginate and aggregate
+// activities, events and steps in the canonical backend-neutral model.
 //
-// Scope: queries span every queue in the backend's database; filter on
-// "queue" to narrow. Every executor of an app therefore answers the same way.
+// Queries span every queue in the database (filter on "queue" to narrow), so
+// every executor of an app answers the same way.
 //
-// Backends advertise what they can evaluate efficiently through
-// QueryCapabilities and must reject anything else with ErrUnsupported (never
-// silently ignore a filter, which would return wrong data).
+// Backends advertise what they evaluate in QueryCapabilities and must reject
+// anything else with ErrUnsupported, never silently ignore a filter.
 type QueryStorage interface {
 	QueryCapabilities() QueryCapabilities
 	QueryActivities(ctx context.Context, q ActivityQuery) (*ActivityRecordPage, error)
@@ -46,8 +44,8 @@ const (
 	RecordStatusCancelled  = "cancelled"
 )
 
-// Canonical event types. Backends map their internal event names onto these;
-// events with no canonical equivalent keep a namespaced name of their own.
+// Canonical event types. Backend events with no equivalent keep a namespaced
+// name of their own.
 const (
 	RecordEventCreated         = "activity.created"
 	RecordEventScheduled       = "activity.scheduled"
@@ -70,7 +68,6 @@ const (
 	RecordEventPriorityChanged = "activity.priority_changed"
 )
 
-// Filter operators.
 const (
 	OpEq       = "eq"
 	OpNe       = "ne"
@@ -215,12 +212,10 @@ type AggregateRows struct {
 	Truncated bool
 }
 
-// EventQuery lists lifecycle events in log order. Filterable fields are
-// advertised in QueryCapabilities.EventFilters; "seq" is the event's position
-// in the log (EventRecord.ID), increasing in insertion order, so
-// seq > cursor tails it. A transaction that commits late can surface an
-// event below an already-seen seq; tailers rescan a window below their
-// cursor to catch those.
+// EventQuery lists lifecycle events in log order. "seq" (EventRecord.ID)
+// increases in insertion order, so seq > cursor tails the log; a late commit
+// can surface below an already-seen seq, so tailers rescan a window below
+// their cursor.
 type EventQuery struct {
 	Filter        *QueryFilter
 	Desc          bool // newest first

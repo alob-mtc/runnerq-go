@@ -8,8 +8,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// ActivityPriority determines the order of execution.
-// Higher priority activities are processed first.
+// ActivityPriority orders execution: higher priorities are claimed first.
 type ActivityPriority int
 
 const (
@@ -63,21 +62,21 @@ func (p *ActivityPriority) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// OnDuplicate defines behavior when an activity with the same idempotency key exists.
+// OnDuplicate is what an enqueue does when its idempotency key is taken.
 type OnDuplicate int
 
 const (
-	// AllowReuse always creates a new activity, updating the idempotency record.
+	// AllowReuse always creates a new activity and repoints the key at it.
 	AllowReuse OnDuplicate = iota
-	// ReturnExisting returns the existing ActivityFuture if key exists.
+	// ReturnExisting returns the existing activity's future.
 	ReturnExisting
-	// AllowReuseOnFailure allows reuse only if the previous activity failed.
+	// AllowReuseOnFailure creates a new activity only if the existing one
+	// failed, dead-lettered or was cancelled.
 	AllowReuseOnFailure
-	// NoReuse returns an error if the key exists.
+	// NoReuse fails the enqueue.
 	NoReuse
 )
 
-// ActivityStatus tracks the activity lifecycle.
 type ActivityStatus string
 
 const (
@@ -89,7 +88,6 @@ const (
 	StatusDeadLetter ActivityStatus = "DeadLetter"
 )
 
-// ActivityOption configures an activity's execution parameters.
 type ActivityOption struct {
 	Priority             *ActivityPriority
 	MaxRetries           uint32
@@ -100,13 +98,11 @@ type ActivityOption struct {
 	Metadata             map[string]string
 }
 
-// IdempotencyConfig holds idempotency key and its behavior.
 type IdempotencyConfig struct {
 	Key      string
 	Behavior OnDuplicate
 }
 
-// activity is an internal representation of an activity to be processed.
 type activity struct {
 	ID                   uuid.UUID          `json:"id"`
 	ActivityType         string             `json:"activity_type"`
@@ -165,7 +161,6 @@ func newActivity(activityType string, payload json.RawMessage, option *ActivityO
 		Status:               StatusPending,
 		CreatedAt:            time.Now().UTC(),
 		ScheduledAt:          scheduledAt,
-		RetryCount:           0,
 		MaxRetries:           maxRetries,
 		TimeoutSeconds:       timeoutSeconds,
 		RetryDelaySeconds:    1,
@@ -173,6 +168,5 @@ func newActivity(activityType string, payload json.RawMessage, option *ActivityO
 		Metadata:             metadata,
 		IdempotencyKey:       idempotencyKey,
 		RootActivityID:       id,
-		Depth:                0,
 	}
 }

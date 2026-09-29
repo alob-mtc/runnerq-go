@@ -5,9 +5,8 @@ import (
 	"fmt"
 )
 
-// Wire types for the RunnerQ Conductor protocol v1. The protocol spec lives
-// in the runnerq-cloud repository (docs/protocol.md) and is the contract;
-// these types encode it.
+// Wire types for Conductor protocol v1. The contract is the spec in
+// runnerq-cloud's docs/protocol.md.
 
 // protocolVersion is the highest Conductor protocol version this agent speaks.
 const protocolVersion = 1
@@ -48,8 +47,6 @@ const (
 	codeInternal           errorCode = "internal"
 )
 
-// wireError is a failed response. Handlers return it to choose the code; any
-// other error is mapped by toWireError.
 type wireError struct {
 	Code    errorCode      `json:"code"`
 	Message string         `json:"message"`
@@ -62,14 +59,12 @@ func errorf(code errorCode, format string, args ...any) *wireError {
 	return &wireError{Code: code, Message: fmt.Sprintf(format, args...)}
 }
 
-// fieldError is an error about one request field.
 func fieldError(code errorCode, field, format string, args ...any) *wireError {
 	e := errorf(code, format, args...)
 	e.Details = map[string]any{"field": field}
 	return e
 }
 
-// Message types.
 const (
 	typeHello   = "hello"
 	typeGoodbye = "goodbye"
@@ -356,7 +351,6 @@ type executorState struct {
 	Counters          *executorCounters `json:"counters,omitempty"`
 }
 
-// executorCounters counts activity outcomes since the executor started.
 type executorCounters struct {
 	Claimed      uint64 `json:"claimed"`
 	Succeeded    uint64 `json:"succeeded"`

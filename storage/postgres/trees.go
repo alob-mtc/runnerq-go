@@ -7,20 +7,16 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Whole-tree deletion, shared by the retention sweeper and the delete
-// command. The caller holds the root's row lock (FOR UPDATE).
-
-// lockTreeForDeleteTx locks the tree's idempotency keys and reports whether
-// a live workflow in another tree still depends on a result this tree
-// produced (the tree must then be kept).
+// lockTreeForDeleteTx locks the tree's idempotency keys and reports whether a
+// live workflow in another tree depends on a result this tree produced (the
+// tree must then be kept). Callers (retention, delete) hold the root FOR UPDATE.
 //
-// Key reuse (BehaviorReturnExisting) registers a dependency on an existing
-// child while holding that child's idempotency row FOR UPDATE, and never
-// takes the root. The key rows a delete removes are therefore the ordering
-// point with it: take them before the dependency check so a reuse in flight
-// either commits first, and its dependency pins the tree below, or waits
-// until the delete commits and then finds the key gone and claims it fresh.
-// Ordering is root → keys here and key only there, so no cycle is possible.
+// Key reuse (BehaviorReturnExisting) registers a dependency while holding the
+// child's idempotency row FOR UPDATE and never takes the root, so the key rows
+// are the ordering point: locking them before the dependency check means a
+// reuse in flight either commits first (its dependency pins the tree) or waits,
+// then finds the key gone and claims it fresh. Order is root → keys here and
+// key only there, so no cycle.
 func (b *PostgresBackend) lockTreeForDeleteTx(ctx context.Context, tx pgx.Tx, root uuid.UUID) (pinned bool, err error) {
 	if _, err := tx.Exec(ctx, `
 		SELECT 1 FROM runnerq_idempotency
@@ -51,9 +47,6 @@ func (b *PostgresBackend) lockTreeForDeleteTx(ctx context.Context, tx pgx.Tx, ro
 	return pinned, nil
 }
 
-// deleteTreeTx deletes the tree rooted at root with its inputs, dependencies,
-// results (by activity and by owner), events and idempotency keys, and
-// returns the number of activities deleted.
 func (b *PostgresBackend) deleteTreeTx(ctx context.Context, tx pgx.Tx, root uuid.UUID) (int64, error) {
 	var deleted int64
 	err := tx.QueryRow(ctx, `

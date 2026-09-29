@@ -8,15 +8,13 @@ import (
 )
 
 // Handler serves the Cloud protocol's queries and commands from a storage
-// backend, as an agent does, but without a worker engine or a connection:
-// a service that holds a backend (such as RunnerQ Cloud's data plane)
-// answers requests with it.
+// backend, as an agent does, but without a worker engine or a connection.
 //
-// Reads cover whatever the backend's queries cover (for the Postgres
-// backend, every queue in its schema), and commands act on the backend's
-// own queue. The Handler checks no caller identity: the service using it
-// decides who may send what, and gives it a backend scoped to what they may
-// see. It also sets each request's deadline and bounds its answer size.
+// Reads cover whatever the backend's queries cover (for Postgres, every
+// queue in its schema); commands act on the backend's own queue. Handler
+// checks no caller identity and applies no deadline or size limit: the
+// caller authorizes requests, scopes the backend to what they may see, and
+// sets deadlines and bounds answer sizes.
 type Handler struct {
 	h     *handlers
 	table map[string]handlerFunc
@@ -24,17 +22,15 @@ type Handler struct {
 
 // HandlerConfig configures a Handler.
 type HandlerConfig struct {
-	// AllowControl serves commands (cancel, retry, run now, reschedule,
-	// set priority, delete, signal) when the backend supports them and
-	// reports its queue (QueueName() string); a command whose target names
-	// another queue fails.
+	// AllowControl serves commands (cancel, retry, run now, reschedule, set
+	// priority, delete, signal) when the backend supports them and has a
+	// QueueName() string method; targets naming another queue fail.
 	AllowControl bool
 }
 
-// queueNamer is a backend that knows its own queue.
 type queueNamer interface{ QueueName() string }
 
-// Error is a failed request, as it goes on the wire.
+// Error is a failed request as sent on the wire.
 type Error struct {
 	Code    string         `json:"code"`
 	Message string         `json:"message"`
@@ -43,14 +39,14 @@ type Error struct {
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }
 
-// NewHandler returns a Handler for backend. It serves the query types when
-// the backend implements storage.QueryStorage, and commands when it
-// implements storage.CommandStorage, reports its queue and cfg allows them.
+// NewHandler returns a Handler for backend. It serves queries when backend
+// implements storage.QueryStorage, and commands when it implements
+// storage.CommandStorage, reports its queue and cfg allows them.
 func NewHandler(backend storage.Storage, cfg HandlerConfig) *Handler {
 	qs, _ := backend.(storage.QueryStorage)
 	cs, _ := backend.(storage.CommandStorage)
-	// Commands are checked against the queue the backend acts on, never a
-	// name from elsewhere: without one, there are none.
+	// Commands are checked against the backend's own queue, never a name
+	// from elsewhere: without one, there are no commands.
 	named, ok := backend.(queueNamer)
 	if !ok {
 		cs = nil
@@ -60,12 +56,12 @@ func NewHandler(backend storage.Storage, cfg HandlerConfig) *Handler {
 		h.queue = named.QueueName()
 	}
 	t := h.table()
-	delete(t, typeExecutorDescribe) // there's no executor
+	delete(t, typeExecutorDescribe)
 	return &Handler{h: h, table: t}
 }
 
-// Serve answers one request: msgType with its data, as in the request
-// envelope. It returns the response data, or the error to send instead.
+// Serve answers one request (msgType and data from its envelope) with the
+// response data or the error to send instead. Handler panics become errors.
 func (h *Handler) Serve(ctx context.Context, msgType string, data json.RawMessage) (res json.RawMessage, werr *Error) {
 	defer func() {
 		if p := recover(); p != nil {
@@ -87,13 +83,12 @@ func (h *Handler) Serve(ctx context.Context, msgType string, data json.RawMessag
 	return encoded, nil
 }
 
-// Capabilities describes what the handler serves, as an agent's hello
-// does: a JSON object keyed by message type.
+// Capabilities describes what the handler serves as a JSON object keyed by
+// message type, as in an agent's hello.
 func (h *Handler) Capabilities() json.RawMessage {
 	caps := h.h.capabilities()
 	delete(caps, typeExecutorDescribe)
-	// Live events need a subscription on a connection, which a Handler
-	// doesn't have.
+	// Live events need a connection, which a Handler doesn't have.
 	delete(caps, typeEventsSubscribe)
 	delete(caps, typeEventsUnsubscribe)
 	b, _ := json.Marshal(caps)

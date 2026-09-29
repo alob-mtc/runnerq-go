@@ -12,9 +12,9 @@ import (
 
 const storageAttemptTimeout = 5 * time.Second
 
-// retryStorage retains the caller's operation inputs until persistence succeeds
-// or cancellation/ownership/permanent failure ends recovery. Each attempt gets a
-// fresh deadline; a timeout of one database attempt does not cancel the retry loop.
+// retryStorage retries fn with backoff until it succeeds or cancellation,
+// claim loss or a permanent error ends it. Each attempt gets its own deadline,
+// so one timed-out attempt does not end the loop.
 func retryStorage(ctx context.Context, operation string, metrics MetricsSink, renew func(context.Context) error, fn func(context.Context) error) error {
 	if metrics == nil {
 		metrics = NoopMetrics{}
@@ -44,9 +44,9 @@ func retryStorage(ctx context.Context, operation string, metrics MetricsSink, re
 			rerr := renew(rctx)
 			rcancel()
 			if rerr != nil {
-				// A committed completion clears ownership before its reply may
-				// be lost. Only the write's next reconciliation can distinguish
-				// that success from a competing claim; renewal cannot decide it.
+				// A committed write whose reply was lost has already released
+				// the claim, so a failed renewal proves nothing; the write's
+				// own reconciliation on retry decides.
 				slog.Warn("Could not renew claim during storage recovery", "operation", operation, "error", rerr)
 			}
 		}

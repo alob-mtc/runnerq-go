@@ -1,8 +1,7 @@
 // Package executor describes a running engine (an executor): who it is,
-// what it is doing, and what it has done. The engine is the one producer
-// of these snapshots; the RunnerQ Cloud agent, the cloud storage adapter
-// and metrics exporters all read them, each on its own schedule and over
-// its own transport.
+// what it is doing and what it has done. The engine produces these
+// snapshots; the Cloud agent, the cloud storage adapter and metrics
+// exporters read them on their own schedules.
 package executor
 
 import (
@@ -13,10 +12,9 @@ import (
 	"github.com/google/uuid"
 )
 
-// Info is who an executor is: fixed for its run.
+// Info identifies an executor; it is fixed for the run.
 type Info struct {
-	// ID is the engine's instance id, unique per run: its executor id in
-	// RunnerQ Cloud.
+	// ID is unique per run and is the executor id in RunnerQ Cloud.
 	ID             string
 	Queue          string
 	ActivityTypes  []string
@@ -24,8 +22,7 @@ type Info struct {
 	StartedAt      time.Time
 	Hostname       string
 	SDK            SDK
-	// Labels are free-form tags (region, deploy version) from the engine's
-	// configuration.
+	// Labels are tags (region, deploy version) from WorkerConfig.Labels.
 	Labels map[string]string
 }
 
@@ -36,9 +33,8 @@ type SDK struct {
 
 // State is what an executor is doing now.
 type State struct {
-	// Running are the activities it is executing, oldest first.
-	Running []Running
-	// Draining: a shutdown has begun; intake has stopped and in-flight
+	Running []Running // oldest first
+	// Draining means a shutdown has begun: intake has stopped and in-flight
 	// activities are finishing.
 	Draining bool
 }
@@ -53,18 +49,18 @@ type Running struct {
 
 // Counters are what an executor has done since it started.
 type Counters struct {
-	// Claimed activities started executing here.
+	// Claimed counts activities that started executing here.
 	Claimed uint64
 	// Succeeded completed; Retried asked for another attempt; Failed failed
 	// for good; TimedOut ran past their timeout; DeadLettered ran out of
 	// attempts.
 	Succeeded, Retried, Failed, TimedOut, DeadLettered uint64
-	// ClaimsLost: another worker took over an activity running here.
+	// ClaimsLost counts activities another worker took over from here.
 	ClaimsLost uint64
-	// HeartbeatFailures: claim renewals that failed.
+	// HeartbeatFailures counts failed claim renewals.
 	HeartbeatFailures uint64
-	// LastClaimLag is how long the last claimed activity waited to be
-	// claimed after it was due.
+	// LastClaimLag is how long the last claimed activity waited after it
+	// was due.
 	LastClaimLag time.Duration
 }
 
@@ -76,24 +72,22 @@ type Snapshot struct {
 	At       time.Time
 }
 
-// Source gives a running executor's snapshots.
+// Source provides a running executor's snapshots.
 type Source interface {
 	Snapshot() Snapshot
 }
 
-// Observer hears an executor start and stop, and reads its snapshots from
-// the Source on its own schedule. Both calls must return promptly.
-//
-// An engine calls every Observer registered with WorkerEngine.Observe, and
-// also its storage backend when the backend is an Observer (RunnerQ Cloud's
-// storage adapter reports hosted workers that way).
+// Observer hears an executor start and stop and reads the Source on its own
+// schedule. Both calls must return promptly. An engine notifies every
+// Observer registered with WorkerEngine.Observe, and its storage backend if
+// that is an Observer (how RunnerQ Cloud's adapter reports hosted workers).
 type Observer interface {
 	ExecutorStarted(src Source)
 	ExecutorStopped(id string)
 }
 
-// ThisSDK names the runnerq-go SDK compiled into this binary; its version
-// is "unknown" without build information.
+// ThisSDK names the runnerq-go SDK in this binary; Version is "unknown"
+// without build information.
 func ThisSDK() SDK {
 	const module = "github.com/alob-mtc/runnerq-go"
 	sdk := SDK{Name: "runnerq-go", Version: "unknown", Language: "go"}

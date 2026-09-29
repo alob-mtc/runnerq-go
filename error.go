@@ -7,12 +7,7 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// ---------------------------------------------------------------------------
-// ActivityError
-// ---------------------------------------------------------------------------
-
-// ActivityError represents an error from activity handler execution.
-// Retryable indicates whether the activity should be retried.
+// ActivityError is a handler error that says whether to retry.
 type ActivityError struct {
 	Retryable bool
 	Message   string
@@ -25,32 +20,26 @@ func (e *ActivityError) Error() string {
 	return fmt.Sprintf("Non-retryable error: %s", e.Message)
 }
 
-// NewRetryError creates an ActivityError that triggers a retry.
+// NewRetryError returns an error that retries the activity.
 func NewRetryError(msg string) *ActivityError {
 	return &ActivityError{Retryable: true, Message: msg}
 }
 
-// NewNonRetryError creates an ActivityError that should not be retried.
+// NewNonRetryError returns an error that fails the activity for good.
 func NewNonRetryError(msg string) *ActivityError {
 	return &ActivityError{Retryable: false, Message: msg}
 }
 
-// IsRetryable implements the RetryableError interface.
 func (e *ActivityError) IsRetryable() bool {
 	return e.Retryable
 }
 
-// RetryableError is an interface for errors that know if they are retryable.
-// Handlers can return any error implementing this interface to control retry behavior.
+// RetryableError is any error that decides whether its activity is retried;
+// a handler error without it is retried.
 type RetryableError interface {
 	IsRetryable() bool
 }
 
-// ---------------------------------------------------------------------------
-// WorkerError
-// ---------------------------------------------------------------------------
-
-// WorkerErrorKind classifies worker engine errors.
 type WorkerErrorKind int
 
 const (
@@ -70,20 +59,15 @@ const (
 	ErrIdempotencyConflictW
 	ErrDepthExceeded
 	ErrUnknown
-	// ErrSignalTimeoutW means WaitForSignal's timeout elapsed before the
-	// signal was delivered. Not retryable: retrying replays the persisted
-	// wait deadline and times out again immediately — the handler must
-	// decide what a missing signal means.
+	// ErrSignalTimeoutW: WaitForSignal timed out. Not retryable: a retry
+	// replays the stored deadline and times out again.
 	ErrSignalTimeoutW
-	// ErrActivityNotFoundW means a signal was addressed to an activity (by ID
-	// or by idempotency key) that does not exist in the queue — never
-	// enqueued, or already completed and retention-swept. Callers delivering
-	// an external event typically treat this as "already settled / nothing to
-	// wake" rather than a failure.
+	// ErrActivityNotFoundW: a signal's target doesn't exist (never enqueued,
+	// or swept by retention).
 	ErrActivityNotFoundW
 )
 
-// WorkerError represents an error from the worker engine.
+// WorkerError is an error from the engine.
 type WorkerError struct {
 	Kind    WorkerErrorKind
 	Message string
@@ -137,7 +121,7 @@ func (e *WorkerError) Unwrap() error {
 	return e.Cause
 }
 
-// IsRetryable returns true if this error may be resolved by retrying.
+// IsRetryable reports whether retrying may resolve the error.
 func (e *WorkerError) IsRetryable() bool {
 	switch e.Kind {
 	case ErrQueue, ErrBackend, ErrDatabase, ErrTimeoutW, ErrExecution, ErrScheduling:
@@ -147,7 +131,8 @@ func (e *WorkerError) IsRetryable() bool {
 	}
 }
 
-// WorkerErrorFromStorage converts a StorageError to a WorkerError.
+// WorkerErrorFromStorage maps a storage error onto a WorkerError kind; an
+// error that isn't a storage error becomes ErrUnknown.
 func WorkerErrorFromStorage(err error) *WorkerError {
 	se, ok := storage.IsStorageError(err)
 	if !ok {
@@ -156,13 +141,7 @@ func WorkerErrorFromStorage(err error) *WorkerError {
 	switch se.Kind {
 	case storage.ErrUnavailable:
 		return &WorkerError{Kind: ErrBackend, Message: se.Message, Cause: err}
-	case storage.ErrConflict:
-		return &WorkerError{Kind: ErrQueue, Message: se.Message, Cause: err}
-	case storage.ErrNotFound:
-		return &WorkerError{Kind: ErrQueue, Message: se.Message, Cause: err}
-	case storage.ErrInternal:
-		return &WorkerError{Kind: ErrQueue, Message: se.Message, Cause: err}
-	case storage.ErrSerialization:
+	case storage.ErrConflict, storage.ErrNotFound, storage.ErrInternal, storage.ErrSerialization:
 		return &WorkerError{Kind: ErrQueue, Message: se.Message, Cause: err}
 	case storage.ErrConfiguration:
 		return &WorkerError{Kind: ErrConfiguration, Message: se.Message, Cause: err}
@@ -183,16 +162,14 @@ func IsSignalTimeout(err error) bool {
 	return ok && we.Kind == ErrSignalTimeoutW
 }
 
-// IsActivityNotFound reports whether err is a signal-to-a-missing-activity
-// error (the target was never enqueued, or has completed and been swept).
-// External deliverers (webhooks, reconciliation) usually treat this as
-// "already settled" rather than a failure.
+// IsActivityNotFound reports whether err is a signal to an activity that
+// doesn't exist; deliverers usually treat it as already settled.
 func IsActivityNotFound(err error) bool {
 	we, ok := IsWorkerError(err)
 	return ok && we.Kind == ErrActivityNotFoundW
 }
 
-// IsWorkerError extracts a *WorkerError from err (if any).
+// IsWorkerError returns the *WorkerError in err's chain, if any.
 func IsWorkerError(err error) (*WorkerError, bool) {
 	var we *WorkerError
 	if errors.As(err, &we) {

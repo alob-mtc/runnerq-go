@@ -12,9 +12,9 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// Claiming: what Dequeue and DequeueBatch hand out, in what order, and the
-// one promise everything else rests on — no activity is claimed twice while
-// its claim is live.
+// Claiming: what Dequeue and DequeueBatch hand out and in what order, and the
+// promise everything rests on: no activity is claimed twice while its claim is
+// live.
 var claimTests = []conformanceTest{
 	{"ClaimRecordsOwnership", testClaimRecordsOwnership},
 	{"OrderIsPriorityThenRetriesThenAge", testClaimOrder},
@@ -54,7 +54,7 @@ func testClaimRecordsOwnership(t *testing.T, h Harness) {
 }
 
 // Higher priority first; within a priority a retried attempt before a fresh
-// one; then oldest first. This is the fairness the engine documents.
+// one; then oldest first.
 func testClaimOrder(t *testing.T, h Harness) {
 	s := newSuite(t, h)
 	base := time.Now().UTC().Add(-time.Minute)
@@ -76,7 +76,7 @@ func testClaimOrder(t *testing.T, h Harness) {
 	s.claimNothing()
 }
 
-// nil filter claims every type; one and many types claim only those.
+// A nil filter claims every type; one and many types claim only those.
 func testClaimTypeFilters(t *testing.T, h Harness) {
 	s := newSuite(t, h)
 	base := time.Now().UTC().Add(-time.Minute)

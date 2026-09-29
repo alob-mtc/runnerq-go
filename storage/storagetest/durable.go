@@ -188,9 +188,8 @@ func testYieldForResultReady(t *testing.T, h Harness) {
 	s.wantStatus(sig.ID, "pending")
 }
 
-// A park racing the publication of the result it waits for must end with
-// the waiter runnable, never parked forever; and a retried park after an
-// early wake must not re-park the row.
+// A park racing publication of its result ends with the waiter runnable,
+// never parked forever; a park retried after an early wake doesn't re-park.
 func testParkPublishRace(t *testing.T, h Harness) {
 	s := newSuite(t, h)
 	deps := need[storage.DependencyStorage](t, s.b)
