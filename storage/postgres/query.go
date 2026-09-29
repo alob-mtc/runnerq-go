@@ -571,13 +571,13 @@ func activitySelect(inc storage.RecordInclude) (cols, joins string) {
 			ORDER BY e.created_at DESC, e.id DESC LIMIT 1
 		) y ON a.status = 'waiting'`
 	if inc.Payload {
-		cols += ", (SELECT i.payload FROM runnerq_inputs i WHERE i.activity_id = a.id)"
+		cols += ", (SELECT " + plainData("i.payload", "i.serialization") + " FROM runnerq_inputs i WHERE i.activity_id = a.id)"
 	}
 	if inc.LastError {
 		cols += ", a.last_error, a.last_error_at"
 	}
 	if inc.Result {
-		cols += ", r.state, r.data"
+		cols += ", r.state, " + plainData("r.data", "r.serialization")
 		joins += " LEFT JOIN runnerq_results r ON r.activity_id = a.id"
 	}
 	return cols, joins
@@ -1045,7 +1045,7 @@ func (b *PostgresBackend) ListStepEntries(ctx context.Context, activityID uuid.U
 	}
 	data := "NULL::jsonb"
 	if includeData {
-		data = "data"
+		data = plainData("data", "serialization")
 	}
 	rows, err := b.pool.Query(ctx, fmt.Sprintf(`
 		SELECT activity_id, step, state, %s, created_at FROM runnerq_results
@@ -1129,3 +1129,11 @@ func (b *PostgresBackend) GetActivityTree(ctx context.Context, activityID uuid.U
 }
 
 var _ storage.QueryStorage = (*PostgresBackend)(nil)
+
+// plainData is a stored value as the console reads it: plain JSON as stored,
+// and the TypeScript SDK's native superjson-v1 as its "json" part (the value
+// with dates as ISO strings and the like; its "meta" only matters to the SDK
+// that decodes it).
+func plainData(data, serialization string) string {
+	return "CASE WHEN " + serialization + " = 'superjson-v1' THEN " + data + "->'json' ELSE " + data + " END"
+}

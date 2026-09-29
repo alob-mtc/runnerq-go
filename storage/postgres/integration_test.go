@@ -662,6 +662,21 @@ func TestEncodedStorageRoundTrips(t *testing.T) {
 		t.Fatalf("result %+v, %v", got, err)
 	}
 
+	// Queries show a native value as its plain "json" part.
+	page, err := b.QueryActivities(ctx, storage.ActivityQuery{
+		Filter:  &storage.QueryFilter{Field: "id", Op: storage.OpEq, Value: native.ID.String()},
+		Include: storage.RecordInclude{Payload: true, Result: true},
+	})
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("query: %+v, %v", page, err)
+	}
+	if got := string(page.Items[0].Payload); got != `{"at": "2026-09-29T00:00:00.000Z"}` && got != `{"at":"2026-09-29T00:00:00.000Z"}` {
+		t.Fatalf("queried payload %s", got)
+	}
+	if r := page.Items[0].Result; r == nil || string(r.Data) != `"done"` {
+		t.Fatalf("queried result %+v", r)
+	}
+
 	// Plain JSON stays empty for Go callers.
 	plain := testActivity(3)
 	if err := b.Enqueue(ctx, plain); err != nil {
