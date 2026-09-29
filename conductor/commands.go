@@ -83,7 +83,7 @@ func (h *handlers) command(kind storage.CommandKind) handlerFunc {
 		}
 		// A cancelled activity this executor is running stops now rather
 		// than at its next claim heartbeat.
-		if kind == storage.CommandCancel && !cmd.DryRun && !res.Replayed {
+		if kind == storage.CommandCancel && !cmd.DryRun && !res.Replayed && h.engine != nil {
 			for _, it := range res.Items {
 				if it.Outcome == storage.CommandApplied {
 					h.engine.Interrupt(it.ID)
@@ -120,8 +120,8 @@ func (h *handlers) command(kind storage.CommandKind) handlerFunc {
 // returns the target ids that are not valid ids for this backend.
 func (h *handlers) toCommand(kind storage.CommandKind, req commandRequest) (storage.Command, []string, error) {
 	cmd := storage.Command{ID: req.CommandID, Kind: kind, DryRun: req.DryRun, Reason: req.Reason}
-	if q := req.Target.Queue; q != "" && q != h.engine.QueueName() {
-		e := fieldError(codeFailedPrecondition, "target.queue", "this executor serves queue %q, not %q", h.engine.QueueName(), q)
+	if q := req.Target.Queue; q != "" && q != h.queue {
+		e := fieldError(codeFailedPrecondition, "target.queue", "this executor serves queue %q, not %q", h.queue, q)
 		return cmd, nil, e
 	}
 

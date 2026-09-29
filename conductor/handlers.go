@@ -24,10 +24,13 @@ type handlerFunc func(ctx context.Context, data json.RawMessage) (any, error)
 
 // handlers serves protocol requests from the engine's storage.
 type handlers struct {
+	// engine is nil in a Handler, which serves storage without a worker.
 	engine  *runnerq.WorkerEngine
 	backend storage.Storage
-	qs      storage.QueryStorage   // nil when the backend has no QueryStorage
-	cs      storage.CommandStorage // nil when the backend has no CommandStorage
+	// queue is the queue commands act on.
+	queue string
+	qs    storage.QueryStorage   // nil when the backend has no QueryStorage
+	cs    storage.CommandStorage // nil when the backend has no CommandStorage
 	// allowControl lets the Cloud run commands.
 	allowControl bool
 	// forceMetadataOnly is the local setting; it always wins.
@@ -41,7 +44,7 @@ func newHandlers(engine *runnerq.WorkerEngine, forceMetadataOnly, allowControl b
 	backend := engine.Backend()
 	qs, _ := backend.(storage.QueryStorage)
 	cs, _ := backend.(storage.CommandStorage)
-	return &handlers{engine: engine, backend: backend, qs: qs, cs: cs, allowControl: allowControl,
+	return &handlers{engine: engine, backend: backend, queue: engine.QueueName(), qs: qs, cs: cs, allowControl: allowControl,
 		forceMetadataOnly: forceMetadataOnly, started: time.Now()}
 }
 

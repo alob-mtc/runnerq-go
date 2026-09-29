@@ -18,6 +18,10 @@
 //	defer agent.Close(context.Background()) // runs before the engine stops
 //	engine.Start(ctx)
 //
+// Services that hold a backend themselves, such as RunnerQ Cloud's data
+// plane for hosted stores, answer the same requests with a Handler, without
+// a worker or a connection.
+//
 // The wire protocol is specified in the runnerq-cloud repository
 // (docs/protocol.md).
 package conductor
