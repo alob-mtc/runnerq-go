@@ -1,20 +1,8 @@
 package runnerq
 
-import "context"
-
-// handlerScopeKey marks contexts that originate inside processActivity, so
-// ActivityFuture.GetResult can tell an in-handler await (which may yield-park
-// the activity) from an external caller's await (which must block normally —
-// there is no activity row to park).
-type handlerScopeKey struct{}
-
-func withHandlerScope(ctx context.Context) context.Context {
-	return context.WithValue(ctx, handlerScopeKey{}, struct{}{})
-}
-
-func inHandlerScope(ctx context.Context) bool {
-	return ctx.Value(handlerScopeKey{}) != nil
-}
-
-// Carries execution identity to rehydrated futures awaited inside handlers.
+// attemptQueueKey carries the executing attempt's queue on contexts that
+// originate inside processActivity. Its presence is what tells an in-handler
+// ActivityFuture.GetResult (which may yield-park the activity, and hands
+// rehydrated futures the attempt's identity) from an external caller's await
+// (which must block normally — there is no activity row to park).
 type attemptQueueKey struct{}

@@ -84,7 +84,8 @@ const awaitParkGrace = 2 * time.Second
 func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error) {
 	queue := f.queue
 	grace := awaitParkGrace
-	if scoped, ok := ctx.Value(attemptQueueKey{}).(*attemptQueue); ok {
+	scoped, inHandler := ctx.Value(attemptQueueKey{}).(*attemptQueue)
+	if inHandler {
 		if scoped.awaitGrace > 0 {
 			grace = scoped.awaitGrace
 		}
@@ -100,7 +101,7 @@ func (f *ActivityFuture) GetResult(ctx context.Context) (json.RawMessage, error)
 		}
 		queue = &copy
 	}
-	if !inHandlerScope(ctx) {
+	if !inHandler {
 		result, err := queue.WaitForResult(ctx, f.activityID)
 		if err != nil {
 			return nil, err

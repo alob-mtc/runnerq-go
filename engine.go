@@ -687,10 +687,9 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	defer revoke(nil)
 	e.revokers.Store(activityID, revoke)
 	defer e.revokers.Delete(activityID)
-	// Mark the context as handler-scoped so in-handler GetResult calls may
-	// yield-park this activity; awaits outside a handler block normally.
-	timeoutCtx = withHandlerScope(timeoutCtx)
-
+	// Carrying the attempt queue marks the context as handler-scoped, so
+	// in-handler GetResult calls may yield-park this activity; awaits outside
+	// a handler block normally.
 	attemptQ := &attemptQueue{activityQueue: e.queue, backend: e.backend, owner: act.ID, worker: workerLabel, persistenceCtx: ctx, metrics: e.metrics, awaitGrace: e.awaitGrace}
 	timeoutCtx = context.WithValue(timeoutCtx, attemptQueueKey{}, attemptQ)
 	scopedExecutor := newActivityExecutor(attemptQ, e.config.MaxActivityDepth).scopedForChild(act)
