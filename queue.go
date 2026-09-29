@@ -326,7 +326,7 @@ func (a *backendQueueAdapter) GetResult(ctx context.Context, activityID uuid.UUI
 // WaitForResult blocks until the activity's result exists. Backends that
 // implement storage.ResultWaiter (the Postgres backend does) provide an
 // efficient notification-driven wait that works across processes; for other
-// backends this falls back to the legacy 100ms poll.
+// backends this falls back to polling GetResult every 100ms.
 func (a *backendQueueAdapter) WaitForResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error) {
 	if rw, ok := a.backend.(storage.ResultWaiter); ok {
 		backendResult, err := rw.WaitForResult(ctx, activityID)

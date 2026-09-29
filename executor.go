@@ -425,8 +425,9 @@ func (w *ActivityExecutor) executeActivity(ctx context.Context, activityType str
 		// Positional identity: a retried parent re-issuing this exact spawn
 		// derives the same key and reattaches to the existing child instead
 		// of duplicating it. The "rq:step:" prefix keeps the derived keyspace
-		// disjoint from user-supplied idempotency keys (which are suffixed
-		// with the activity type, never prefixed like this).
+		// disjoint from user-supplied idempotency keys (which are encoded
+		// with the activity type under the "rq:key:v2:" prefix; see
+		// storage.BusinessIdempotencyKey).
 		a.IdempotencyKey = &IdempotencyConfig{
 			Key:      fmt.Sprintf("rq:step:%s:%s:%s", a.RootActivityID, w.lineage.parentID, step),
 			Behavior: ReturnExisting,
