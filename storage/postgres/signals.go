@@ -43,6 +43,9 @@ const (
 
 	resultWaitFallback = 5 * time.Second
 
+	// Bounds a claim statement that no longer follows its caller's context.
+	claimStatementTimeout = 30 * time.Second
+
 	// Keeps payloads under the 8KB NOTIFY limit (36-byte UUIDs plus separators).
 	resultIDsPerNotify = 200
 )

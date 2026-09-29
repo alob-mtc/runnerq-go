@@ -465,3 +465,68 @@ func isKind(err error, kind storage.StorageErrorKind) bool {
 	se, ok := storage.IsStorageError(err)
 	return ok && se.Kind == kind
 }
+
+// A claim commits on its own, so once sent its reply must reach the caller
+// even if the caller's context ends meanwhile; otherwise the row would sit
+// claimed until lease recovery.
+func TestClaimSentBeforeCancelIsDelivered(t *testing.T) {
+	b := testBackend(t)
+	ctx := context.Background()
+	a := testActivity(3)
+	if err := b.Enqueue(ctx, a); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	// Hold the claim statement mid-flight: its Dequeued insert waits on this lock.
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `LOCK TABLE runnerq_events IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	claimCtx, cancel := context.WithCancel(ctx)
+	type result struct {
+		claims []storage.DequeuedActivity
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		claims, err := b.DequeueBatch(claimCtx, "w", 1, 0, []string{a.ActivityType})
+		done <- result{claims, err}
+	}()
+	waitUntil(t, func() bool {
+		var n int
+		_ = b.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock' AND query LIKE '%WITH claimed%'`).Scan(&n)
+		return n > 0
+	})
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	r := <-done
+	if r.err != nil || len(r.claims) != 1 || r.claims[0].Activity.ID != a.ID {
+		t.Fatalf("claim sent before cancel: got %d claims, err %v; want the activity", len(r.claims), r.err)
+	}
+	if status, _ := activityStatus(t, b, a.ID); status != "processing" {
+		t.Fatalf("status = %s, want processing", status)
+	}
+
+	// A context that has already ended sends nothing.
+	if _, err := b.DequeueBatch(claimCtx, "w", 1, 0, nil); err == nil {
+		t.Fatal("claim on an ended context: want its error")
+	}
+}
+
+func waitUntil(t *testing.T, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); !cond(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met within 5s")
+		}
+	}
+}

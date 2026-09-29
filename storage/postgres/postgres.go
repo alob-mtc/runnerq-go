@@ -722,7 +722,23 @@ func (b *PostgresBackend) Dequeue(ctx context.Context, workerID string, maxBlock
 	return claimed, nil
 }
 
+// claimContext is ctx for sending a claim statement, which commits on its own:
+// once sent, its reply is read even if ctx ends, so rows it claimed reach the
+// engine instead of waiting for lease recovery.
+func claimContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	c, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimStatementTimeout)
+	return c, cancel, nil
+}
+
 func (b *PostgresBackend) dequeueOnce(ctx context.Context, workerID string, activityTypes []string) (*storage.QueuedActivity, error) {
+	ctx, cancel, err := claimContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
 	lease, now := b.defaultLeaseMS.Load(), time.Now().UTC()
 	var row pgx.Row
 	switch len(activityTypes) {
@@ -788,10 +804,12 @@ func (b *PostgresBackend) dequeueBatch(ctx context.Context, workerIDPrefix strin
 
 // reads nil means plain JSON only.
 func (b *PostgresBackend) dequeueBatchOnce(ctx context.Context, workerIDPrefix string, limit int, activityTypes, reads []string) ([]storage.DequeuedActivity, error) {
-	var (
-		rows pgx.Rows
-		err  error
-	)
+	ctx, cancel, err := claimContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	var rows pgx.Rows
 	lease, now := b.defaultLeaseMS.Load(), time.Now().UTC()
 	switch {
 	case reads == nil && len(activityTypes) == 0:
