@@ -1,20 +1,10 @@
-// Package runnerq provides a durable activity queue and worker system for Go.
+// Package runnerq is a durable activity queue and worker engine, with
+// pluggable storage (PostgreSQL built in).
 //
-// # Features
-//
-//   - Priority-based activity processing (Critical, High, Normal, Low)
-//   - Activity scheduling with precise timestamp-based scheduling
-//   - Intelligent retry mechanism with exponential backoff
-//   - Dead letter queue handling for activities exceeding retry limits
-//   - Concurrent activity processing with configurable worker pools
-//   - Graceful shutdown with proper cleanup
-//   - Activity orchestration enabling activities to execute other activities
-//   - Comprehensive error handling with retryable and non-retryable types
-//   - Pluggable storage backends (PostgreSQL built-in)
-//   - Worker-level activity type filtering
-//   - Observability through RunnerQ Cloud (see the conductor package)
-//
-// # Quick Start
+// Activities run by priority and schedule, retry with exponential backoff and
+// dead-letter when out of attempts. Handlers can checkpoint steps (Run,
+// RunStep), sleep and wait for signals durably, and spawn and await child
+// activities. RunnerQ Cloud observes workers through the conductor package.
 //
 //	backend, _ := postgres.New(ctx, "postgres://localhost/mydb", "my_app")
 //	engine, _ := runnerq.Builder().

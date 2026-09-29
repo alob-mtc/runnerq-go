@@ -12,46 +12,33 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// ActivityContext is provided to activity handlers during execution.
+// ActivityContext is what a handler gets about the activity it runs.
 type ActivityContext struct {
-	// ActivityID is the unique identifier for this activity instance.
-	ActivityID uuid.UUID
-
-	// ActivityType is the type of activity being executed.
+	ActivityID   uuid.UUID
 	ActivityType string
 
-	// RetryCount is the current retry attempt number (0 for first execution).
+	// RetryCount is the attempt number minus one (0 on the first attempt).
 	RetryCount uint32
 
-	// Metadata is custom metadata associated with the activity.
 	Metadata map[string]string
 
-	// Ctx is the Go context for cancellation and deadline propagation. It ends
-	// at the activity's timeout, and earlier if this execution loses its claim
-	// (its lease expired and the activity was handed to another worker) —
-	// context.Cause(Ctx) is then a storage ErrClaimLost error. Handlers must
-	// stop on cancellation: the engine cannot interrupt one that ignores it,
-	// and its side effects would overlap the replacement execution's.
+	// Ctx ends at the activity's timeout, and earlier if this execution loses
+	// its claim to another worker; context.Cause(Ctx) is then a storage
+	// ErrClaimLost error. Handlers must stop when it ends: the engine cannot
+	// interrupt one that ignores it, and its side effects would overlap the
+	// replacement execution's.
 	Ctx context.Context
 
-	// ActivityExecutor spawns other activities from within a handler.
-	// Spawns made through it are tagged as children of this activity.
+	// ActivityExecutor spawns children of this activity.
 	ActivityExecutor *ActivityExecutor
 
-	// ParentActivityID is the direct parent of this activity, if any.
-	ParentActivityID *uuid.UUID
+	ParentActivityID *uuid.UUID // nil for a root
+	RootActivityID   uuid.UUID  // ActivityID for a root
+	Depth            uint16     // 0 for a root
 
-	// RootActivityID is the root of the lineage tree this activity belongs to.
-	// For root activities, RootActivityID equals ActivityID.
-	RootActivityID uuid.UUID
-
-	// Depth is the lineage depth of this activity (0 for roots).
-	Depth uint16
-
-	// queue gives Run and Sleep access to checkpoint storage. Set by the
-	// engine; nil when an ActivityContext is constructed by hand (e.g. in
-	// handler unit tests), in which case Run executes fn without
-	// checkpointing and Sleep waits in-process.
+	// queue is the checkpoint storage behind Run, Sleep and WaitForSignal;
+	// nil in a hand-built context (handler unit tests), where Run just calls
+	// fn and Sleep waits in-process.
 	queue activityQueue
 }
 
@@ -62,31 +49,23 @@ func (c ActivityContext) checkpointID(kind, name string) uuid.UUID {
 	return storage.CheckpointID(c.ActivityID, kind, name)
 }
 
-// Run executes fn as a named, checkpointed step: its successful result (or
-// permanent failure) is persisted, and when a retried handler reaches the
-// same step it returns the stored outcome WITHOUT re-running fn. Use it for
-// local side effects that must not repeat across retries — payments, emails,
-// non-idempotent API calls.
+// Run executes fn as a named, checkpointed step: a retried handler reaching
+// the same step gets the stored outcome without re-running fn. Use it for
+// side effects that must not repeat across retries (payments, emails).
 //
-// Semantics:
-//   - success           → result stored; later attempts return it instantly.
-//   - NonRetryError     → failure stored; later attempts return the same
-//     error without re-running fn.
-//   - retryable error   → nothing stored; fn runs again on the next attempt.
-//   - crash AFTER fn but BEFORE the result commits → fn runs again. Run is
-//     at-least-once with at-most-once-per-recorded-success; fn should be as
-//     idempotent as the external system allows (e.g. pass an idempotency key
-//     to the payment provider).
+//   - success: the result is stored and returned by later attempts.
+//   - NonRetryError: the failure is stored and returned by later attempts.
+//   - retryable error: nothing is stored; fn runs again next attempt.
+//   - a crash after fn but before the result commits: fn runs again. Make fn
+//     as idempotent as the external system allows (e.g. pass it an
+//     idempotency key).
 //
 // Step names must be stable across retries and unique within the handler.
 func (c ActivityContext) Run(name string, fn func() (json.RawMessage, error)) (json.RawMessage, error) {
 	if name == "" {
-		// An empty name would alias every unnamed Run onto one checkpoint
-		// key, replaying the wrong stored result on retry.
 		return nil, NewNonRetryError("Run requires a non-empty step name")
 	}
 	if c.queue == nil {
-		// Hand-constructed context (unit tests): no checkpoint storage.
 		return fn()
 	}
 	checkID := c.checkpointID("run", name)
@@ -107,8 +86,8 @@ func (c ActivityContext) Run(name string, fn func() (json.RawMessage, error)) (j
 	out, fnErr := fn()
 	if fnErr != nil {
 		if !retryableError(fnErr) {
-			// Permanent failure: checkpoint it so retries of the PARENT (for
-			// unrelated reasons) don't re-run a step that failed for good.
+			// Checkpoint a permanent failure so a retry of the handler (for
+			// another reason) doesn't re-run the step.
 			failureJSON, _ := json.Marshal(map[string]string{"error": fnErr.Error()})
 			if err := c.queue.StoreResult(c.Ctx, checkID, c.ActivityID, activityResult{Data: failureJSON, State: ResultErr}, "run:"+name); err != nil {
 				return nil, err
@@ -118,32 +97,27 @@ func (c ActivityContext) Run(name string, fn func() (json.RawMessage, error)) (j
 	}
 
 	if err := c.queue.StoreResult(c.Ctx, checkID, c.ActivityID, activityResult{Data: out, State: ResultOk}, "run:"+name); err != nil {
-		// Scoped storage retries transient writes without rerunning fn. Keep
-		// the remaining error's ownership/permanent/cancellation classification.
+		// Wrapped, not replaced, so the error keeps its classification.
 		return nil, fmt.Errorf("step %q ran but checkpoint failed: %w", name, err)
 	}
 	return out, nil
 }
 
-// Step is a typed unit of work for RunStep: it receives a context derived
-// from the activity's (so the activity timeout still bounds it) and returns
-// a JSON-encodable result.
+// Step is a typed unit of work for RunStep. Its context derives from the
+// activity's, so the activity timeout still bounds it.
 type Step[R any] func(ctx context.Context) (R, error)
 
-// RunStep is the typed form of Run: fn's result is encoded with
-// encoding/json into the checkpoint, and a replaying attempt decodes the
-// stored result into R without re-running fn. R must round-trip through
-// encoding/json; json.RawMessage passes through unchanged. Semantics and the
-// step-name rules are those of Run.
+// RunStep is the typed form of Run: fn's result is stored as JSON and a
+// replaying attempt decodes it into R, so R must round-trip through
+// encoding/json. Semantics and step-name rules are Run's.
 //
 //	receipt, err := ctx.RunStep("charge", func(c context.Context) (Receipt, error) {
 //	    return payments.Charge(c, orderID, amount)
 //	})
 //
-// A stored result that no longer decodes into R — the type changed between
-// deploys — fails as a NonRetryError naming the step, since retrying cannot
-// fix it. An encode failure is also a NonRetryError and is checkpointed as
-// a permanent step failure, because the side effect has already happened.
+// A stored result that no longer decodes into R (the type changed between
+// deploys) is a NonRetryError. So is an encode failure, which is stored as a
+// permanent step failure because the side effect has already happened.
 func (c ActivityContext) RunStep[R any](name string, fn Step[R]) (R, error) {
 	var zero R
 	raw, err := c.Run(name, func() (json.RawMessage, error) {
@@ -173,57 +147,44 @@ func (c ActivityContext) RunStep[R any](name string, fn Step[R]) (R, error) {
 	return out, nil
 }
 
-// yieldMargin is how much handler-deadline headroom Sleep requires to wait
-// in-process. A wake that wouldn't land at least this far before the
-// activity's timeout yields instead, so the sleep never converts into a
-// spurious timeout-retry.
+// yieldMargin is the headroom before the handler deadline a wait needs to
+// happen in-process; otherwise it yields rather than end in a timeout retry.
 const yieldMargin = 2 * time.Second
 
-// yieldPark is the sentinel error a yielding durable wait (Sleep,
-// WaitForSignal, or an in-handler GetResult) returns. The engine intercepts
-// it and parks the activity row as 'waiting' until wakeAt — without counting
-// a retry — instead of treating it as a failure. Parked waits are woken
-// early by what they wait for: signal delivery or child completion.
+// yieldPark is the sentinel error of a yielding wait (Sleep, WaitForSignal,
+// in-handler GetResult). The engine parks the activity as 'waiting' until
+// wakeAt without counting a retry; what it waits for wakes it early.
 //
-// recheck closes the park race: a checkpoint/result that commits between the
-// handler's final check and the park landing produces no wake of its own
-// (the row wasn't 'waiting' yet when the producer looked). When recheck is
-// set, the engine re-checks that result AFTER the park commits and self-
-// wakes the activity if it exists.
+// recheck names the awaited result: one that commits between the handler's
+// last check and the park wakes nothing (the row wasn't 'waiting' yet), so
+// the engine re-checks it after the park commits.
 type yieldPark struct {
 	wakeAt  time.Time
-	kind    string // "sleep" | "signal" | "await" — for the Yielded event / console
+	kind    string // "sleep", "signal" or "await", for the Yielded event
 	step    string
-	recheck uuid.UUID // result ID to re-check post-park; uuid.Nil = none
+	recheck uuid.UUID // uuid.Nil: none
 }
 
 func (y *yieldPark) Error() string {
 	return fmt.Sprintf("durable wait %q yields until %s", y.step, y.wakeAt.Format(time.RFC3339))
 }
 
-// Sleep is a durable timer: the wake deadline is persisted under the step
-// name on first execution, so a handler that crashes or is redeployed
-// mid-sleep resumes with only the REMAINDER of the wait — a 24h sleep does
-// not restart from zero, and an already-elapsed sleep returns immediately on
-// replay.
+// Sleep is a durable timer: the wake time is stored on first execution, so a
+// handler that crashes or is redeployed mid-sleep waits only the remainder,
+// and a replay past it returns at once.
 //
-// When the remaining wait fits inside the activity's timeout budget, Sleep
-// waits in-process. When it doesn't, Sleep YIELDS: it returns a sentinel
-// error that the caller MUST propagate unchanged (`if err != nil { return
-// nil, err }`); the engine intercepts it, parks the activity as scheduled
-// until the wake time without consuming a retry, and re-invokes the handler
-// afterwards — earlier Run/Step checkpoints fast-forward and this Sleep
-// returns nil.
+// A wait that fits in the activity's timeout happens in-process. Otherwise
+// Sleep YIELDS: it returns a sentinel error the caller MUST propagate
+// unchanged, the activity is parked until the wake time without consuming a
+// retry, and the handler then replays (earlier checkpoints fast-forward) to
+// a Sleep that returns nil.
 //
 // Step names must be stable across retries and unique within the handler.
 func (c ActivityContext) Sleep(name string, d time.Duration) error {
 	if name == "" {
-		// An empty name would alias every unnamed Sleep onto one checkpoint
-		// key, replaying the wrong wake deadline on retry.
 		return NewNonRetryError("Sleep requires a non-empty step name")
 	}
 	if c.queue == nil {
-		// Hand-constructed context (unit tests): plain in-process wait.
 		select {
 		case <-time.After(d):
 			return nil
@@ -247,8 +208,7 @@ func (c ActivityContext) Sleep(name string, d time.Duration) error {
 	} else {
 		wakeAt = time.Now().UTC().Add(d)
 		cpJSON, _ := json.Marshal(map[string]time.Time{"wake_at": wakeAt})
-		// Persist BEFORE waiting, so a crash mid-sleep resumes the remainder
-		// instead of restarting the full duration.
+		// Stored before waiting, so a crash mid-sleep resumes the remainder.
 		if err := c.queue.StoreResult(c.Ctx, checkID, c.ActivityID, activityResult{Data: cpJSON, State: ResultOk}, "sleep:"+name); err != nil {
 			return err
 		}
@@ -259,12 +219,9 @@ func (c ActivityContext) Sleep(name string, d time.Duration) error {
 		return nil
 	}
 
-	// Yield when the wake wouldn't comfortably precede the handler deadline:
-	// burning the rest of this attempt on a wait that ends in a timeout-retry
-	// would consume retry budget and hold a goroutine for nothing. The margin
-	// is capped at half the remaining budget so short-timeout handlers (≤ 2×
-	// yieldMargin) can still take short sleeps in-process instead of paying a
-	// reschedule round-trip for every wait.
+	// Yield unless the wake comfortably precedes the handler deadline. The
+	// margin is capped at half the remaining budget so short-timeout handlers
+	// can still take short sleeps in-process.
 	if deadline, ok := c.Ctx.Deadline(); ok {
 		margin := max(min(yieldMargin, time.Until(deadline)/2), 0)
 		if wakeAt.After(deadline.Add(-margin)) {
@@ -280,38 +237,27 @@ func (c ActivityContext) Sleep(name string, d time.Duration) error {
 	}
 }
 
-// signalParkHorizon is the park deadline for WaitForSignal calls with no
-// timeout — effectively "until signalled". The parked row's scheduled_at is
-// never reached; delivery flips it to pending early.
+// signalParkHorizon is the park deadline of a wait with no timeout:
+// effectively until woken.
 const signalParkHorizon = 100 * 365 * 24 * time.Hour
 
-// WaitForSignal blocks until an external signal named name is delivered to
-// THIS activity (via WorkerEngine.Signal or runnerq.SignalActivity from any
-// process sharing the database) and returns its payload. timeout bounds the
-// wait, measured from the FIRST attempt that reached this call — replays
-// share the persisted deadline, they don't restart it; 0 means wait forever.
-// On timeout it returns a non-retryable error (check with IsSignalTimeout).
+// WaitForSignal waits for the signal named name to be delivered to this
+// activity (WorkerEngine.Signal or SignalActivity, from any process sharing
+// the database) and returns its payload. timeout runs from the first attempt
+// to reach this call, not from each replay; 0 waits forever. On timeout it
+// returns a non-retryable error (IsSignalTimeout).
 //
-// Signals are buffered: one delivered before the handler reaches this call —
-// or before the activity even started — is returned immediately, including on
-// replay. Repeated signals with the same name overwrite the payload
-// (last write wins).
+// Signals are buffered: one delivered earlier, even before the activity
+// started, is returned at once. A repeated signal overwrites the payload.
 //
-// Like Sleep, a wait that doesn't fit the handler's timeout budget YIELDS:
-// the sentinel error MUST be propagated unchanged; the engine parks the
-// activity (no retry consumed, no worker held) until delivery wakes it or the
-// wait deadline passes. Signal names must be stable across retries and
+// Like Sleep, a wait that doesn't fit the timeout YIELDS: propagate the
+// sentinel error unchanged. Signal names must be stable across retries and
 // unique within the handler.
 func (c ActivityContext) WaitForSignal(name string, timeout time.Duration) (json.RawMessage, error) {
 	if name == "" {
-		// An empty name would alias every unnamed wait onto one checkpoint
-		// key, delivering the wrong signal on retry.
 		return nil, NewNonRetryError("WaitForSignal requires a non-empty signal name")
 	}
 	if timeout < 0 {
-		// A computed negative duration silently becoming "wait forever"
-		// would be a surprising and hard-to-debug outcome — fail fast
-		// before the wait checkpoint is written.
 		return nil, NewNonRetryError("WaitForSignal timeout must be >= 0 (0 = wait forever)")
 	}
 	if c.queue == nil {
@@ -319,8 +265,8 @@ func (c ActivityContext) WaitForSignal(name string, timeout time.Duration) (json
 	}
 	sigID := c.checkpointID("signal", name)
 
-	// Persist the wait deadline on first arrival so timeout is measured from
-	// the first wait, not restarted by every replay. nil deadline = forever.
+	// The deadline is stored on first arrival so replays don't restart it;
+	// nil is forever.
 	var deadline *time.Time
 	waitID := c.checkpointID("signalwait", name)
 	if stored, err := c.queue.GetResult(c.Ctx, waitID); err != nil {
@@ -339,7 +285,6 @@ func (c ActivityContext) WaitForSignal(name string, timeout time.Duration) (json
 			deadline = &d
 		}
 		cpJSON, _ := json.Marshal(map[string]*time.Time{"deadline": deadline})
-		// Step left "" this pass: signal step history is the follow-up (C).
 		if err := c.queue.StoreResult(c.Ctx, waitID, c.ActivityID, activityResult{Data: cpJSON, State: ResultOk}, ""); err != nil {
 			return nil, err
 		}
@@ -355,10 +300,7 @@ func (c ActivityContext) WaitForSignal(name string, timeout time.Duration) (json
 		}
 
 		if deadline != nil && !time.Now().Before(*deadline) {
-			// One final check before declaring a timeout: a signal that
-			// committed between the lookup above and this deadline check
-			// would otherwise be misreported as missing. Ties go to the
-			// signal.
+			// Check once more before timing out: ties go to the signal.
 			if stored, err := c.queue.GetResult(c.Ctx, sigID); err != nil {
 				return nil, err
 			} else if stored != nil {
@@ -375,9 +317,7 @@ func (c ActivityContext) WaitForSignal(name string, timeout time.Duration) (json
 			wake = *deadline
 		}
 
-		// Same yield policy as Sleep: don't burn this attempt on a wait that
-		// would end in a timeout-retry. Parked waits are woken early by
-		// delivery (SignalActivity flips the scheduled row to pending).
+		// Same yield policy as Sleep; delivery wakes the parked activity.
 		if ctxDeadline, ok := c.Ctx.Deadline(); ok {
 			margin := max(min(yieldMargin, time.Until(ctxDeadline)/2), 0)
 			if wake.After(ctxDeadline.Add(-margin)) {
@@ -385,13 +325,11 @@ func (c ActivityContext) WaitForSignal(name string, timeout time.Duration) (json
 			}
 		}
 
-		// In-process wait on the signal's result row — notification-driven
-		// across processes, with the backend's fallback re-checks — bounded
-		// by the wait deadline so the timeout error above can fire.
+		// Wait in-process, bounded by the deadline so the timeout above fires.
 		stored, err = c.waitForCheckpoint(sigID, wake)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) && c.Ctx.Err() == nil {
-				continue // wait deadline reached → loop re-checks and times out
+				continue // deadline reached: re-check, then time out
 			}
 			return nil, err
 		}
@@ -399,36 +337,27 @@ func (c ActivityContext) WaitForSignal(name string, timeout time.Duration) (json
 	}
 }
 
-// waitForCheckpoint blocks on a checkpoint row until it exists or wake
-// passes.
 func (c ActivityContext) waitForCheckpoint(id uuid.UUID, wake time.Time) (*activityResult, error) {
 	waitCtx, cancel := context.WithDeadline(c.Ctx, wake)
 	defer cancel()
 	return c.queue.WaitForResult(waitCtx, id)
 }
 
-// ActivityHandler is the interface that all activity handlers must implement.
-// Implementations should be safe for concurrent use.
-//
-// The activity type a handler serves is decided at registration, not by the
-// handler: RegisterActivity derives it from the handler's type name and
-// RegisterActivityWithName pins it explicitly.
+// ActivityHandler runs activities of the type it is registered under
+// (RegisterActivity, RegisterActivityWithName). It must be safe for
+// concurrent use.
 type ActivityHandler interface {
-	// Handle processes the activity with the given payload and context.
-	// Returns:
-	//   (result, nil)       - completed successfully, result may be nil
-	//   (nil, RetryError)   - failed but should be retried
-	//   (nil, NonRetryError)- failed permanently
+	// Handle runs one attempt. It returns (result, nil) on success (result
+	// may be nil), a NonRetryError to fail for good, or any other error to
+	// retry.
 	Handle(ctx ActivityContext, payload json.RawMessage) (json.RawMessage, error)
 
-	// OnDeadLetter is called when an activity enters the dead letter state.
-	// The default behavior (if not overridden by embedding DefaultDeadLetterHandler) is a no-op.
+	// OnDeadLetter is called when an attempt fails for the last time; embed
+	// DefaultDeadLetterHandler for a no-op.
 	OnDeadLetter(ctx ActivityContext, payload json.RawMessage, errorMsg string)
 }
 
-// DefaultDeadLetterHandler provides a no-op OnDeadLetter implementation.
-// Embed this in your handler struct if you don't need dead letter handling.
+// DefaultDeadLetterHandler is a no-op OnDeadLetter to embed in handlers.
 type DefaultDeadLetterHandler struct{}
 
-// OnDeadLetter is a no-op implementation.
 func (DefaultDeadLetterHandler) OnDeadLetter(_ ActivityContext, _ json.RawMessage, _ string) {}

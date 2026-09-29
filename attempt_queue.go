@@ -16,8 +16,9 @@ import (
 // block: there is no activity row to park.
 type attemptQueueKey struct{}
 
-// Scoped to one execution. Checkpoint persistence outlives the handler deadline
-// during recovery, but remains bounded by engine shutdown and claim ownership.
+// attemptQueue is the queue as one execution sees it: its writes are fenced
+// on the execution's claim, and checkpoint persistence may outlive the
+// handler deadline, bounded by engine shutdown and claim ownership.
 type attemptQueue struct {
 	activityQueue
 	backend        storage.Storage
@@ -25,20 +26,16 @@ type attemptQueue struct {
 	worker         string
 	persistenceCtx context.Context
 	metrics        MetricsSink
-	// awaitGrace overrides awaitParkGrace for awaits in this attempt; zero
-	// uses it.
-	awaitGrace time.Duration
+	awaitGrace     time.Duration // overrides awaitParkGrace when set
 }
 
-// attemptHeartbeatInterval is how often a running handler's claim is renewed
-// and re-verified. It bounds how long an execution that lost its lease (a
-// stalled process, a partition longer than the lease) keeps running
-// unawares. Several beats fit inside attemptLeaseExtension, so a missed one
-// does not cost the claim.
+// attemptHeartbeatInterval bounds how long an execution that lost its lease
+// (a stalled process, a long partition) keeps running unawares. Several beats
+// fit in attemptLeaseExtension, so one missed beat does not cost the claim.
 const attemptHeartbeatInterval = 10 * time.Second
 
-// attemptLeaseExtension is how far each renewal pushes the lease out. A
-// renewal never shortens a lease.
+// attemptLeaseExtension is how far each renewal pushes the lease out; a
+// renewal never shortens it.
 const attemptLeaseExtension = 60 * time.Second
 
 func (q *attemptQueue) renew(ctx context.Context) error {
@@ -54,10 +51,9 @@ func (q *attemptQueue) renew(ctx context.Context) error {
 	return nil
 }
 
-// Spawns issued by a handler are fenced on its claim when the backend supports
-// it: an execution that lost its lease may still be running user code while
-// its replacement issues the same spawns, and only one of them may add
-// children to the tree.
+// Spawns are fenced on the claim when the backend supports it: an execution
+// that lost its lease may still be running user code while its replacement
+// issues the same spawns, and only one may add children to the tree.
 func (q *attemptQueue) Enqueue(ctx context.Context, a *activity) error {
 	if b, ok := q.backend.(storage.SpawnStorage); ok {
 		return b.EnqueueForWorker(ctx, activityToQueued(a), q.owner, q.worker)
@@ -73,17 +69,14 @@ func (q *attemptQueue) EnqueueIdempotent(ctx context.Context, a *activity) (*sto
 	return q.activityQueue.EnqueueIdempotent(ctx, a)
 }
 
-// heartbeat renews the claim every interval until ctx ends (the handler
-// returned or ran out its timeout) or the claim turns out to be lost, in which
-// case it calls revoke with the ErrClaimLost error and stops. A renewal that
-// merely fails is retried on the next beat: the lease already covers the
-// handler's whole timeout, so an outage shorter than that costs nothing.
+// heartbeat renews the claim every interval until ctx ends or the claim is
+// lost, when it calls revoke with the ErrClaimLost error. A failed renewal is
+// retried on the next beat: the lease already covers the handler's whole
+// timeout, so a shorter outage costs nothing.
 //
-// Beats run on a timer rather than a goroutine per activity, so an activity
-// shorter than one interval costs one timer. The returned stop waits for a
-// beat in progress, so no renewal can race the acknowledgement that follows:
-// a beat landing after the ack would find the claim released and misreport it
-// as lost.
+// Beats run on a timer, not a goroutine per activity. The returned stop waits
+// for a beat in progress, so no renewal races the acknowledgement after it (a
+// late beat would find the claim released and report it lost).
 func (q *attemptQueue) heartbeat(ctx context.Context, interval time.Duration, revoke context.CancelCauseFunc) (stop func()) {
 	if _, ok := q.backend.(storage.AttemptLeaseStorage); !ok {
 		return func() {}
@@ -168,8 +161,8 @@ func (q *attemptQueue) registerFuture(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
-// Read retries have no uncertain commit to reconcile. Once renewal establishes
-// claim loss, don't return a missing checkpoint that could trigger another effect.
+// retryRead retries a read. Once renewal shows the claim is lost it stops
+// reading: a missing checkpoint returned then could trigger a repeated effect.
 func (q *attemptQueue) retryRead(ctx context.Context, operation string, fn func(context.Context) error) error {
 	var lost error
 	renew := func(ctx context.Context) error {

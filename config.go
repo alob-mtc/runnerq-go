@@ -5,82 +5,75 @@ import (
 	"time"
 )
 
-// RetentionConfig opts the engine into deleting old terminal workflow trees.
-// Without it, activities, events, results, and idempotency keys are kept
-// forever. The deletion unit is a whole tree (terminal root with no
-// non-terminal descendants), so retries can never find their children's
-// results missing. One engine per queue sweeps at a time (advisory-lock
-// leadership in the backend); running it on every engine is safe.
+// RetentionConfig opts the engine into deleting old terminal workflow trees;
+// without it everything is kept forever. A tree is deleted whole (a terminal
+// root with no non-terminal descendants), so a retry never finds a child's
+// result missing. The backend elects one sweeper per queue, so every engine
+// may set it.
 type RetentionConfig struct {
-	// Completed is how long trees whose root completed successfully are kept.
-	// Zero keeps them forever.
+	// Completed is how long trees whose root completed are kept; zero is
+	// forever.
 	Completed time.Duration `json:"completed,omitempty"`
-	// Failed is how long trees whose root is failed or dead_letter are kept —
-	// a separate clock so failures can be held longer for inspection.
-	// Zero keeps them forever.
+	// Failed is how long trees whose root failed or dead-lettered are kept,
+	// so failures can be held longer for inspection; zero is forever.
 	Failed time.Duration `json:"failed,omitempty"`
-	// Interval is the sweep cadence. Defaults to 10 minutes.
+	// Interval is the sweep cadence (default 10 minutes).
 	Interval time.Duration `json:"interval,omitempty"`
-	// BatchSize is the max root trees deleted per sweep transaction.
-	// Defaults to 100.
+	// BatchSize is the most trees deleted per sweep transaction (default 100).
 	BatchSize int `json:"batch_size,omitempty"`
 }
 
-// WorkerConfig controls queue behavior and resource usage.
+// WorkerConfig configures a WorkerEngine.
 type WorkerConfig struct {
-	// QueueName is used as a prefix to avoid conflicts between different applications.
+	// QueueName is the queue this engine serves; applications sharing a
+	// database keep apart by using different queues.
 	QueueName string `json:"queue_name"`
 
-	// MaxConcurrentActivities is the maximum number of activities processed concurrently.
+	// MaxConcurrentActivities is how many activities run at once.
 	MaxConcurrentActivities int `json:"max_concurrent_activities"`
 
-	// SchedulePollIntervalSeconds is the interval for polling scheduled activities.
-	// When nil, defaults to 5 seconds.
-	// Only effective for backends that don't handle scheduling natively in Dequeue().
+	// SchedulePollIntervalSeconds is how often due scheduled activities are
+	// released (default 5), for backends that don't schedule in Dequeue.
 	SchedulePollIntervalSeconds *uint64 `json:"schedule_poll_interval_seconds,omitempty"`
 
-	// LeaseMS overrides the backend's lease floor for claimed activities, in
+	// LeaseMS overrides the backend's minimum lease on a claim, in
 	// milliseconds. Nil keeps the backend's own (postgres.WithConfig's
 	// defaultLeaseMS; 60s for postgres.New).
 	LeaseMS *uint64 `json:"lease_ms,omitempty"`
 
-	// ReaperIntervalSeconds is how often the reaper scans for expired leases.
-	// Defaults to 5 seconds.
+	// ReaperIntervalSeconds is how often expired leases are reclaimed
+	// (default 5).
 	ReaperIntervalSeconds *uint64 `json:"reaper_interval_seconds,omitempty"`
 
-	// ReaperBatchSize is the max number of expired items to requeue per reaper tick.
-	// Defaults to 100.
+	// ReaperBatchSize is the most expired leases reclaimed per tick
+	// (default 100).
 	ReaperBatchSize *int `json:"reaper_batch_size,omitempty"`
 
-	// ActivityTypes restricts this engine to only dequeue specific activity types.
-	// When empty, workers dequeue only locally registered activity types.
+	// ActivityTypes restricts the types this engine claims; empty means
+	// every registered type.
 	ActivityTypes []string `json:"activity_types,omitempty"`
 
-	// MaxActivityDepth caps how deep the parent/child activity tree can grow.
-	// A handler attempting to spawn a child beyond this depth will receive ErrDepthExceeded.
-	// When zero, defaults to 32.
+	// MaxActivityDepth caps the depth of a parent/child tree (default 32); a
+	// spawn beyond it fails with ErrDepthExceeded.
 	MaxActivityDepth uint16 `json:"max_activity_depth,omitempty"`
 
-	// Retention enables deletion of old terminal workflow trees. Nil (the
-	// default) keeps everything forever.
+	// Retention enables deleting old terminal workflow trees; nil keeps
+	// everything.
 	Retention *RetentionConfig `json:"retention,omitempty"`
 
-	// ShutdownGraceSeconds bounds the entire shutdown drain: intake loops and
-	// in-flight activities. When the budget expires, Start() returns even if
-	// some goroutines are still in flight (those are then orphaned for the
-	// remaining process lifetime, which is fine on a SIGTERM). Default 30s.
+	// ShutdownGraceSeconds bounds the whole shutdown drain (default 30).
+	// When it runs out, Start returns with activities still in flight.
 	ShutdownGraceSeconds *uint64 `json:"shutdown_grace_seconds,omitempty"`
 
-	// Labels are free-form tags for this worker (region, deploy version).
-	// RunnerQ Cloud shows them in Fleet, whether the worker is connected by
-	// its agent or reports through the cloud storage adapter.
+	// Labels are free-form tags for this worker (region, deploy version),
+	// shown by RunnerQ Cloud.
 	Labels map[string]string `json:"labels,omitempty"`
 }
 
-// DefaultMaxActivityDepth is the default cap when MaxActivityDepth is unset.
+// DefaultMaxActivityDepth is MaxActivityDepth's default.
 const DefaultMaxActivityDepth uint16 = 32
 
-// DefaultWorkerConfig returns a WorkerConfig with sensible defaults.
+// DefaultWorkerConfig is the configuration Builder starts from.
 func DefaultWorkerConfig() WorkerConfig {
 	reaperInterval := uint64(5)
 	reaperBatch := 100
@@ -92,7 +85,7 @@ func DefaultWorkerConfig() WorkerConfig {
 	}
 }
 
-// Detach caller-owned slices and pointers before the engine starts goroutines.
+// cloneWorkerConfig detaches caller-owned slices and pointers.
 func cloneWorkerConfig(c WorkerConfig) WorkerConfig {
 	c.ActivityTypes = append([]string(nil), c.ActivityTypes...)
 	c.Labels = maps.Clone(c.Labels)

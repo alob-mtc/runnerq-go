@@ -23,7 +23,7 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// WorkerEngine is the main activity processing engine.
+// WorkerEngine claims activities from its backend and runs their handlers.
 type WorkerEngine struct {
 	queue    activityQueue
 	backend  storage.Storage
@@ -32,50 +32,40 @@ type WorkerEngine struct {
 	running  atomic.Bool
 	metrics  MetricsSink
 
-	// mu guards the shutdown machinery below. Start writes these fields and
-	// Stop reads them, typically from different goroutines (`go engine.Start`
-	// then `engine.Stop` from main is the documented usage), so unsynchronized
-	// access is a data race; the mutex also makes closing shutdownCh
-	// idempotent under concurrent Stop calls.
+	// mu guards the fields below: Start and Stop usually run on different
+	// goroutines, and it makes closing shutdownCh idempotent.
 	mu           sync.Mutex
 	active       bool               // true through startup and until the last drain finishes
 	cancelFunc   context.CancelFunc // cancels the engine context (handlers, acks) — phase 3
 	intakeCancel context.CancelFunc // cancels only the dequeue/poll loops — phase 1
 	shutdownCh   chan struct{}
 
-	// instanceID makes worker labels unique per engine instance. It feeds the
-	// current_worker_id ack fence: without it, every process claims work as
-	// "worker-N", so a stale worker whose lease expired could ack (and mark
-	// completed/failed) a row that a different process had since reclaimed
-	// and was still running.
+	// instanceID prefixes claim tokens so they are unique across processes;
+	// otherwise a stale worker could pass the ack fence on a row another
+	// process had reclaimed.
 	instanceID string
 
-	// heartbeatInterval overrides attemptHeartbeatInterval; zero uses it.
-	heartbeatInterval time.Duration
-	// awaitGrace overrides awaitParkGrace; zero uses it.
-	awaitGrace time.Duration
+	heartbeatInterval time.Duration // overrides attemptHeartbeatInterval when set
+	awaitGrace        time.Duration // overrides awaitParkGrace when set
 
 	inflight  sync.Map  // id -> *running: the activities executing here
 	startedAt time.Time // guarded by mu; zero until Start
 
-	// counts counts the metrics the engine emits for Snapshot, and passes
-	// them on to the configured sink; metrics is always counts.
+	// counts feeds Snapshot and forwards to the configured sink; metrics is
+	// always counts.
 	counts      *countingMetrics
 	hostname    string
 	sdk         executor.SDK
 	observers   []executor.Observer // guarded by mu
 	servedTypes []string            // guarded by mu; set by Start
 
-	// changes tells reporters when an activity starts or finishes, or a
-	// drain begins.
 	changes executor.Signal
 }
 
-// Interrupt stops the handler this engine is running for activityID, as if
-// its claim had been lost, and reports whether one was running here. Use it
-// right after the activity was cancelled in storage: the claim heartbeat
-// would notice within a heartbeat interval anyway; this makes it immediate
-// when the command lands on the executor running the activity.
+// Interrupt stops the handler running activityID here, as if its claim had
+// been lost, and reports whether one was running. Call it after cancelling
+// the activity in storage: the heartbeat would notice within an interval;
+// this makes it immediate.
 func (e *WorkerEngine) Interrupt(activityID uuid.UUID) bool {
 	v, ok := e.inflight.Load(activityID)
 	if !ok {
@@ -87,7 +77,7 @@ func (e *WorkerEngine) Interrupt(activityID uuid.UUID) bool {
 	return true
 }
 
-// InFlightActivity is an activity the engine is executing right now.
+// InFlightActivity is an activity the engine is executing.
 type InFlightActivity struct {
 	ID        uuid.UUID
 	Type      string
@@ -95,7 +85,6 @@ type InFlightActivity struct {
 	StartedAt time.Time
 }
 
-// running is an activity executing here and the cancel that interrupts it.
 type running struct {
 	InFlightActivity
 	revoke context.CancelCauseFunc
@@ -112,9 +101,8 @@ func (e *WorkerEngine) InFlight() []InFlightActivity {
 	return out
 }
 
-// Snapshot is this executor as it is now: who it is, what it's running and
-// what it has done since it was built. The Cloud agent and executor.Observers
-// read it; it's safe to call at any time, from any goroutine.
+// Snapshot describes this executor now: who it is, what it is running and
+// what it has done since it was built. Safe from any goroutine.
 func (e *WorkerEngine) Snapshot() executor.Snapshot {
 	e.mu.Lock()
 	types := slices.Clone(e.servedTypes)
@@ -144,17 +132,15 @@ func (e *WorkerEngine) Snapshot() executor.Snapshot {
 	return snap
 }
 
-// Changed returns a channel closed at the engine's next change: an
-// activity starting or finishing, or a drain beginning. Reporters use it
-// (executor.Notifier) to report soon after a change.
+// Changed returns a channel closed at the engine's next change: an activity
+// starting or finishing, or a drain beginning (executor.Notifier).
 func (e *WorkerEngine) Changed() <-chan struct{} {
 	return e.changes.Changed()
 }
 
-// Observe tells o when this engine starts and stops executing, so it can
-// report the executor (by reading its Snapshot) while it runs. A backend
-// that is an executor.Observer is attached without asking. Call Observe
-// before Start.
+// Observe tells o when this engine starts and stops, so it can report the
+// engine's Snapshot while it runs. A backend that is an executor.Observer is
+// attached automatically. Call before Start.
 func (e *WorkerEngine) Observe(o executor.Observer) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -184,10 +170,10 @@ func (e *WorkerEngine) Draining() bool {
 	}
 }
 
-// NewWorkerEngineWithBackend creates a WorkerEngine from a custom backend.
+// NewWorkerEngineWithBackend creates a WorkerEngine from a backend and a
+// full configuration; Builder is the shorter way.
 func NewWorkerEngineWithBackend(backend storage.Storage, config WorkerConfig) *WorkerEngine {
 	config = cloneWorkerConfig(config)
-	// Propagate lease config to backends that support it.
 	if lc, ok := backend.(storage.LeaseConfigurer); ok && config.LeaseMS != nil {
 		leaseMS := min(*config.LeaseMS, math.MaxInt64)
 		lc.SetLeaseMS(int64(leaseMS))
@@ -210,7 +196,7 @@ func NewWorkerEngineWithBackend(backend storage.Storage, config WorkerConfig) *W
 	}
 }
 
-// SetMetrics sets the metrics sink.
+// SetMetrics sets the metrics sink. Panics once the engine is running.
 func (e *WorkerEngine) SetMetrics(sink MetricsSink) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -223,24 +209,20 @@ func (e *WorkerEngine) SetMetrics(sink MetricsSink) {
 	e.counts.sink = sink
 }
 
-// Backend returns the storage backend the engine runs on.
 func (e *WorkerEngine) Backend() storage.Storage {
 	return e.backend
 }
 
-// MaxConcurrentActivities is how many activities the engine runs at once.
 func (e *WorkerEngine) MaxConcurrentActivities() int {
 	return e.config.MaxConcurrentActivities
 }
 
-// QueueName is the queue this engine serves.
 func (e *WorkerEngine) QueueName() string {
 	return e.config.QueueName
 }
 
-// InstanceID is this engine's unique identity: a random id fixed at
-// construction that prefixes its claim tokens. RunnerQ Cloud uses it as the
-// executor id.
+// InstanceID is this engine's random, per-construction identity: it prefixes
+// claim tokens and is RunnerQ Cloud's executor id.
 func (e *WorkerEngine) InstanceID() string {
 	return e.instanceID
 }
@@ -252,15 +234,14 @@ func (e *WorkerEngine) ActivityTypes() []string {
 	return slices.Sorted(maps.Keys(e.handlers))
 }
 
-// RegisterActivity registers a handler under an activity type derived from
-// its Go type name: &ResizeImage{} serves "ResizeImage". NameOf derives the
-// same string for spawns. Panics for handlers whose type has no name (use
-// RegisterActivityWithName), for a type already registered, or once the
-// engine is running.
+// RegisterActivity registers a handler under its Go type name: &ResizeImage{}
+// serves "ResizeImage", as NameOf derives for spawns. It panics for an
+// unnamed type (use RegisterActivityWithName), a type already registered, or
+// once the engine is running.
 //
-// The activity type is persisted with every enqueued activity. Renaming a
-// handler struct therefore strands rows already in the store; pin the name
-// with RegisterActivityWithName where that matters.
+// The type is stored with every activity, so renaming the handler struct
+// strands rows already enqueued; pin the name with RegisterActivityWithName
+// where that matters.
 func (e *WorkerEngine) RegisterActivity(handler ActivityHandler) {
 	if isNilHandler(handler) {
 		panic("handler must be non-nil")
@@ -273,9 +254,9 @@ func (e *WorkerEngine) RegisterActivity(handler ActivityHandler) {
 }
 
 // RegisterActivityWithName registers a handler under an explicit activity
-// type. Use it to decouple the persisted type from the handler's Go name, or
-// to serve several types from one handler type. Panics on an empty type or
-// nil handler, a type already registered, or once the engine is running.
+// type, decoupling the stored type from the Go name or serving several types
+// with one handler type. It panics on an empty type, a nil handler, a type
+// already registered, or once the engine is running.
 func (e *WorkerEngine) RegisterActivityWithName(activityType string, handler ActivityHandler) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -291,9 +272,8 @@ func (e *WorkerEngine) RegisterActivityWithName(activityType string, handler Act
 	e.handlers[activityType] = handler
 }
 
-// isNilHandler reports whether handler is nil, including a typed nil such as
-// (*ChargeCard)(nil) wrapped in the interface — which compares unequal to nil
-// yet panics (or silently misbehaves) on the first Handle call.
+// isNilHandler also catches a typed nil such as (*ChargeCard)(nil), which
+// compares unequal to nil yet fails on the first Handle call.
 func isNilHandler(handler ActivityHandler) bool {
 	if handler == nil {
 		return true
@@ -306,13 +286,14 @@ func isNilHandler(handler ActivityHandler) bool {
 	return false
 }
 
-// GetActivityExecutor returns an executor for spawning activities from
-// outside a handler. Spawns made through it are roots (no parent lineage).
+// GetActivityExecutor returns an executor for spawning root activities from
+// outside a handler.
 func (e *WorkerEngine) GetActivityExecutor() *ActivityExecutor {
 	return newActivityExecutor(e.queue, e.config.MaxActivityDepth)
 }
 
-// Start starts the worker engine and blocks until shutdown or error.
+// Start runs the engine until ctx ends, Stop is called or the process gets
+// SIGINT/SIGTERM, then drains in-flight activities and returns.
 func (e *WorkerEngine) Start(ctx context.Context) error {
 	e.mu.Lock()
 	if e.active {
@@ -378,33 +359,28 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 
 	var wg sync.WaitGroup
 
-	// Scheduled activities processor (skipped if backend handles it natively)
 	if !e.queue.SchedulesNatively() {
 		wg.Go(func() {
 			e.runScheduledProcessor(intakeCtx)
 		})
 	}
 
-	// Reaper processor
 	if !managedMaintenance {
 		wg.Go(func() {
 			e.runReaperProcessor(intakeCtx)
 		})
 	}
 
-	// Retention sweeper (opt-in). Safe to run on every engine: the backend
-	// elects one sweeper per queue via an advisory lock.
+	// The backend elects one retention sweeper per queue.
 	if e.config.Retention != nil && !managedMaintenance {
 		wg.Go(func() {
 			e.runRetentionProcessor(intakeCtx)
 		})
 	}
 
-	// Intake. A backend that can claim in bulk gets one dispatcher that
-	// claims exactly as many activities as the engine has idle slots; every
-	// other backend gets the fixed pool of one blocking-claim loop per slot.
-	// Long waits inside handlers (child awaits, sleeps, signal waits)
-	// yield-park the activity rather than holding the slot in either mode.
+	// Intake: a backend that claims in bulk gets one dispatcher claiming as
+	// many activities as there are idle slots; others get one blocking-claim
+	// loop per slot.
 	if batchQueue, ok := e.queue.(batchActivityQueue); ok {
 		wg.Go(func() {
 			e.runBatchDispatcher(intakeCtx, engineCtx, batchQueue)
@@ -417,7 +393,6 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		}
 	}
 
-	// Wait for shutdown signal or context cancellation
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -435,17 +410,12 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 		}
 	}
 
-	// Phase 1: stop intake. Loops unwind; in-flight handlers keep running on
-	// the still-live engineCtx so they can complete and ack instead of being
-	// guaranteed to fail their ack and rerun. engineCtx is cancelled by the
-	// deferred engineCancel once the drain below finishes (or the grace
-	// budget expires).
+	// Phase 1: stop intake. In-flight handlers keep engineCtx so they can
+	// still ack; it is cancelled once the drain finishes or the grace ends.
 	e.Stop()
 
-	// Phase 2: drain, bounded by one shutdown grace. wg covers the intake
-	// loops and maintenance processors started above, and in-flight
-	// activities run inside the intake goroutines, so it covers them too.
-	// Worst case is ShutdownGraceSeconds however many are still in flight.
+	// Phase 2: drain, bounded by one shutdown grace. In-flight activities run
+	// inside the intake goroutines, so wg covers them too.
 	graceSec := uint64(30)
 	if e.config.ShutdownGraceSeconds != nil {
 		graceSec = max(*e.config.ShutdownGraceSeconds, 1)
@@ -484,10 +454,9 @@ func (e *WorkerEngine) Start(ctx context.Context) error {
 // Stop begins a graceful shutdown: intake stops, and Start returns once
 // in-flight activities have finished (bounded by the shutdown grace).
 //
-// Stop is phase 1 of shutdown. It leaves the engine context alive so
-// in-flight handlers can finish and ack; cancelling it here would make a
-// handler that completes during the drain fail its ack and rerun elsewhere.
-// Start performs the drain (phase 2) and the final cancel (phase 3).
+// Stop leaves the engine context alive: cancelling it would make a handler
+// that completes during the drain fail its ack and rerun elsewhere. Start
+// drains and then cancels it.
 func (e *WorkerEngine) Stop() {
 	slog.Info("Stopping worker engine")
 	e.mu.Lock()
@@ -506,20 +475,16 @@ func (e *WorkerEngine) Stop() {
 	}
 }
 
-// workerDequeueBlock is how long a worker's Dequeue call parks waiting for
-// work. The backend wakes parked dequeuers on new-work notifications and
-// re-probes internally, so this only bounds how often the loop comes up for
-// air; ctx cancellation aborts the wait immediately for shutdown.
+// workerDequeueBlock bounds one blocking claim. The backend wakes it on new
+// work and ctx cancellation ends it, so this only sets how often the loop
+// comes up for air.
 const workerDequeueBlock = 15 * time.Second
 
-// runWorkerLoop polls for work on ctx (the intake context, cancelled first
-// during shutdown) but executes claimed activities on handlerCtx (the engine
-// context, which outlives intake so a draining handler can still ack).
+// runWorkerLoop claims on ctx (intake, cancelled first at shutdown) and
+// executes on handlerCtx, which outlives intake so a draining handler can
+// still ack.
 func (e *WorkerEngine) runWorkerLoop(ctx, handlerCtx context.Context, workerID int) {
 	slog.Debug("Starting worker loop", "worker_id", workerID)
-	// Every claim receives a fresh execution identity, including subsequent
-	// claims on the same worker slot. Old acknowledgements cannot match a new attempt.
-
 	for e.running.Load() {
 		select {
 		case <-ctx.Done():
@@ -528,9 +493,8 @@ func (e *WorkerEngine) runWorkerLoop(ctx, handlerCtx context.Context, workerID i
 		default:
 		}
 
-		// Blocking dequeue: parks inside the backend until work is signalled
-		// or the block window elapses. No idle sleep/backoff needed here —
-		// an empty return means the window expired and we simply re-enter.
+		// A fresh token per claim, so an old attempt's ack can't match a new
+		// one on the same slot.
 		workerLabel := fmt.Sprintf("%s:worker-%d:%s", e.instanceID, workerID, uuid.New())
 		act, err := e.queue.Dequeue(ctx, workerDequeueBlock, workerLabel)
 		if err != nil {
@@ -554,23 +518,20 @@ func (e *WorkerEngine) runWorkerLoop(ctx, handlerCtx context.Context, workerID i
 	slog.Debug("Worker loop stopped", "worker_id", workerID)
 }
 
-// runBatchDispatcher is the intake loop for batch-capable backends. One
-// goroutine owns the engine's concurrency budget: idle slots are tokens in a
-// channel, the dispatcher gathers every slot idle right now, claims that many
-// activities in one round trip, and hands each claim to its own goroutine,
-// which returns the slot when the activity completes, parks, or fails.
+// runBatchDispatcher is the intake loop for batch-capable backends. Idle
+// slots are tokens in a channel; it takes every idle slot, claims that many
+// activities in one round trip, and runs each on its own goroutine, which
+// returns the slot when the activity completes, parks or fails.
 //
-// Claiming only what is idle means a lease is never held by an activity
-// waiting behind an in-memory backlog, and a busy engine issues one claim per
-// wave of freed slots instead of one per slot. Like runWorkerLoop it claims on
-// ctx (intake) and executes on handlerCtx (engine), and it does not return
-// until every activity it dispatched has finished, so Start's drain sees the
-// same thing it would from the fixed pool.
+// Claiming only for idle slots means no lease is held by an activity queued
+// in memory, and a busy engine claims once per wave of freed slots. Like
+// runWorkerLoop it claims on ctx and executes on handlerCtx, and it returns
+// only after every activity it dispatched has finished.
 func (e *WorkerEngine) runBatchDispatcher(ctx, handlerCtx context.Context, queue batchActivityQueue) {
 	n := e.config.MaxConcurrentActivities
 	slog.Debug("Starting batch dispatcher", "max_concurrent_activities", n)
 
-	// Slot numbers double as the worker_id in logs, matching the fixed pool.
+	// Slot numbers double as the worker_id in logs.
 	idle := make(chan int, n)
 	for slot := range n {
 		idle <- slot
@@ -590,9 +551,7 @@ func (e *WorkerEngine) runBatchDispatcher(ctx, handlerCtx context.Context, queue
 		}
 		held = takeIdle(idle, held)
 
-		// A fresh prefix per call: the backend appends each activity's id, so
-		// a token is unique per (call, activity), as the fixed pool's
-		// per-claim uuid is unique per claim.
+		// A fresh prefix per call; the backend appends each activity's id.
 		prefix := fmt.Sprintf("%s:batch:%s", e.instanceID, uuid.New())
 		claims, err := queue.DequeueBatch(ctx, len(held), workerDequeueBlock, prefix)
 		if err != nil {
@@ -618,7 +577,7 @@ func (e *WorkerEngine) runBatchDispatcher(ctx, handlerCtx context.Context, queue
 	slog.Debug("Batch dispatcher stopped")
 }
 
-// takeIdle appends every slot that is idle right now to held, without waiting.
+// takeIdle appends every slot idle right now to held, without waiting.
 func takeIdle(idle <-chan int, held []int) []int {
 	for {
 		select {
@@ -630,9 +589,8 @@ func takeIdle(idle <-chan int, held []int) []int {
 	}
 }
 
-// pauseAfterDequeueError holds an intake loop back for a second after a
-// failed claim so a struggling backend is not hammered. False means ctx ended
-// during the pause and the loop should exit.
+// pauseAfterDequeueError waits a second after a failed claim so a struggling
+// backend is not hammered; false means ctx ended.
 func pauseAfterDequeueError(ctx context.Context) bool {
 	select {
 	case <-time.After(time.Second):
@@ -660,9 +618,8 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	activityTimeout := time.Duration(act.TimeoutSeconds) * time.Second
 	deadlineCtx, timeoutCancel := context.WithTimeout(ctx, activityTimeout)
 	defer timeoutCancel()
-	// revoke cancels the handler early when the heartbeat finds the claim
-	// lost (or Interrupt is called); context.Cause then reports the
-	// ErrClaimLost error.
+	// revoke cancels the handler when the claim is lost (heartbeat or
+	// Interrupt); context.Cause then reports the ErrClaimLost error.
 	timeoutCtx, revoke := context.WithCancelCause(deadlineCtx)
 	defer revoke(nil)
 
@@ -677,9 +634,8 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 		e.inflight.Delete(activityID)
 		e.changes.Notify()
 	}()
-	// Carrying the attempt queue marks the context as handler-scoped, so
-	// in-handler GetResult calls may yield-park this activity; awaits outside
-	// a handler block normally.
+	// The attempt queue on the context lets in-handler GetResult calls
+	// yield-park this activity.
 	attemptQ := &attemptQueue{activityQueue: e.queue, backend: e.backend, owner: act.ID, worker: workerLabel, persistenceCtx: ctx, metrics: e.metrics, awaitGrace: e.awaitGrace}
 	timeoutCtx = context.WithValue(timeoutCtx, attemptQueueKey{}, attemptQ)
 	scopedExecutor := newActivityExecutor(attemptQ, e.config.MaxActivityDepth).scopedForChild(act)
@@ -704,9 +660,8 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	result, handlerErr := e.safeHandle(handler, actCtx, act.Payload)
 	stopHeartbeat()
 
-	// Another execution owns the activity now. Whatever the handler returned —
-	// a result included — belongs to a superseded attempt; the acks would be
-	// rejected by the fence anyway.
+	// Another execution owns the activity now: whatever the handler returned
+	// belongs to a superseded attempt, and the fence would reject its ack.
 	if cause := context.Cause(timeoutCtx); cause != nil {
 		if se, ok := storage.IsStorageError(cause); ok && se.Kind == storage.ErrClaimLost {
 			e.metrics.IncCounter(metricClaimLost, 1)
@@ -715,17 +670,16 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 		}
 	}
 
-	// A yielding durable Sleep is not a failure: park the activity until its
-	// wake time without consuming a retry. Checked before the timeout so a
-	// yield that raced the deadline is still honored as a yield.
+	// A yield parks the activity without consuming a retry. Checked before
+	// the timeout so a yield that raced the deadline is still a yield.
 	var ys *yieldPark
 	if errors.As(handlerErr, &ys) {
 		e.handleYield(ctx, act, ys, workerLabel, workerID)
 		return
 	}
 
-	// A successfully returned outcome is worth persisting even if the handler
-	// deadline elapsed during checkpoint recovery. Ownership still fences it.
+	// A returned result is persisted even if the deadline passed during
+	// checkpoint recovery; ownership still fences it.
 	if handlerErr == nil {
 		e.handleSuccess(ctx, act, result, workerLabel, workerID)
 		return
@@ -747,7 +701,7 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	e.handleRetryableFailure(ctx, act, handler, payloadForDL, handlerErr.Error(), workerLabel, workerID)
 }
 
-// safeHandle calls the handler with panic recovery.
+// safeHandle turns a handler panic into a retryable error.
 func (e *WorkerEngine) safeHandle(handler ActivityHandler, ctx ActivityContext, payload json.RawMessage) (result json.RawMessage, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -789,15 +743,14 @@ func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result 
 	slog.Info("Activity completed successfully", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType)
 }
 
-// handleYield parks a sleeping activity as scheduled until its wake time.
-// On failure the row simply stays processing: its lease expires, the reaper
-// requeues it, and the handler replays to the same Sleep — degraded latency
-// and one consumed retry, not lost work.
+// handleYield parks the activity until its wake time. If that fails the row
+// stays processing until its lease expires and the reaper requeues it: one
+// consumed retry and some latency, not lost work.
 func (e *WorkerEngine) handleYield(ctx context.Context, act *activity, ys *yieldPark, workerLabel string, workerID int) {
 	activityID, activityType := act.ID, act.ActivityType
-	// Recheck waits periodically even if this process dies immediately after
-	// park commits. The original signal/timer deadline remains checkpointed;
-	// this only schedules a replay to discover a result or repark safely.
+	// Waits with a recheck replay at least every minute, even if this process
+	// dies right after the park: the checkpointed deadline is unchanged, the
+	// replay just finds a result or reparks.
 	wakeAt := ys.wakeAt
 	if ys.recheck != uuid.Nil {
 		if recheckAt := time.Now().UTC().Add(time.Minute); wakeAt.After(recheckAt) {
@@ -824,12 +777,11 @@ func (e *WorkerEngine) handleYield(ctx context.Context, act *activity, ys *yield
 		"worker_id", workerID, "activity_id", activityID, "activity_type", activityType,
 		"step", ys.step, "wake_at", ys.wakeAt)
 
-	// Close the park race: a result (signal, child completion) that committed
-	// between the handler's final check and the park above produced no wake —
-	// the row wasn't 'waiting' yet when the producer looked. Re-check now
-	// that the park is committed and self-wake if the awaited result exists.
-	// Failure here is bounded by the one-minute replay deadline above plus
-	// queue availability. Durable dependency registration can avoid polling.
+	// Close the park race: a result that committed between the handler's
+	// last check and the park woke nothing, since the row wasn't 'waiting'
+	// yet. Re-check now and self-wake. A backend with DependencyStorage closes
+	// the race in YieldForResult; otherwise a failure here costs at most the
+	// one-minute replay above.
 	if ys.recheck == uuid.Nil {
 		return
 	}
@@ -885,8 +837,7 @@ func (e *WorkerEngine) handleTimeout(ctx context.Context, act *activity, handler
 	e.retryOrDeadLetter(ctx, act, handler, payload, "Activity execution timed out", workerLabel, workerID)
 }
 
-// callDeadLetter runs the handler's dead-letter hook for an activity whose
-// last attempt just failed, recovering a panicking hook.
+// callDeadLetter runs the handler's dead-letter hook, recovering a panic.
 func (e *WorkerEngine) callDeadLetter(ctx context.Context, act *activity, handler ActivityHandler, payload json.RawMessage, reason string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -958,10 +909,9 @@ func (e *WorkerEngine) runReaperProcessor(ctx context.Context) {
 	slog.Debug("Reaper processor stopped")
 }
 
-// runRetentionProcessor periodically asks the backend to delete terminal
-// workflow trees older than the configured TTLs. Each tick drains: it keeps
-// sweeping until a batch comes back short, so a backlog accumulated while the
-// engine was down clears quickly instead of one batch per interval.
+// runRetentionProcessor sweeps expired workflow trees. Each tick keeps
+// sweeping until a batch comes back short, so a backlog clears at once
+// rather than one batch per interval.
 func (e *WorkerEngine) runRetentionProcessor(ctx context.Context) {
 	cfg := e.config.Retention
 	interval := cfg.Interval
@@ -1005,7 +955,7 @@ func (e *WorkerEngine) runRetentionProcessor(ctx context.Context) {
 	slog.Debug("Retention sweeper stopped")
 }
 
-// WorkerEngineBuilder provides fluent configuration for WorkerEngine.
+// WorkerEngineBuilder configures a WorkerEngine; start with Builder.
 type WorkerEngineBuilder struct {
 	queueName     *string
 	maxWorkers    *int
@@ -1017,55 +967,56 @@ type WorkerEngineBuilder struct {
 	retention     *RetentionConfig
 }
 
-// Builder creates a new WorkerEngineBuilder.
+// Builder starts configuring a WorkerEngine from DefaultWorkerConfig.
 func Builder() *WorkerEngineBuilder {
 	return &WorkerEngineBuilder{}
 }
 
-// QueueName sets the queue name.
+// QueueName sets the queue to serve (default "default").
 func (b *WorkerEngineBuilder) QueueName(name string) *WorkerEngineBuilder {
 	b.queueName = &name
 	return b
 }
 
-// MaxWorkers sets the maximum concurrent workers.
+// MaxWorkers sets how many activities run at once (default 10).
 func (b *WorkerEngineBuilder) MaxWorkers(max int) *WorkerEngineBuilder {
 	b.maxWorkers = &max
 	return b
 }
 
-// SchedulePollInterval sets the interval for polling scheduled activities.
+// SchedulePollInterval sets how often due scheduled activities are released,
+// for backends that don't schedule in Dequeue (default 5s).
 func (b *WorkerEngineBuilder) SchedulePollInterval(interval time.Duration) *WorkerEngineBuilder {
 	b.pollInterval = &interval
 	return b
 }
 
-// ActivityTypes restricts this engine to only dequeue the specified types.
+// ActivityTypes restricts the types this engine claims (default: all
+// registered types).
 func (b *WorkerEngineBuilder) ActivityTypes(types []string) *WorkerEngineBuilder {
 	b.activityTypes = types
 	return b
 }
 
-// Metrics sets the metrics sink.
 func (b *WorkerEngineBuilder) Metrics(sink MetricsSink) *WorkerEngineBuilder {
 	b.metrics = sink
 	return b
 }
 
-// Backend sets the storage backend. Required.
+// Backend sets the storage backend; required.
 func (b *WorkerEngineBuilder) Backend(backend storage.Storage) *WorkerEngineBuilder {
 	b.backend = backend
 	return b
 }
 
-// Retention opts the engine into deleting old terminal workflow trees —
-// see RetentionConfig. Safe to set on every engine in a cluster; the backend
-// elects one sweeper per queue.
+// Retention opts the engine into deleting old terminal workflow trees (see
+// RetentionConfig). Safe on every engine: the backend elects one sweeper.
 func (b *WorkerEngineBuilder) Retention(cfg RetentionConfig) *WorkerEngineBuilder {
 	b.retention = &cfg
 	return b
 }
 
+// ShutdownGrace bounds the shutdown drain (default 30s, at least 1s).
 func (b *WorkerEngineBuilder) ShutdownGrace(d time.Duration) *WorkerEngineBuilder {
 	b.shutdownGrace = &d
 	return b
@@ -1105,8 +1056,8 @@ func (b *WorkerEngineBuilder) Build() (*WorkerEngine, error) {
 	return engine, nil
 }
 
-// Failure decisions are outcomes too: retry their acknowledgement independently
-// of the handler. An idempotent backend resolves an already-committed transition.
+// persistFailure retries a failure's acknowledgement like any outcome; the
+// backend recognises one that already committed.
 func (e *WorkerEngine) persistFailure(ctx context.Context, act *activity, reason string, retryable bool, worker string) (dead bool, err error) {
 	q := &attemptQueue{backend: e.backend, owner: act.ID, worker: worker}
 	err = retryStorage(ctx, "record activity failure", e.metrics, q.renew, func(ctx context.Context) error {

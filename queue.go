@@ -11,11 +11,7 @@ import (
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
-// ---------------------------------------------------------------------------
-// Internal queue interface
-// ---------------------------------------------------------------------------
-
-// ResultState indicates whether an activity result is success or failure.
+// ResultState says whether a stored result is a success or a failure.
 type ResultState int
 
 const (
@@ -23,92 +19,71 @@ const (
 	ResultErr
 )
 
-// activityResult holds the result data from a completed activity.
 type activityResult struct {
 	Data  json.RawMessage `json:"data,omitempty"`
 	State ResultState     `json:"state"`
 }
 
-// activityQueue is the internal interface used by the worker engine for queue operations.
-// Custom backends should implement the storage.Storage interface instead.
+// activityQueue is the engine's view of its backend; backends implement
+// storage.Storage.
 type activityQueue interface {
 	Enqueue(ctx context.Context, a *activity) error
 	Dequeue(ctx context.Context, timeout time.Duration, workerID string) (*activity, error)
-	// MarkCompleted marks an activity as completed and persists its result
-	// atomically with the status flip. result may be nil (handler returned no
-	// data) — a result row is still written so awaiting parents resolve.
+	// MarkCompleted stores the result atomically with completion, even a nil
+	// one, so awaiting parents resolve.
 	MarkCompleted(ctx context.Context, a *activity, result json.RawMessage, workerID string) error
-	// MarkFailed marks an activity as failed. Returns true if moved to dead letter queue.
+	// MarkFailed reports whether the activity was dead-lettered.
 	MarkFailed(ctx context.Context, a *activity, errorMessage string, retryable bool, workerID string) (bool, error)
 	ProcessScheduledActivities(ctx context.Context) error
-	// Yield parks a processing activity as scheduled until wakeAt without
-	// consuming a retry. Used by durable Sleep/WaitForSignal/await. kind and
-	// step describe the wait for observability (recorded on the Yielded event).
+	// Yield parks the activity until wakeAt without consuming a retry; kind
+	// and step only describe the wait on the Yielded event.
 	Yield(ctx context.Context, a *activity, wakeAt time.Time, workerID, kind, step string) error
 	RequeueExpired(ctx context.Context, maxToProcess int) (uint64, error)
-	// EnqueueIdempotent atomically claims the activity's idempotency key and
-	// enqueues it. A nil result means the activity was enqueued; callers must
-	// not Enqueue separately. A non-nil result means an existing activity owns
-	// the key and nothing was enqueued.
+	// EnqueueIdempotent claims the key and enqueues atomically. A non-nil
+	// result is the activity already owning the key; nothing was enqueued.
 	EnqueueIdempotent(ctx context.Context, a *activity) (*storage.IdempotencyResult, error)
-	// StoreResult persists a result row. owner is the activity whose workflow
-	// tree governs the row's lifetime (the activity itself for normal results;
-	// the handler's activity for Run/Sleep checkpoints). step is the
-	// checkpoint's human identity ("kind:name") for the console, "" for a
-	// normal result.
+	// StoreResult stores a result owned by owner's workflow tree; step is a
+	// checkpoint's "kind:name", "" for an activity's own result.
 	StoreResult(ctx context.Context, activityID uuid.UUID, owner uuid.UUID, result activityResult, step string) error
 	GetResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error)
-	// WaitForResult blocks until the activity's result exists or ctx is done.
 	WaitForResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error)
 	RecordSpawnLinked(ctx context.Context, childID, parentID uuid.UUID) error
 	SchedulesNatively() bool
 }
 
-// batchActivityQueue is the engine-side counterpart of
-// storage.BatchQueueStorage. Only a queue whose backend can claim in bulk
-// implements it, so the engine picks its intake strategy with one type
-// assertion.
+// batchActivityQueue is implemented only when the backend can claim in bulk
+// (storage.BatchQueueStorage).
 type batchActivityQueue interface {
 	activityQueue
 	// DequeueBatch claims up to limit activities, blocking up to timeout for
-	// the first one, and returns each with the execution token its claim was
-	// fenced with. workerIDPrefix must be fresh per call; tokens derive from it.
+	// the first. workerIDPrefix must be fresh per call; tokens derive from it.
 	DequeueBatch(ctx context.Context, limit int, timeout time.Duration, workerIDPrefix string) ([]claimedActivity, error)
 }
 
-// claimedActivity pairs an activity with the execution token of its claim;
-// every acknowledgement for the activity must present that token.
+// claimedActivity pairs an activity with its claim token, which every
+// acknowledgement must present.
 type claimedActivity struct {
 	activity *activity
 	leaseID  string
 }
 
-// activityTypeFilter is implemented by queues whose dequeue filter the engine
-// finalizes at Start, once the registered handlers are known.
+// activityTypeFilter lets Start set the claim filter once handlers are known.
 type activityTypeFilter interface {
 	setActivityTypes(types []string)
 }
 
-// ---------------------------------------------------------------------------
-// Backend adapter (bridges storage.Storage → activityQueue)
-// ---------------------------------------------------------------------------
-
-// backendQueueAdapter wraps a storage.Storage to provide the activityQueue interface.
 type backendQueueAdapter struct {
 	backend       storage.Storage
 	activityTypes []string
 }
 
-// batchBackendQueueAdapter is the adapter for a backend that also implements
-// storage.BatchQueueStorage: the shared adapter plus DequeueBatch.
 type batchBackendQueueAdapter struct {
 	*backendQueueAdapter
 	batch storage.BatchQueueStorage
 }
 
-// newBackendQueueAdapter returns a batch-capable adapter when the backend can
-// claim in bulk, so the capability is visible as a type assertion on
-// batchActivityQueue rather than as a flag callers must remember to check.
+// newBackendQueueAdapter returns a batchActivityQueue when the backend can
+// claim in bulk.
 func newBackendQueueAdapter(backend storage.Storage, activityTypes []string) activityQueue {
 	base := &backendQueueAdapter{backend: backend, activityTypes: activityTypes}
 	if batch, ok := backend.(storage.BatchQueueStorage); ok {
@@ -232,10 +207,8 @@ func (a *batchBackendQueueAdapter) DequeueBatch(ctx context.Context, limit int, 
 	if err != nil {
 		return nil, err
 	}
-	// The contract checks below guard custom backends. A violation is
-	// reported instead of patched over: an activity run under an invented
-	// token or beyond the concurrency budget is worse than one left for lease
-	// recovery.
+	// Guard custom backends: an activity run under an invented token or
+	// beyond the concurrency budget is worse than one left to lease recovery.
 	if len(claims) > limit {
 		return nil, storage.NewInternalError(fmt.Sprintf("batch dequeue returned %d activities for a limit of %d", len(claims), limit))
 	}
@@ -294,10 +267,8 @@ func (a *backendQueueAdapter) GetResult(ctx context.Context, activityID uuid.UUI
 	return &activityResult{Data: r.Data, State: ResultState(r.State)}, nil
 }
 
-// WaitForResult blocks until the activity's result exists. Backends that
-// implement storage.ResultWaiter (the Postgres backend does) provide an
-// efficient notification-driven wait that works across processes; for other
-// backends this falls back to polling GetResult every 100ms.
+// WaitForResult uses the backend's storage.ResultWaiter when it has one, and
+// otherwise polls GetResult every 100ms.
 func (a *backendQueueAdapter) WaitForResult(ctx context.Context, activityID uuid.UUID) (*activityResult, error) {
 	if rw, ok := a.backend.(storage.ResultWaiter); ok {
 		r, err := rw.WaitForResult(ctx, activityID)
