@@ -630,7 +630,6 @@ func TestEncodedStorageRoundTrips(t *testing.T) {
 		t.Fatalf("claimed %+v", c.Activity)
 	}
 
-
 	checkpoint := uuid.New()
 	step := storage.ActivityResult{Data: json.RawMessage(`{"json":1}`), State: storage.ResultOk, Serialization: "superjson-v1"}
 	if err := b.StoreCheckpoint(ctx, checkpoint, native.ID, c.LeaseID, step, "run:load"); err != nil {
