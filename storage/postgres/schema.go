@@ -6,7 +6,6 @@ CREATE TABLE IF NOT EXISTS runnerq_activities (
     id UUID PRIMARY KEY,
     queue_name TEXT NOT NULL,
     activity_type TEXT NOT NULL,
-    payload JSONB NOT NULL,
     priority INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -17,7 +16,7 @@ CREATE TABLE IF NOT EXISTS runnerq_activities (
     current_worker_id TEXT,
     last_worker_id TEXT,
     retry_count INTEGER NOT NULL DEFAULT 0,
-    max_retries INTEGER NOT NULL DEFAULT 3,
+    max_retries INTEGER NOT NULL DEFAULT 0,
     timeout_seconds BIGINT NOT NULL DEFAULT 300,
     retry_delay_seconds BIGINT NOT NULL DEFAULT 60,
     max_retry_delay_seconds BIGINT NOT NULL DEFAULT 0,
@@ -26,6 +25,36 @@ CREATE TABLE IF NOT EXISTS runnerq_activities (
     metadata JSONB,
     idempotency_key TEXT
 );
+
+-- Inputs, apart from the activity rows that claims, leases and status
+-- changes rewrite: an activity's payload is written once and read when it is
+-- claimed or inspected. serialization names the payload's encoding
+-- ('json-v1': plain JSON, the only one Go writes; the TypeScript SDK also
+-- writes 'superjson-v1'). The same table as the TypeScript SDK's.
+CREATE TABLE IF NOT EXISTS runnerq_inputs (
+    activity_id UUID PRIMARY KEY,
+    queue_name TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    serialization TEXT NOT NULL DEFAULT 'json-v1'
+);
+
+-- Migration: payloads used to live in runnerq_activities.payload. Move them
+-- into runnerq_inputs and drop the column, in the schema transaction, so a
+-- database is either wholly before or wholly after the move. Processes on
+-- an older version of this SDK can't use the database afterwards: stop them
+-- before starting this one.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = current_schema()
+                 AND table_name = 'runnerq_activities' AND column_name = 'payload') THEN
+        INSERT INTO runnerq_inputs (activity_id, queue_name, payload)
+            SELECT id, queue_name, payload FROM runnerq_activities
+            ON CONFLICT (activity_id) DO NOTHING;
+        ALTER TABLE runnerq_activities DROP COLUMN payload;
+        ALTER TABLE runnerq_activities ALTER COLUMN max_retries SET DEFAULT 0;
+    END IF;
+END $$;
 
 -- Indexes for efficient queries
 --
@@ -135,6 +164,10 @@ CREATE INDEX IF NOT EXISTS idx_runnerq_results_owner
 -- by owner (already indexed above) on the console path, never on a hot path.
 ALTER TABLE runnerq_results
     ADD COLUMN IF NOT EXISTS step TEXT;
+
+-- serialization names the result data's encoding, as for inputs.
+ALTER TABLE runnerq_results
+    ADD COLUMN IF NOT EXISTS serialization TEXT NOT NULL DEFAULT 'json-v1';
 
 -- Retention sweep: find roots that have been terminal longer than the TTL.
 CREATE INDEX IF NOT EXISTS idx_runnerq_root_terminal_age

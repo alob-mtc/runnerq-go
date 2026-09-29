@@ -2,10 +2,16 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // The expectation is parsed from the DDL, so the parser must see every
@@ -207,5 +213,99 @@ func TestSchemaInitWaitsForLockWithoutPinningSnapshot(t *testing.T) {
 	defer conn.Release()
 	if current, err := schemaCurrent(ctx, conn); err != nil || !current {
 		t.Fatalf("schema not restored after the waiter initialized: %v, %v", current, err)
+	}
+}
+
+// A database from before runnerq_inputs (payload inline on the activity row)
+// is migrated on connect: payloads move to runnerq_inputs, the column is
+// dropped, and queued work is still claimed with its payload.
+func TestSchemaMovesInlinePayloadsToInputs(t *testing.T) {
+	dsn := os.Getenv("RUNNERQ_TEST_DSN")
+	if dsn == "" {
+		t.Skip("RUNNERQ_TEST_DSN not set; skipping integration test")
+	}
+	ctx := context.Background()
+	schema := "rq_inline_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	admin, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	if _, err := admin.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = admin.Exec(context.Background(), `DROP SCHEMA `+schema+` CASCADE`) })
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	scoped := dsn + sep + "search_path=" + schema
+
+	// Today's schema, taken back to the inline-payload layout.
+	b, err := WithConfig(ctx, scoped, "inline", 30_000, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
+	a := testActivity(3)
+	a.Payload = json.RawMessage(`{"order":42,"items":["a","b"]}`)
+	for _, stmt := range []string{
+		`DROP TABLE ` + schema + `.runnerq_inputs`,
+		`ALTER TABLE ` + schema + `.runnerq_results DROP COLUMN serialization`,
+		`ALTER TABLE ` + schema + `.runnerq_activities ADD COLUMN payload JSONB NOT NULL`,
+		`ALTER TABLE ` + schema + `.runnerq_activities ALTER COLUMN max_retries SET DEFAULT 3`,
+	} {
+		if _, err := admin.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	if _, err := admin.Exec(ctx, `INSERT INTO `+schema+`.runnerq_activities
+		(id, queue_name, activity_type, payload, priority, status, created_at, max_retries, root_activity_id)
+		VALUES ($1, 'inline', $2, $3, 2, 'pending', now(), 3, $1)`, a.ID, a.ActivityType, a.Payload); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err = WithConfig(ctx, scoped, "inline", 30_000, 5)
+	if err != nil {
+		t.Fatalf("connect to an inline-payload database: %v", err)
+	}
+	defer b.Close()
+
+	var payloadColumn bool
+	var input json.RawMessage
+	var serialization, maxRetriesDefault string
+	if err := admin.QueryRow(ctx, `SELECT
+		EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'runnerq_activities' AND column_name = 'payload'),
+		(SELECT payload FROM `+schema+`.runnerq_inputs WHERE activity_id = $2),
+		(SELECT serialization FROM `+schema+`.runnerq_inputs WHERE activity_id = $2),
+		(SELECT column_default FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'runnerq_activities' AND column_name = 'max_retries')`,
+		schema, a.ID).Scan(&payloadColumn, &input, &serialization, &maxRetriesDefault); err != nil {
+		t.Fatal(err)
+	}
+	if payloadColumn || serialization != "json-v1" || maxRetriesDefault != "0" {
+		t.Fatalf("after migration: payload column %v, serialization %q, max_retries default %q", payloadColumn, serialization, maxRetriesDefault)
+	}
+	var got, want any
+	_ = json.Unmarshal(input, &got)
+	_ = json.Unmarshal(a.Payload, &want)
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("input %s, want %s", input, a.Payload)
+	}
+
+	claimed, err := b.Dequeue(ctx, "w1", 0, nil)
+	if err != nil || claimed == nil || claimed.ID != a.ID {
+		t.Fatalf("claim after migration: %+v, %v", claimed, err)
+	}
+	if err := json.Unmarshal(claimed.Payload, &got); err != nil || fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("claimed payload %s", claimed.Payload)
+	}
+
+	conn, err := b.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if current, err := schemaCurrent(ctx, conn); err != nil || !current {
+		t.Fatalf("schema current after migration = %v, %v", current, err)
 	}
 }

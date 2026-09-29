@@ -35,13 +35,30 @@ On first connect the backend creates:
 | Table | Holds |
 |---|---|
 | `runnerq_activities` | activities and their lifecycle state |
+| `runnerq_inputs` | each activity's payload, written once at enqueue |
 | `runnerq_events` | append-only lifecycle event timeline |
 | `runnerq_results` | activity results and `Run`/`Sleep` checkpoints |
 | `runnerq_idempotency` | idempotency-key → activity mapping |
 | `runnerq_worker_pools` | unused: the old inspector's engine registry, left in place for existing databases |
+| `runnerq_dependencies` | durable references from a waiting activity to the results it waits on |
+| `runnerq_commands` | applied RunnerQ Cloud commands, so a repeated command replays its result |
 
 Without [retention](configuration.md#retention) configured, these grow
 forever — turn it on for production.
+
+The schema is the one the TypeScript SDK uses, so either SDK can open a
+database the other created; only `runnerq_commands` is Go's alone.
+
+#### Upgrading from an inline-payload schema
+
+Earlier versions kept each payload in a `runnerq_activities.payload`
+column. On first connect, this version moves every payload into
+`runnerq_inputs` and drops that column, in one transaction under the
+schema lock. Older versions can't use the database afterwards, so stop every
+process on an older version before starting this one: a rolling deploy that
+mixes the two will fail the old processes' enqueues and claims. The move
+reads the whole activities table once; on a large table, expect the first
+start to take a while.
 
 ## Implementing a custom backend
 

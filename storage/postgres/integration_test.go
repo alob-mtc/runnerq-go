@@ -136,6 +136,39 @@ func TestAckSuccessAlwaysStoresResult(t *testing.T) {
 
 // storage.BatchQueueStorage: one round trip claims up to limit rows in the
 // order Dequeue would have taken them, each with its own fenced token.
+// Go claims only plain-JSON inputs: an activity the TypeScript SDK enqueued
+// in its native encoding stays queued for a TypeScript worker, however high
+// its priority.
+func TestClaimsSkipInputsGoCannotRead(t *testing.T) {
+	b := testBackend(t)
+	ctx := context.Background()
+	native, plain := testActivity(3), testActivity(3)
+	native.Priority, plain.Priority = storage.PriorityCritical, storage.PriorityLow
+	for _, a := range []storage.QueuedActivity{native, plain} {
+		if err := b.Enqueue(ctx, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := b.pool.Exec(ctx, `UPDATE runnerq_inputs SET serialization = 'superjson-v1',
+		payload = '{"json":{"k":"v"},"meta":{"values":{}}}' WHERE activity_id = $1`, native.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := b.Dequeue(ctx, "w1", 0, nil)
+	if err != nil || claimed == nil || claimed.ID != plain.ID {
+		t.Fatalf("claimed %+v, %v; want the plain-JSON activity", claimed, err)
+	}
+	if again, err := b.Dequeue(ctx, "w2", 0, nil); err != nil || again != nil {
+		t.Fatalf("claimed %+v, %v; want nothing", again, err)
+	}
+	if batch, err := b.DequeueBatch(ctx, "engine:batch:1", 10, 0, nil); err != nil || len(batch) != 0 {
+		t.Fatalf("batch claimed %d, %v; want nothing", len(batch), err)
+	}
+	if status, _ := activityStatus(t, b, native.ID); status != "pending" {
+		t.Fatalf("native activity status %q, want pending", status)
+	}
+}
+
 func TestDequeueBatchClaimsInDequeueOrderWithFencedTokens(t *testing.T) {
 	b := testBackend(t)
 	ctx := context.Background()

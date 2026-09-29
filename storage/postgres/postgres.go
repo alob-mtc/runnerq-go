@@ -512,13 +512,17 @@ func (b *PostgresBackend) enqueueInTx(ctx context.Context, tx pgx.Tx, a *storage
 	}
 
 	_, err = tx.Exec(ctx, `
-		INSERT INTO runnerq_activities (
-			id, queue_name, activity_type, payload, priority, status,
-			created_at, scheduled_at, retry_count, max_retries,
-			timeout_seconds, retry_delay_seconds, max_retry_delay_seconds,
-			metadata, idempotency_key,
-			parent_activity_id, root_activity_id, depth
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
+		WITH activity AS (
+			INSERT INTO runnerq_activities (
+				id, queue_name, activity_type, priority, status,
+				created_at, scheduled_at, retry_count, max_retries,
+				timeout_seconds, retry_delay_seconds, max_retry_delay_seconds,
+				metadata, idempotency_key,
+				parent_activity_id, root_activity_id, depth
+			) VALUES ($1, $2, $3, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+		)
+		INSERT INTO runnerq_inputs (activity_id, queue_name, payload, serialization)
+		VALUES ($1, $2, $4, 'json-v1')`,
 		a.ID, b.queueName, a.ActivityType, a.Payload,
 		priorityToInt(a.Priority), status, a.CreatedAt, a.ScheduledAt,
 		int32(a.RetryCount), int32(a.MaxRetries),
@@ -583,10 +587,15 @@ const (
 	// forcing a top-1 sort over the whole eligible backlog on every claim
 	// (verified with EXPLAIN ANALYZE on a 200k-row backlog: external merge
 	// sort vs a 0.2ms index walk).
+	// Go handlers take plain JSON: an input in another encoding (the
+	// TypeScript SDK's native superjson-v1) is left for a worker that can
+	// read it. One primary-key probe per candidate row.
 	claimEligibleSQL = `
 			WHERE queue_name = $3
 			  AND status IN ('pending', 'scheduled', 'retrying', 'waiting')
-			  AND (status = 'pending' OR scheduled_at <= NOW())`
+			  AND (status = 'pending' OR scheduled_at <= NOW())
+			  AND NOT EXISTS (SELECT 1 FROM runnerq_inputs i
+			      WHERE i.activity_id = runnerq_activities.id AND i.serialization <> 'json-v1')`
 	claimOrderSQL = `
 			ORDER BY
 				priority DESC,
@@ -595,14 +604,16 @@ const (
 	claimLeaseSQL = `(EXTRACT(EPOCH FROM NOW()) * 1000)::bigint + GREATEST($2::bigint, (timeout_seconds + 10) * 1000)`
 	// claimColumnsSQL is the RETURNING list of every claim statement, in the
 	// order scanClaim reads it.
-	claimColumnsSQL = `id, activity_type, payload, priority, retry_count, max_retries,
+	claimColumnsSQL = `id, activity_type,
+			(SELECT i.payload FROM runnerq_inputs i WHERE i.activity_id = a.id),
+			priority, retry_count, max_retries,
 			timeout_seconds, retry_delay_seconds, max_retry_delay_seconds,
 			scheduled_at, metadata, idempotency_key, created_at,
 			parent_activity_id, root_activity_id, depth, current_worker_id, lease_deadline_ms`
 
 	// Single claim: $1 worker token, $2 default lease ms, $3 queue, $4 type filter.
 	dequeueSQLHead = `
-		UPDATE runnerq_activities
+		UPDATE runnerq_activities AS a
 		SET status = 'processing',
 			current_worker_id = $1,
 			started_at = NOW(),
@@ -1808,7 +1819,9 @@ func (b *PostgresBackend) tryEnqueueIdempotent(ctx context.Context, a *storage.Q
 
 func (b *PostgresBackend) ListDeadLetter(ctx context.Context, offset, limit int) ([]storage.DeadLetterRecord, error) {
 	rows, err := b.pool.Query(ctx, `
-		SELECT id, activity_type, payload, priority, status, created_at,
+		SELECT id, activity_type,
+			(SELECT i.payload FROM runnerq_inputs i WHERE i.activity_id = runnerq_activities.id),
+			priority, status, created_at,
 			scheduled_at, started_at, completed_at, current_worker_id,
 			last_worker_id, retry_count, max_retries, timeout_seconds,
 			retry_delay_seconds, last_error, last_error_at, metadata,
@@ -1851,7 +1864,9 @@ func (b *PostgresBackend) ListDeadLetter(ctx context.Context, offset, limit int)
 
 func (b *PostgresBackend) GetActivity(ctx context.Context, activityID uuid.UUID) (*storage.ActivitySnapshot, error) {
 	rows, err := b.pool.Query(ctx, `
-		SELECT id, activity_type, payload, priority, status, created_at,
+		SELECT id, activity_type,
+			(SELECT i.payload FROM runnerq_inputs i WHERE i.activity_id = runnerq_activities.id),
+			priority, status, created_at,
 			scheduled_at, started_at, completed_at, current_worker_id,
 			last_worker_id, retry_count, max_retries, timeout_seconds,
 			retry_delay_seconds, last_error, last_error_at, metadata,
@@ -1910,7 +1925,9 @@ func (b *PostgresBackend) GetActivityEvents(ctx context.Context, activityID uuid
 
 func (b *PostgresBackend) GetChildren(ctx context.Context, parentID uuid.UUID, offset, limit int) ([]storage.ActivitySnapshot, error) {
 	rows, err := b.pool.Query(ctx, `
-		SELECT id, activity_type, payload, priority, status, created_at,
+		SELECT id, activity_type,
+			(SELECT i.payload FROM runnerq_inputs i WHERE i.activity_id = runnerq_activities.id),
+			priority, status, created_at,
 			scheduled_at, started_at, completed_at, current_worker_id,
 			last_worker_id, retry_count, max_retries, timeout_seconds,
 			retry_delay_seconds, last_error, last_error_at, metadata,
@@ -1969,7 +1986,9 @@ func (b *PostgresBackend) GetActivitySteps(ctx context.Context, ownerActivityID 
 
 func (b *PostgresBackend) GetSubtree(ctx context.Context, rootID uuid.UUID) ([]storage.ActivitySnapshot, error) {
 	rows, err := b.pool.Query(ctx, `
-		SELECT id, activity_type, payload, priority, status, created_at,
+		SELECT id, activity_type,
+			(SELECT i.payload FROM runnerq_inputs i WHERE i.activity_id = runnerq_activities.id),
+			priority, status, created_at,
 			scheduled_at, started_at, completed_at, current_worker_id,
 			last_worker_id, retry_count, max_retries, timeout_seconds,
 			retry_delay_seconds, last_error, last_error_at, metadata,

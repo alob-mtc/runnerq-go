@@ -43,11 +43,16 @@ func plantTree(t *testing.T, b *PostgresBackend, rootStatus, childStatus string,
 			cAt = &completedAt
 		}
 		if _, err := b.pool.Exec(ctx, `
-			INSERT INTO runnerq_activities (id, queue_name, activity_type, payload, priority, status,
+			INSERT INTO runnerq_activities (id, queue_name, activity_type, priority, status,
 				created_at, completed_at, parent_activity_id, root_activity_id, depth)
-			VALUES ($1, $2, 'tree_member', '{}'::jsonb, 2, $3, $4, $5, $6, $7, $8)`,
+			VALUES ($1, $2, 'tree_member', 2, $3, $4, $5, $6, $7, $8)`,
 			id, b.queueName, status, completedAt.Add(-time.Minute), cAt, parent, tree.root, 0); err != nil {
 			t.Fatalf("insert activity: %v", err)
+		}
+		if _, err := b.pool.Exec(ctx, `
+			INSERT INTO runnerq_inputs (activity_id, queue_name, payload) VALUES ($1, $2, '{}'::jsonb)`,
+			id, b.queueName); err != nil {
+			t.Fatalf("insert input: %v", err)
 		}
 		if _, err := b.pool.Exec(ctx, `
 			INSERT INTO runnerq_events (activity_id, queue_name, event_type, created_at)
@@ -100,6 +105,15 @@ func rowCounts(t *testing.T, b *PostgresBackend, tree retentionTree) (activities
 		`SELECT COUNT(*) FROM runnerq_idempotency WHERE queue_name=$1 AND idempotency_key=$2`,
 		b.queueName, tree.idemKey).Scan(&idem); err != nil {
 		t.Fatalf("count idem: %v", err)
+	}
+	// Inputs go with their activities.
+	var inputs int
+	if err := b.pool.QueryRow(ctx, `SELECT COUNT(*) FROM runnerq_inputs WHERE queue_name=$1 AND activity_id = ANY($2)`,
+		b.queueName, ids).Scan(&inputs); err != nil {
+		t.Fatalf("count inputs: %v", err)
+	}
+	if inputs != activities {
+		t.Fatalf("%d inputs for %d activities", inputs, activities)
 	}
 	return
 }
@@ -210,9 +224,9 @@ func TestCleanupExpiredHandlesLegacyNullRootID(t *testing.T) {
 	legacyID := uuid.New()
 	completedAt := time.Now().UTC().Add(-2 * time.Hour)
 	if _, err := b.pool.Exec(ctx, `
-		INSERT INTO runnerq_activities (id, queue_name, activity_type, payload, priority, status,
+		INSERT INTO runnerq_activities (id, queue_name, activity_type, priority, status,
 			created_at, completed_at, parent_activity_id, root_activity_id, depth)
-		VALUES ($1, $2, 'legacy', '{}'::jsonb, 2, 'completed', $3, $3, NULL, NULL, 0)`,
+		VALUES ($1, $2, 'legacy', 2, 'completed', $3, $3, NULL, NULL, 0)`,
 		legacyID, b.queueName, completedAt); err != nil {
 		t.Fatalf("insert legacy root: %v", err)
 	}

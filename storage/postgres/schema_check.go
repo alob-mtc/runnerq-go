@@ -32,6 +32,9 @@ type schemaExpectation struct {
 	columns []string // "table.column" from ALTER TABLE ... ADD COLUMN IF NOT EXISTS
 	indexes []string // CREATE INDEX IF NOT EXISTS, plus dequeueIndexes (must be valid)
 	retired []string // dequeueIndexes predecessors (must be gone)
+	// retiredColumns ("table.column") must be gone: schemaSql moves their
+	// data and drops them.
+	retiredColumns []string
 }
 
 var (
@@ -57,6 +60,7 @@ var expectedSchema = sync.OnceValue(func() schemaExpectation {
 			e.columns = append(e.columns, table+"."+strings.ToLower(col[1]))
 		}
 	}
+	e.retiredColumns = []string{"runnerq_activities.payload"}
 	for _, idx := range dequeueIndexes {
 		e.indexes = append(e.indexes, strings.ToLower(idx.name))
 		if idx.dropAfter != "" {
@@ -67,7 +71,8 @@ var expectedSchema = sync.OnceValue(func() schemaExpectation {
 })
 
 // schemaCurrent reports whether every table, column and index the DDL would
-// create already exists (indexes valid) and every retired index is gone, in
+// create already exists (indexes valid) and every retired index and column
+// is gone, in
 // the connection's current schema. One catalog round trip, no table locks.
 func schemaCurrent(ctx context.Context, conn *pgxpool.Conn) (bool, error) {
 	e := expectedSchema()
@@ -83,8 +88,10 @@ func schemaCurrent(ctx context.Context, conn *pgxpool.Conn) (bool, error) {
 		        WHERE n.nspname = current_schema() AND c.relname = ANY($3) AND i.indisvalid) = cardinality($3::text[])
 		   AND NOT EXISTS (SELECT 1 FROM pg_class c
 		        JOIN pg_namespace n ON n.oid = c.relnamespace
-		        WHERE n.nspname = current_schema() AND c.relname = ANY($4))`,
-		e.tables, e.columns, e.indexes, e.retired).Scan(&current)
+		        WHERE n.nspname = current_schema() AND c.relname = ANY($4))
+		   AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+		        WHERE table_schema = current_schema() AND table_name || '.' || column_name = ANY($5))`,
+		e.tables, e.columns, e.indexes, e.retired, e.retiredColumns).Scan(&current)
 	if err != nil {
 		return false, databaseError(err, fmt.Sprintf("Failed to inspect schema: %v", err))
 	}
