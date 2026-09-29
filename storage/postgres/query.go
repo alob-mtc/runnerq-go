@@ -65,13 +65,15 @@ var activityFields = map[string]queryField{
 	"depth":           {expr: "a.depth", kind: kindInt},
 	"idempotency_key": {expr: "a.idempotency_key", kind: kindString, nullable: true},
 	"attempt":         {expr: "(a.retry_count + 1)", kind: kindInt},
-	"max_attempts":    {expr: "(a.max_retries + 1)", kind: kindInt},
-	"created_at":      {expr: "a.created_at", kind: kindTime},
-	"scheduled_for":   {expr: "a.scheduled_at", kind: kindTime, nullable: true},
-	"started_at":      {expr: "a.started_at", kind: kindTime, nullable: true},
-	"completed_at":    {expr: "a.completed_at", kind: kindTime, nullable: true},
-	"updated_at":      {expr: updatedAtSQL, kind: kindTime},
-	"executor_id":     {expr: "NULLIF(split_part(a.current_worker_id, ':', 1), '')", kind: kindString, nullable: true},
+	// max_retries holds the total attempts allowed (0 is unlimited, which no
+	// number matches).
+	"max_attempts":  {expr: "NULLIF(a.max_retries, 0)", kind: kindInt},
+	"created_at":    {expr: "a.created_at", kind: kindTime},
+	"scheduled_for": {expr: "a.scheduled_at", kind: kindTime, nullable: true},
+	"started_at":    {expr: "a.started_at", kind: kindTime, nullable: true},
+	"completed_at":  {expr: "a.completed_at", kind: kindTime, nullable: true},
+	"updated_at":    {expr: updatedAtSQL, kind: kindTime},
+	"executor_id":   {expr: "NULLIF(split_part(a.current_worker_id, ':', 1), '')", kind: kindString, nullable: true},
 }
 
 var eventFields = map[string]queryField{
@@ -626,7 +628,7 @@ func scanRecord(rows pgx.Rows, inc storage.RecordInclude, extra ...any) (storage
 		r.IdempotencyKey = storage.ApplicationIdempotencyKey(*idemKey, r.Type)
 	}
 	r.Attempt = int(retryCount) + 1
-	r.MaxAttempts = int(maxRetry) + 1
+	r.MaxAttempts = int(maxRetry)
 	r.Timeout = time.Duration(timeoutSeconds) * time.Second
 	if leaseMS != nil && status == "processing" {
 		t := time.UnixMilli(*leaseMS).UTC()
