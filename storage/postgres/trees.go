@@ -51,7 +51,7 @@ func (b *PostgresBackend) lockTreeForDeleteTx(ctx context.Context, tx pgx.Tx, ro
 	return pinned, nil
 }
 
-// deleteTreeTx deletes the tree rooted at root with its dependencies,
+// deleteTreeTx deletes the tree rooted at root with its inputs, dependencies,
 // results (by activity and by owner), events and idempotency keys, and
 // returns the number of activities deleted.
 func (b *PostgresBackend) deleteTreeTx(ctx context.Context, tx pgx.Tx, root uuid.UUID) (int64, error) {
@@ -79,6 +79,9 @@ func (b *PostgresBackend) deleteTreeTx(ctx context.Context, tx pgx.Tx, root uuid
 		),
 		del_idem AS (
 			DELETE FROM runnerq_idempotency WHERE queue_name = $1 AND activity_id IN (SELECT id FROM tree)
+		),
+		del_inputs AS (
+			DELETE FROM runnerq_inputs WHERE activity_id IN (SELECT id FROM tree)
 		),
 		del_act AS (
 			DELETE FROM runnerq_activities WHERE queue_name = $1 AND id IN (SELECT id FROM tree)

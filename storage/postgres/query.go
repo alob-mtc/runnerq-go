@@ -571,7 +571,7 @@ func activitySelect(inc storage.RecordInclude) (cols, joins string) {
 			ORDER BY e.created_at DESC, e.id DESC LIMIT 1
 		) y ON a.status = 'waiting'`
 	if inc.Payload {
-		cols += ", a.payload"
+		cols += ", (SELECT i.payload FROM runnerq_inputs i WHERE i.activity_id = a.id)"
 	}
 	if inc.LastError {
 		cols += ", a.last_error, a.last_error_at"
