@@ -135,8 +135,12 @@ func testQueryCanonicalFields(t *testing.T, h Harness) {
 	}
 
 	r := s.record(running.ID, storage.RecordInclude{})
-	if r.ExecutorID != "exec-1" || r.LeaseExpiresAt == nil || r.StartedAt == nil || r.Attempt != 1 || r.MaxAttempts != 4 {
+	if r.ExecutorID != "exec-1" || r.LeaseExpiresAt == nil || r.StartedAt == nil || r.Attempt != 1 || r.MaxAttempts != 3 {
 		t.Fatalf("running record %+v", r)
+	}
+	// MaxRetries is the total attempts allowed; 0 is unlimited.
+	if unlimited := s.enqueue(activity(withMaxRetries(0))); s.record(unlimited.ID, storage.RecordInclude{}).MaxAttempts != 0 {
+		t.Fatalf("unlimited activity reports max attempts %d", s.record(unlimited.ID, storage.RecordInclude{}).MaxAttempts)
 	}
 	if r.Type != "running" || r.Queue != s.queue || r.RootID != running.ID || r.ParentID != nil || r.Depth != 0 {
 		t.Fatalf("identity fields %+v", r)
