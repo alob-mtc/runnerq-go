@@ -1,11 +1,11 @@
 # RunnerQ
 
-**Durable workflows and queues for Go, backed by Postgres.**
+**Durable Golang functions, with pluggable storage.**
 
 Add crash-proof background jobs and multi-step workflows to your Go app in a
 few lines — no separate orchestrator to run, no new infrastructure. RunnerQ is
-a library: import it, point it at the Postgres you already have, and write
-workflows as ordinary Go functions. When a process crashes mid-workflow, it
+a library: import it, point it at your storage (PostgreSQL is built in), and
+write workflows as ordinary Go functions. When a process crashes mid-workflow, it
 resumes from where it left off without redoing completed work.
 
 ```go
@@ -50,9 +50,11 @@ RunnerQ gives you durable execution as a **library**:
 - **Steps are checkpointed.** Completed work is skipped on replay, so retries
   and restarts are cheap and side effects don't repeat.
 - **Workflows pause for free.** Sleep for days or wait for a webhook while
-  holding zero workers — paused workflows are just rows in Postgres.
-- **Only Postgres.** No orchestrator cluster, no broker, no control-plane
-  bill. Scale by adding stateless worker processes.
+  holding zero workers — paused workflows are just stored state.
+- **Pluggable storage.** PostgreSQL is built in; implement the storage
+  interface to use anything else ([Storage backends](docs/storage-backends.md)).
+  No orchestrator cluster, no broker, no control-plane bill. Scale by adding
+  stateless worker processes.
 
 ### When to use it
 
@@ -151,7 +153,7 @@ through the workers. Your data stays where it is. See
 |---|---|---|---|
 | Durable workflows | ✅ | ✅ | ❌ |
 | Deploy model | a Go library | a server cluster to operate | a library |
-| Infrastructure | Postgres you already run | server + its own datastore | Postgres or Redis |
+| Infrastructure | Postgres you already run, or your own storage backend | server + its own datastore | Postgres or Redis |
 | Workflow code | plain Go, step-memoized | plain code, full replay-determinism | n/a |
 | Durable timers / signals | ✅ | ✅ | ❌ |
 | Scale | add stateless worker processes | scale the cluster | add workers |
