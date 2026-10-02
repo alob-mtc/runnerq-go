@@ -197,69 +197,12 @@ func acquireSchemaLock(ctx context.Context, conn *pgxpool.Conn) error {
 	}
 }
 
-// dequeueIndexes are built CONCURRENTLY outside schemaSql so the build never
-// takes the SHARE lock that blocks writes to runnerq_activities. dropAfter is
-// the predecessor, dropped only once the replacement is valid.
-type dequeueIndex struct {
-	name      string
-	ddl       string
-	dropAfter string
-}
-
-var dequeueIndexes = []dequeueIndex{
-	{
-		// Single-type dequeue: with activity_type pinned by equality the rest
-		// of the key is the dequeue ORDER BY, so the claim is an index walk
-		// stopping at the first unlocked row.
-		name: "idx_runnerq_dequeue_effective_v2",
-		ddl: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_dequeue_effective_v2
-			ON runnerq_activities (
-				queue_name,
-				activity_type,
-				priority DESC,
-				retry_count DESC,
-				COALESCE(scheduled_at, created_at) ASC
-			)
-			WHERE status IN ('pending', 'scheduled', 'retrying', 'waiting')`,
-		dropAfter: "idx_runnerq_dequeue_effective",
-	},
-	{
-		// Untyped and multi-type dequeue: key order IS the dequeue ORDER BY,
-		// so Postgres never sorts the eligible backlog to find the top row.
-		name: "idx_runnerq_dequeue_order_v2",
-		ddl: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_dequeue_order_v2
-			ON runnerq_activities (
-				queue_name,
-				priority DESC,
-				retry_count DESC,
-				COALESCE(scheduled_at, created_at) ASC
-			)
-			WHERE status IN ('pending', 'scheduled', 'retrying', 'waiting')`,
-		dropAfter: "idx_runnerq_dequeue_order",
-	},
-	// QueryStorage: cross-queue, newest first, optionally by status or type;
-	// the id tiebreaker matches the keyset cursor.
-	{
-		name: "idx_runnerq_query_created",
-		ddl: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_query_created
-			ON runnerq_activities (created_at DESC, id DESC)`,
-	},
-	{
-		name: "idx_runnerq_query_status_created",
-		ddl: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_query_status_created
-			ON runnerq_activities (status, created_at DESC, id DESC)`,
-	},
-	{
-		name: "idx_runnerq_query_type_created",
-		ddl: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runnerq_query_type_created
-			ON runnerq_activities (activity_type, created_at DESC, id DESC)`,
-	},
-}
-
-// ensureDequeueIndexes runs on the schema-locked connection with each
-// statement autocommitting (CONCURRENTLY can't run in a transaction). INVALID
-// leftovers of failed builds are dropped and rebuilt; a predecessor is dropped
-// only after its replacement is valid, so the claim path is never unindexed.
+// ensureDequeueIndexes builds runnerq-spec's concurrent indexes (the dequeue
+// and query indexes) on the schema-locked connection, each statement
+// autocommitting: CONCURRENTLY can't run in a transaction, and a plain CREATE
+// INDEX would block writes for the whole build. INVALID leftovers of failed
+// builds are dropped and rebuilt; a predecessor is dropped only after its
+// replacement is valid, so the claim path is never unindexed.
 func (b *PostgresBackend) ensureDequeueIndexes(ctx context.Context, conn *pgxpool.Conn) error {
 	// Scope to the schema unqualified DDL resolves to: index names are unique
 	// only per schema, so an unscoped lookup could see another schema's index
@@ -268,17 +211,17 @@ func (b *PostgresBackend) ensureDequeueIndexes(ctx context.Context, conn *pgxpoo
 	if err := conn.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
 		return databaseError(err, fmt.Sprintf("Failed to resolve current schema: %v", err))
 	}
-	for _, idx := range dequeueIndexes {
+	for _, idx := range spec.PostgresConcurrentIndexes {
 		// Safe to rerun: a build killed mid-way leaves an INVALID index that
 		// ensureDequeueIndex drops before rebuilding.
-		if err := retryDeadlock(ctx, idx.name, func() error { return b.ensureDequeueIndex(ctx, conn, schema, idx) }); err != nil {
+		if err := retryDeadlock(ctx, idx.Name, func() error { return b.ensureDequeueIndex(ctx, conn, schema, idx) }); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (b *PostgresBackend) ensureDequeueIndex(ctx context.Context, conn *pgxpool.Conn, schema string, idx dequeueIndex) error {
+func (b *PostgresBackend) ensureDequeueIndex(ctx context.Context, conn *pgxpool.Conn, schema string, idx spec.PostgresConcurrentIndex) error {
 	dropIndex := func(name string) error {
 		if name == "" {
 			return nil
@@ -293,27 +236,27 @@ func (b *PostgresBackend) ensureDequeueIndex(ctx context.Context, conn *pgxpool.
 			FROM pg_index i
 			JOIN pg_class c ON c.oid = i.indexrelid
 			JOIN pg_namespace n ON n.oid = c.relnamespace
-			WHERE n.nspname = $1 AND c.relname = $2`, schema, idx.name).Scan(&valid)
+			WHERE n.nspname = $1 AND c.relname = $2`, schema, idx.Name).Scan(&valid)
 		switch {
 		case err == pgx.ErrNoRows:
 		case err != nil:
-			return databaseError(err, fmt.Sprintf("Failed to inspect index %s: %v", idx.name, err))
+			return databaseError(err, fmt.Sprintf("Failed to inspect index %s: %v", idx.Name, err))
 		case valid != nil && !*valid:
-			if err := dropIndex(idx.name); err != nil {
-				return databaseError(err, fmt.Sprintf("Failed to drop invalid index %s: %v", idx.name, err))
+			if err := dropIndex(idx.Name); err != nil {
+				return databaseError(err, fmt.Sprintf("Failed to drop invalid index %s: %v", idx.Name, err))
 			}
 		default:
-			if err := dropIndex(idx.dropAfter); err != nil {
-				return databaseError(err, fmt.Sprintf("Failed to drop superseded index %s: %v", idx.dropAfter, err))
+			if err := dropIndex(idx.Replaces); err != nil {
+				return databaseError(err, fmt.Sprintf("Failed to drop superseded index %s: %v", idx.Replaces, err))
 			}
 			return nil
 		}
 
-		if _, err := conn.Exec(ctx, idx.ddl); err != nil {
-			return databaseError(err, fmt.Sprintf("Failed to build index %s: %v", idx.name, err))
+		if _, err := conn.Exec(ctx, idx.SQL); err != nil {
+			return databaseError(err, fmt.Sprintf("Failed to build index %s: %v", idx.Name, err))
 		}
-		if err := dropIndex(idx.dropAfter); err != nil {
-			return databaseError(err, fmt.Sprintf("Failed to drop superseded index %s: %v", idx.dropAfter, err))
+		if err := dropIndex(idx.Replaces); err != nil {
+			return databaseError(err, fmt.Sprintf("Failed to drop superseded index %s: %v", idx.Replaces, err))
 		}
 	}
 	return nil

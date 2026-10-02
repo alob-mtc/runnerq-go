@@ -14,17 +14,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// The expectation is parsed from the DDL, so the parser must see every
-// object schemaSql creates: any DDL form it does not recognise would be
-// silently skipped by the fast path and never migrated.
-func TestSchemaExpectationCoversAllDDL(t *testing.T) {
+// The fast path checks for every object in the spec's catalog, so it must
+// include the ones the hot paths depend on.
+func TestSchemaExpectationCoversCatalog(t *testing.T) {
 	e := expectedSchema()
-	ddl := schemaCommentRe.ReplaceAllString(schemaSql, "")
-	ifNotExists := strings.Count(strings.ToUpper(ddl), "IF NOT EXISTS")
-	if got := len(e.tables) + len(e.columns) + len(schemaIndexRe.FindAllString(ddl, -1)); got != ifNotExists {
-		t.Fatalf("parsed %d objects from %d IF NOT EXISTS clauses; schemaSql uses a DDL form the parser does not recognise", got, ifNotExists)
-	}
-	for _, want := range []string{"runnerq_activities", "runnerq_results", "runnerq_dependencies", "runnerq_worker_pools"} {
+	for _, want := range []string{"runnerq_activities", "runnerq_results", "runnerq_dependencies", "runnerq_worker_pools", "runnerq_commands"} {
 		if !slices.Contains(e.tables, want) {
 			t.Fatalf("tables %v missing %s", e.tables, want)
 		}
@@ -34,7 +28,7 @@ func TestSchemaExpectationCoversAllDDL(t *testing.T) {
 			t.Fatalf("columns %v missing %s", e.columns, want)
 		}
 	}
-	for _, want := range []string{"idx_runnerq_root_status", "idx_runnerq_dequeue_order_v2", "idx_runnerq_dequeue_effective_v2"} {
+	for _, want := range []string{"idx_runnerq_root_status", "idx_runnerq_dequeue_order_v2", "idx_runnerq_dequeue_effective_v2", "idx_runnerq_query_created"} {
 		if !slices.Contains(e.indexes, want) {
 			t.Fatalf("indexes %v missing %s", e.indexes, want)
 		}
