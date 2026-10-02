@@ -1,6 +1,13 @@
-# RunnerQ
+# RunnerQ for Go
 
 **Durable Golang functions, with pluggable storage.**
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/alob-mtc/runnerq-go.svg)](https://pkg.go.dev/github.com/alob-mtc/runnerq-go)
+[![CI](https://github.com/runnerq/runnerq-go/actions/workflows/ci.yml/badge.svg)](https://github.com/runnerq/runnerq-go/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/runnerq/runnerq-go?sort=semver)](https://github.com/runnerq/runnerq-go/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+[Getting started](docs/getting-started.md) · [Docs](docs/) · [Examples](examples/)
 
 Add crash-proof background jobs and multi-step workflows to your Go app in a
 few lines — no separate orchestrator to run, no new infrastructure. RunnerQ is
@@ -10,8 +17,8 @@ resumes from where it left off without redoing completed work.
 
 ```go
 func (h *Checkout) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
-    // Each step is checkpointed in Postgres. Crash after the charge and
-    // restart — the charge is NOT repeated; the workflow resumes at shipping.
+    // Each step is checkpointed. Crash after the charge and restart —
+    // the charge is NOT repeated; the workflow resumes at shipping.
     receipt, err := ctx.RunStep("charge-card", func(c context.Context) (Receipt, error) {
         return chargeCard(c, payload)   // at most once per recorded success
     })
@@ -27,143 +34,19 @@ func (h *Checkout) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) 
 }
 ```
 
-```bash
-go get github.com/alob-mtc/runnerq-go
-```
-
 > See it for real: [`examples/02-crash-and-resume`](examples/02-crash-and-resume/)
 > charges an order, lets you `Ctrl-C` it, and resumes on restart without
 > double-charging. That demo is the whole pitch in 30 seconds.
 
-## Why RunnerQ
+## Install
 
-Background work that touches the real world — charging cards, sending email,
-calling APIs, orchestrating multi-step jobs — has to survive crashes,
-deploys, and retries without doing things twice. The usual options are a heavy
-workflow server (a cluster to operate) or a plain task queue (no durability —
-you hand-roll idempotency and recovery yourself).
-
-RunnerQ gives you durable execution as a **library**:
-
-- **A workflow is just a Go function.** Orchestration is normal control flow —
-  loops, conditionals, error handling — not a DSL or a DAG.
-- **Steps are checkpointed.** Completed work is skipped on replay, so retries
-  and restarts are cheap and side effects don't repeat.
-- **Workflows pause for free.** Sleep for days or wait for a webhook while
-  holding zero workers — paused workflows are just stored state.
-- **Pluggable storage.** PostgreSQL is built in; implement the storage
-  interface to use anything else ([Storage backends](docs/storage-backends.md)).
-  No orchestrator cluster, no broker, no control-plane bill. Scale by adding
-  stateless worker processes.
-
-### When to use it
-
-- **Use RunnerQ** when you want durable, crash-safe workflows or queues with
-  minimal new infrastructure, and you're already running Postgres.
-- **Reach for a dedicated workflow server** (Temporal, Cadence) if you need
-  many SDK languages or want workflow orchestration decoupled from your app
-  and your database.
-- **A plain queue** (River, Asynq, SQS) is enough if you only need
-  fire-and-forget tasks and don't need workflows, steps, signals, or durable
-  timers.
-
-## Features
-
-### Durable workflows that survive crashes
-
-A handler that calls `ctx.RunStep` steps is a durable workflow. Each step's result
-is checkpointed; if the process dies, the handler replays and completed steps
-return their stored results instead of re-executing.
-
-```go
-receipt, err := ctx.RunStep("charge-card", func(c context.Context) (Receipt, error) {
-    return chargeCard(c, payload)   // at most once, even across retries and restarts
-})
+```bash
+go get github.com/alob-mtc/runnerq-go@main
 ```
 
-### Orchestration that fast-forwards on retry
-
-Spawn child activities with `.Step(name)`. A retried parent reattaches to the
-children it already launched instead of duplicating them, and parents that
-await children **park** in the database — no goroutine, no lease, no retry
-burned while they wait.
-
-```go
-fut, _ := ctx.ActivityExecutor.Activity[Reserve]().Step("reserve").Payload(p).Execute(ctx.Ctx)
-reserved, _ := fut.GetResult(ctx.Ctx)   // memoized on replay
-```
-
-### Durable timers
-
-Sleep inside a workflow for seconds or weeks. The deadline is persisted —
-a restart resumes the remainder — and long sleeps hold no worker.
-
-```go
-ctx.Sleep("cooling-off", 24 * time.Hour)   // survives restarts; frees the worker
-```
-
-### Signals — pause for the outside world
-
-Wait for an approval, a webhook, or a payment confirmation. The workflow parks
-until a signal arrives, delivered from anywhere — even another process.
-
-```go
-decision, err := ctx.WaitForSignal("approval", 48*time.Hour)   // parks, holds no worker
-// from an HTTP handler, a Slack action, a Kafka consumer:
-engine.Signal(ctx, activityID, "approval", payload)
-```
-
-### Exactly-once enqueue
-
-Idempotency keys make enqueuing exactly-once — dedupe webhooks and event
-handlers with one option.
-
-```go
-executor.ActivityNamed("process_event").
-    Payload(p).
-    IdempotencyKeyOption(eventID, runnerq.ReturnExisting).   // duplicate deliveries collapse to one
-    Execute(ctx)
-```
-
-### A real queue underneath
-
-Priorities, exponential-backoff retries, a dead-letter queue, scheduling, and
-worker-level type filtering so slow jobs can't starve latency-sensitive ones.
-
-```go
-executor.ActivityNamed("send_email").
-    Payload(p).
-    Priority(runnerq.PriorityHigh).
-    MaxRetries(5).
-    Timeout(2 * time.Minute).
-    Delay(30 * time.Second).
-    Execute(ctx)
-```
-
-### A console in RunnerQ Cloud
-
-Connect your workers with the `conductor` agent and see every activity, its
-steps, events and results in RunnerQ Cloud, read live from your own database
-through the workers. Your data stays where it is. See
-[Observability](docs/observability.md).
-
-## How it compares
-
-| | RunnerQ | Temporal / Cadence | Plain task queue (River, Asynq, …) |
-|---|---|---|---|
-| Durable workflows | ✅ | ✅ | ❌ |
-| Deploy model | a Go library | a server cluster to operate | a library |
-| Infrastructure | Postgres you already run, or your own storage backend | server + its own datastore | Postgres or Redis |
-| Workflow code | plain Go, step-memoized | plain code, full replay-determinism | n/a |
-| Durable timers / signals | ✅ | ✅ | ❌ |
-| Scale | add stateless worker processes | scale the cluster | add workers |
-
-**The economics:** RunnerQ adds one dependency you almost certainly already
-have — Postgres. There's no orchestrator cluster to size, secure, and pay for,
-and no separate control plane. Workers are stateless; scale out by running
-more of your own binary. The trade-off versus a dedicated server is
-deliberate: durable execution that fits *inside* your app and your database,
-rather than a system you operate alongside it.
+Requires Go 1.27. The API in this README is on `main` and not in a tagged
+release yet. The latest release, v0.5.1, has the older
+[named-activity API](https://github.com/runnerq/runnerq-go/tree/v0.5.1#readme).
 
 ## Quick start
 
@@ -222,23 +105,140 @@ func main() {
 }
 ```
 
-Every registration and spawn comes in two interchangeable forms. The
-**typed** form above derives the activity name from the handler type, so
-nothing can drift; it is the one to reach for. The **named** form takes a
-string you choose, for names that must outlive a refactor, one handler
-serving several types, or producers with no Go type in scope. It is also the
-shape of the v0.5 API, which is where to stay if you cannot yet move to
-Go 1.27 (required by v0.6+).
+The **typed** form above derives the activity name from the handler type, so
+nothing can drift. When a name must outlive a refactor, use the **named** form
+(`RegisterActivityWithName`, `ActivityNamed`); see
+[Naming activities](docs/workflows.md#naming-activities).
+
+## Why RunnerQ
+
+Background work that touches the real world — charging cards, sending email,
+calling APIs, orchestrating multi-step jobs — has to survive crashes,
+deploys, and retries without doing things twice. The usual options are a heavy
+workflow server (a cluster to operate) or a plain task queue (no durability —
+you hand-roll idempotency and recovery yourself).
+
+RunnerQ gives you durable execution as a **library**:
+
+- **A workflow is just a Go function.** Orchestration is normal control flow —
+  loops, conditionals, error handling — not a DSL or a DAG.
+- **Steps are checkpointed.** Completed work is skipped on replay, so retries
+  and restarts are cheap and side effects don't repeat.
+- **Workflows pause for free.** Sleep for days or wait for a webhook while
+  holding zero workers — paused workflows are just stored state.
+- **Pluggable storage.** PostgreSQL is built in; implement the storage
+  interface to use anything else. No orchestrator cluster, no broker, no
+  control-plane bill. Scale by adding stateless worker processes.
+
+**Good fits:** charging a card exactly once, processing each webhook once,
+approval flows that wait days for a human, and fanning a batch out across
+workers. The [examples](#examples) cover each of these.
+
+## Features
+
+<details open>
+<summary><strong>Durable workflows that survive crashes</strong></summary>
+
+A handler that calls `ctx.RunStep` is a durable workflow. Each step's result
+is checkpointed; if the process dies, the handler replays and completed steps
+return their stored results instead of re-executing.
 
 ```go
-engine.RegisterActivity(&Greeting{})                       // typed
-engine.GetActivityExecutor().Activity[Greeting]()
-
-engine.RegisterActivityWithName("greeting", &Greeting{})   // named
-engine.GetActivityExecutor().ActivityNamed("greeting")
+receipt, err := ctx.RunStep("charge-card", func(c context.Context) (Receipt, error) {
+    return chargeCard(c, payload)   // at most once, even across retries and restarts
+})
 ```
 
-See [Naming activities](docs/workflows.md#naming-activities).
+</details>
+
+<details>
+<summary><strong>Orchestration that fast-forwards on retry</strong></summary>
+
+Spawn child activities with `.Step(name)`. A retried parent reattaches to the
+children it already launched instead of duplicating them, and parents that
+await children **park** in storage — no goroutine, no lease, no retry
+burned while they wait.
+
+```go
+fut, _ := ctx.ActivityExecutor.Activity[Reserve]().Step("reserve").Payload(p).Execute(ctx.Ctx)
+reserved, _ := fut.GetResult(ctx.Ctx)   // memoized on replay
+```
+
+</details>
+
+<details>
+<summary><strong>Durable timers and signals</strong></summary>
+
+Sleep inside a workflow for seconds or weeks. The deadline is persisted — a
+restart resumes the remainder — and long sleeps hold no worker.
+
+```go
+ctx.Sleep("cooling-off", 24 * time.Hour)   // survives restarts; frees the worker
+```
+
+Wait for an approval, a webhook, or a payment confirmation. The workflow parks
+until a signal arrives, delivered from anywhere — even another process.
+
+```go
+decision, err := ctx.WaitForSignal("approval", 48*time.Hour)   // parks, holds no worker
+// from an HTTP handler, a Slack action, a Kafka consumer:
+engine.Signal(ctx, activityID, "approval", payload)
+```
+
+</details>
+
+<details>
+<summary><strong>Exactly-once enqueue</strong></summary>
+
+Idempotency keys make enqueuing exactly-once — dedupe webhooks and event
+handlers with one option.
+
+```go
+executor.ActivityNamed("process_event").
+    Payload(p).
+    IdempotencyKeyOption(eventID, runnerq.ReturnExisting).   // duplicate deliveries collapse to one
+    Execute(ctx)
+```
+
+</details>
+
+<details>
+<summary><strong>A real queue underneath</strong></summary>
+
+Priorities, exponential-backoff retries, a dead-letter queue, scheduling, and
+worker-level type filtering so slow jobs can't starve latency-sensitive ones.
+
+```go
+executor.ActivityNamed("send_email").
+    Payload(p).
+    Priority(runnerq.PriorityHigh).
+    MaxRetries(5).
+    Timeout(2 * time.Minute).
+    Delay(30 * time.Second).
+    Execute(ctx)
+```
+
+</details>
+
+<details>
+<summary><strong>Pluggable storage</strong></summary>
+
+PostgreSQL is built in. To use something else, implement `storage.Storage` and
+run the conformance suite in `storage/storagetest` against it: a backend that
+passes can replace Postgres without the engine noticing. See
+[Storage backends](docs/storage-backends.md).
+
+</details>
+
+<details>
+<summary><strong>A console in RunnerQ Cloud</strong></summary>
+
+Connect your workers with the `conductor` agent and see every activity, its
+steps, events and results in RunnerQ Cloud, read live from your own database
+through the workers. Your data stays where it is. See
+[Observability](docs/observability.md).
+
+</details>
 
 ## Examples
 
@@ -259,6 +259,26 @@ own README. `docker compose up -d` once, then `go run .` in any of them.
 | 10 | [retries-and-dead-letter](examples/10-retries-and-dead-letter/) | backoff, the dead-letter queue, `OnDeadLetter` |
 | 11 | [retention](examples/11-retention/) | TTL cleanup of completed workflows |
 | 12 | [workload-isolation](examples/12-workload-isolation/) | many worker fleets sharing one queue |
+
+## How it compares
+
+| | RunnerQ | Temporal / Cadence | Plain task queue (River, Asynq, …) |
+|---|---|---|---|
+| Durable workflows | ✅ | ✅ | ❌ |
+| Deploy model | a Go library | a server cluster to operate | a library |
+| Infrastructure | Postgres you already run, or your own storage backend | server + its own datastore | Postgres or Redis |
+| Workflow code | plain Go, step-memoized | plain code, full replay-determinism | n/a |
+| Durable timers / signals | ✅ | ✅ | ❌ |
+| Scale | add stateless worker processes | scale the cluster | add workers |
+
+- **Use RunnerQ** when you want durable, crash-safe workflows or queues with
+  minimal new infrastructure, and you're already running Postgres.
+- **Reach for a dedicated workflow server** (Temporal, Cadence) if you need
+  many SDK languages or want workflow orchestration decoupled from your app
+  and your database.
+- **A plain queue** (River, Asynq, SQS) is enough if you only need
+  fire-and-forget tasks and don't need workflows, steps, signals, or durable
+  timers.
 
 ## Documentation
 
