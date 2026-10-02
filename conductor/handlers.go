@@ -14,6 +14,7 @@ import (
 
 	"github.com/alob-mtc/runnerq-go"
 	"github.com/alob-mtc/runnerq-go/executor"
+	"github.com/alob-mtc/runnerq-go/internal/spec"
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
@@ -598,7 +599,7 @@ func errorMessage(err error) string {
 // plainJSON unwraps the "json" part of the TypeScript SDK's superjson-v1
 // results, which is what the console reads; other data passes through.
 func plainJSON(r *storage.ActivityResult) json.RawMessage {
-	if r.Serialization != "superjson-v1" {
+	if r.Serialization != spec.SerializationSuperJSON {
 		return r.Data
 	}
 	var envelope struct {

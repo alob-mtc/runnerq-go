@@ -29,6 +29,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/alob-mtc/runnerq-go/internal/spec"
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
@@ -50,8 +51,8 @@ const (
 	resultIDsPerNotify = 200
 )
 
-func (b *PostgresBackend) workChannel() string   { return "rq_w_" + b.queueName }
-func (b *PostgresBackend) resultChannel() string { return "rq_r_" + b.queueName }
+func (b *PostgresBackend) workChannel() string   { return spec.WorkChannelPrefix + b.queueName }
+func (b *PostgresBackend) resultChannel() string { return spec.ResultChannelPrefix + b.queueName }
 
 type signalKind int
 

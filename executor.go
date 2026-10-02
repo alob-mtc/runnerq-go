@@ -383,11 +383,8 @@ func (w *ActivityExecutor) executeActivity(ctx context.Context, activityType str
 		if w.lineage == nil || asRoot {
 			return nil, &WorkerError{Kind: ErrQueue, Message: "Step is only valid when spawning from inside an activity handler"}
 		}
-		// A retried parent re-issuing this spawn derives the same key and gets
-		// the existing child. The "rq:step:" prefix keeps these keys apart
-		// from application keys (storage.BusinessIdempotencyKey).
 		a.IdempotencyKey = &IdempotencyConfig{
-			Key:      fmt.Sprintf("rq:step:%s:%s:%s", a.RootActivityID, w.lineage.parentID, step),
+			Key:      storage.StepIdempotencyKey(a.RootActivityID, w.lineage.parentID, step),
 			Behavior: ReturnExisting,
 		}
 	}
