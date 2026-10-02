@@ -57,3 +57,28 @@ func TestSpecStepKey(t *testing.T) {
 		}
 	}
 }
+
+func TestSpecAttemptsRemain(t *testing.T) {
+	type in struct {
+		RetryCount int `json:"retry_count"`
+		MaxRetries int `json:"max_retries"`
+	}
+	for _, c := range spectest.Load[in, bool](t, "vectors/attempts_remain.json") {
+		if got := AttemptsRemain(c.Input.RetryCount, c.Input.MaxRetries); got != c.Output {
+			t.Errorf("%s: got %v, want %v", c.Name, got, c.Output)
+		}
+	}
+}
+
+func TestSpecRetryDelay(t *testing.T) {
+	type in struct {
+		RetryCount    int   `json:"retry_count"`
+		RetryDelay    int64 `json:"retry_delay_seconds"`
+		MaxRetryDelay int64 `json:"max_retry_delay_seconds"`
+	}
+	for _, c := range spectest.Load[in, int64](t, "vectors/retry_delay.json") {
+		if got := RetryDelaySeconds(c.Input.RetryCount, c.Input.RetryDelay, c.Input.MaxRetryDelay); got != c.Output {
+			t.Errorf("%s: got %d, want %d", c.Name, got, c.Output)
+		}
+	}
+}
