@@ -1,8 +1,10 @@
 # 04 — Checkpoint Side Effects with `ctx.Run`
 
-Make non-idempotent side effects — charges, emails, external API writes —
-safe under retries. `ctx.Run` runs a function at most once per recorded
-success and replays its stored result thereafter.
+Keep side effects — charges, emails, external API writes — from repeating
+when a handler retries. `ctx.Run` runs a function at most once per recorded
+success and replays its stored result thereafter. A crash after the function
+returns but before its checkpoint commits runs it again, so still pass an
+idempotency key to the external system where it accepts one.
 
 ## What this shows
 
@@ -32,7 +34,7 @@ billing_run attempt #2
 
 ✓ done: {"charge_id":"ch_42"}
   charge ran 1 time(s); send ran 3 time(s).
-  → the charge happened exactly once despite the retries.
+  → the charge ran once despite the retries.
 ```
 
 ## The key idea
