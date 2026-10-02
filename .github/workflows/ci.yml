@@ -67,3 +67,11 @@ jobs:
         env:
           RUNNERQ_TEST_DSN: postgres://postgres:test@localhost:5432/runnerq_test
         run: go test ./... -race -count=1 -timeout=5m
+
+      # runnerq-spec's cross-language scenarios, through this SDK's driver.
+      - name: Conformance
+        env:
+          RUNNERQ_TEST_DSN: postgres://postgres:test@localhost:5432/runnerq_test
+        run: |
+          go build -o "$RUNNER_TEMP/conformancedriver" ./internal/conformancedriver
+          go run -C spec/tools/conformance . -v -driver go="$RUNNER_TEMP/conformancedriver"

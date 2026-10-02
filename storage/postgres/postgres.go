@@ -1,11 +1,13 @@
 package postgres
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -455,7 +457,7 @@ func (b *PostgresBackend) enqueueStmts(a *storage.QueuedActivity) ([]stmt, error
 			) VALUES ($1, $2, $3, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		)
 		INSERT INTO runnerq_inputs (activity_id, queue_name, payload, serialization)
-		VALUES ($1, $2, $4, $19)`,
+		VALUES ($1, $2, COALESCE($4::jsonb, 'null'::jsonb), $19)`,
 		[]any{a.ID, b.queueName, a.ActivityType, a.Payload,
 			int32(a.Priority), status, a.CreatedAt, a.ScheduledAt,
 			int32(a.RetryCount), int32(a.MaxRetries),
@@ -780,8 +782,27 @@ func (b *PostgresBackend) dequeueBatchOnce(ctx context.Context, workerIDPrefix s
 	if len(claims) == 0 {
 		return nil, nil
 	}
+	// UPDATE ... RETURNING has no order: return the claims in claim order.
+	slices.SortStableFunc(claims, func(x, y storage.DequeuedActivity) int {
+		a, b := x.Activity, y.Activity
+		if a.Priority != b.Priority {
+			return cmp.Compare(b.Priority, a.Priority)
+		}
+		if a.RetryCount != b.RetryCount {
+			return cmp.Compare(b.RetryCount, a.RetryCount)
+		}
+		return dueAt(a).Compare(dueAt(b))
+	})
 	slog.Debug("Activities claimed", "count", len(claims), "limit", limit)
 	return claims, nil
+}
+
+// dueAt is when a claimed activity became due: its schedule, else its creation.
+func dueAt(a storage.QueuedActivity) time.Time {
+	if a.ScheduledAt != nil {
+		return *a.ScheduledAt
+	}
+	return a.CreatedAt
 }
 
 func (b *PostgresBackend) AckSuccess(ctx context.Context, activityID uuid.UUID, result json.RawMessage, workerID string) error {
@@ -1006,13 +1027,15 @@ func (b *PostgresBackend) RequeueExpired(ctx context.Context, batchSize int) (ui
 	// rows don't look running.
 	rows, err := tx.Query(ctx, `
 		UPDATE runnerq_activities
-		SET retry_count = retry_count + 1,
+		SET retry_count = retry_count + CASE WHEN max_retries > 0 AND retry_count + 1 >= max_retries
+				THEN 0 ELSE 1 END,
 			status = CASE WHEN max_retries > 0 AND retry_count + 1 >= max_retries
 				THEN 'dead_letter' ELSE 'pending' END,
 			completed_at = CASE WHEN max_retries > 0 AND retry_count + 1 >= max_retries
 				THEN $3::timestamptz ELSE completed_at END,
 			last_error = $4,
 			last_error_at = $3,
+			last_worker_id = current_worker_id,
 			current_worker_id = NULL,
 			lease_deadline_ms = NULL,
 			started_at = NULL

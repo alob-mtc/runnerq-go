@@ -54,7 +54,8 @@ func testReaperAttemptAccounting(t *testing.T, h Harness) {
 	s.expire(a.ID)
 	s.reap(1)
 	snap := s.snapshot(a.ID)
-	if snap.Status != snapshotStatus["dead_letter"] || snap.RetryCount != 2 || snap.CompletedAt == nil {
+	// The dead-letter is terminal: it doesn't count another attempt.
+	if snap.Status != snapshotStatus["dead_letter"] || snap.RetryCount != 1 || snap.CompletedAt == nil {
 		t.Fatalf("after reap 2: %+v", snap)
 	}
 	s.wantEvent(a.ID, storage.EventDeadLetter)

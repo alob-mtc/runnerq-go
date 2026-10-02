@@ -309,6 +309,9 @@ checked out as the `spec` submodule:
 git submodule update --init
 go generate ./internal/spec   # after bumping spec: regenerate the constants
 RUNNERQ_TEST_DSN=postgres://... go test ./... -race
+# runnerq-spec's cross-language scenarios, through this SDK's conformance driver:
+go build -o /tmp/conformancedriver ./internal/conformancedriver
+go run -C spec/tools/conformance . -driver go=/tmp/conformancedriver
 ```
 
 The vector tests (`TestSpec*`) need the submodule; the Postgres tests need
