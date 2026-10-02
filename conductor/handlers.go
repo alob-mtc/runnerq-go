@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/alob-mtc/runnerq-go"
+	"github.com/alob-mtc/runnerq-go/conductor/internal/wire"
 	"github.com/alob-mtc/runnerq-go/executor"
 	"github.com/alob-mtc/runnerq-go/internal/spec"
 	"github.com/alob-mtc/runnerq-go/storage"
@@ -51,16 +52,16 @@ func newHandlers(engine *runnerq.WorkerEngine, forceMetadataOnly, allowControl b
 func (h *handlers) metadataOnly() bool { return h.forceMetadataOnly || h.cloudMetadataOnly.Load() }
 
 func (h *handlers) table() map[string]handlerFunc {
-	t := map[string]handlerFunc{typeExecutorDescribe: h.executorDescribe}
+	t := map[string]handlerFunc{wire.TypeExecutorDescribe: h.executorDescribe}
 	if h.qs != nil {
-		t[typeActivitiesList] = h.activitiesList
-		t[typeActivitiesGet] = h.activitiesGet
-		t[typeActivitiesCount] = h.activitiesCount
-		t[typeActivitiesAggregate] = h.activitiesAggregate
-		t[typeStepsList] = h.stepsList
-		t[typeEventsList] = h.eventsList
-		t[typeResultsGet] = h.resultsGet
-		t[typeTreesGet] = h.treesGet
+		t[wire.TypeActivitiesList] = h.activitiesList
+		t[wire.TypeActivitiesGet] = h.activitiesGet
+		t[wire.TypeActivitiesCount] = h.activitiesCount
+		t[wire.TypeActivitiesAggregate] = h.activitiesAggregate
+		t[wire.TypeStepsList] = h.stepsList
+		t[wire.TypeEventsList] = h.eventsList
+		t[wire.TypeResultsGet] = h.resultsGet
+		t[wire.TypeTreesGet] = h.treesGet
 	}
 	h.addCommands(t)
 	return t
@@ -71,27 +72,27 @@ var (
 	getIncludes    = []string{"events", "last_error", "payload", "result", "steps"}
 )
 
-func (h *handlers) capabilities() map[string]capability {
-	caps := map[string]capability{typeExecutorDescribe: {V: 1}}
+func (h *handlers) capabilities() map[string]wire.Capability {
+	caps := map[string]wire.Capability{wire.TypeExecutorDescribe: {V: 1}}
 	h.commandCapabilities(caps)
 	if h.qs == nil {
 		return caps
 	}
 	qc := h.qs.QueryCapabilities()
-	caps[typeActivitiesList] = capability{V: 1, Filters: qc.ActivityFilters, Sorts: qc.ActivitySorts, Include: recordIncludes}
-	caps[typeActivitiesGet] = capability{V: 1, Include: getIncludes}
-	caps[typeActivitiesCount] = capability{V: 1, Filters: qc.ActivityFilters}
-	metrics := []string{"count"}
+	caps[wire.TypeActivitiesList] = wire.Capability{V: 1, Filters: qc.ActivityFilters, Sorts: qc.ActivitySorts, Include: recordIncludes}
+	caps[wire.TypeActivitiesGet] = wire.Capability{V: 1, Include: getIncludes}
+	caps[wire.TypeActivitiesCount] = wire.Capability{V: 1, Filters: qc.ActivityFilters}
+	metrics := []string{string(wire.MetricCount)}
 	for _, d := range qc.Durations {
-		metrics = append(metrics, "duration."+d)
+		metrics = append(metrics, string(wire.MetricDuration)+"."+d)
 	}
-	caps[typeActivitiesAggregate] = capability{V: 1, Filters: qc.ActivityFilters, GroupBy: qc.GroupBy, Buckets: qc.Buckets, Metrics: metrics}
-	caps[typeStepsList] = capability{V: 1, Include: []string{"result"}}
-	caps[typeEventsList] = capability{V: 1, Filters: qc.EventFilters, Sorts: []string{"at"}, Include: []string{"detail"}}
-	caps[typeResultsGet] = capability{V: 1}
-	caps[typeTreesGet] = capability{V: 1, Include: recordIncludes}
-	caps[typeEventsSubscribe] = capability{V: 1, Filters: qc.EventFilters}
-	caps[typeEventsUnsubscribe] = capability{V: 1}
+	caps[wire.TypeActivitiesAggregate] = wire.Capability{V: 1, Filters: qc.ActivityFilters, GroupBy: qc.GroupBy, Buckets: qc.Buckets, Metrics: metrics}
+	caps[wire.TypeStepsList] = wire.Capability{V: 1, Include: []string{"result"}}
+	caps[wire.TypeEventsList] = wire.Capability{V: 1, Filters: qc.EventFilters, Sorts: []string{"at"}, Include: []string{"detail"}}
+	caps[wire.TypeResultsGet] = wire.Capability{V: 1}
+	caps[wire.TypeTreesGet] = wire.Capability{V: 1, Include: recordIncludes}
+	caps[wire.TypeEventsSubscribe] = wire.Capability{V: 1, Filters: qc.EventFilters}
+	caps[wire.TypeEventsUnsubscribe] = wire.Capability{V: 1}
 	return caps
 }
 
@@ -103,20 +104,23 @@ func decode[T any](data json.RawMessage) (T, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields() // an unknown request field could change meaning
 	if err := dec.Decode(&v); err != nil {
-		return v, errorf(codeInvalidArgument, "decode request: %v", err)
+		if field, ok := unknownField(err); ok {
+			return v, fieldError(wire.CodeInvalidArgument, field, "unknown field %q", field)
+		}
+		return v, errorf(wire.CodeInvalidArgument, "decode request: %v", err)
 	}
 	return v, nil
 }
 
 // toStorageFilter keeps filter values in their JSON types.
-func toStorageFilter(f *wireFilter) (*storage.QueryFilter, error) {
+func toStorageFilter(f *wire.Filter) (*storage.QueryFilter, error) {
 	if f == nil {
 		return nil, nil
 	}
-	out := &storage.QueryFilter{Field: f.Field, Op: f.Op}
+	out := &storage.QueryFilter{Field: f.Field, Op: string(f.Op)}
 	if len(f.Value) > 0 {
 		if err := json.Unmarshal(f.Value, &out.Value); err != nil {
-			return nil, fieldError(codeInvalidArgument, f.Field, "invalid filter value")
+			return nil, fieldError(wire.CodeInvalidArgument, f.Field, "invalid filter value")
 		}
 	}
 	for _, t := range f.And {
@@ -148,10 +152,10 @@ func (h *handlers) includes(list, allowed []string) (map[string]bool, error) {
 	out := map[string]bool{}
 	for _, inc := range list {
 		if !slices.Contains(allowed, inc) {
-			return nil, fieldError(codeUnsupported, "include", "cannot include %q", inc)
+			return nil, fieldError(wire.CodeUnsupported, "include", "cannot include %q", inc)
 		}
 		if h.metadataOnly() && (inc == "payload" || inc == "result" || inc == "last_error" || inc == "detail") {
-			return nil, fieldError(codeForbidden, "include", "%s is not sent in metadata-only mode", inc)
+			return nil, fieldError(wire.CodeForbidden, "include", "%s is not sent in metadata-only mode", inc)
 		}
 		out[inc] = true
 	}
@@ -178,26 +182,26 @@ func tsp(t *time.Time) string {
 	return ts(*t)
 }
 
-func toResult(r *storage.ActivityResult) *result {
+func toResult(r *storage.ActivityResult) *wire.Result {
 	if r == nil {
 		return nil
 	}
 	if r.State == storage.ResultOk {
-		return &result{State: "ok", Data: plainJSON(r)}
+		return &wire.Result{State: wire.ResultOK, Data: plainJSON(r)}
 	}
 	var e struct {
 		Error string `json:"error"`
 		Type  string `json:"type"`
 	}
 	if json.Unmarshal(r.Data, &e) == nil && e.Error != "" {
-		return &result{State: "error", Error: &errorInfo{Message: e.Error, Kind: e.Type}}
+		return &wire.Result{State: wire.ResultError, Error: &wire.ErrorInfo{Message: e.Error, Kind: e.Type}}
 	}
-	return &result{State: "error", Data: r.Data}
+	return &wire.Result{State: wire.ResultError, Data: r.Data}
 }
 
-func toActivity(r storage.ActivityRecord) activityView {
-	v := activityView{
-		ID: r.ID.String(), Type: r.Type, Queue: r.Queue, Status: r.Status, Priority: r.Priority,
+func toActivity(r storage.ActivityRecord) wire.Activity {
+	v := wire.Activity{
+		ID: r.ID.String(), Type: r.Type, Queue: r.Queue, Status: wire.ActivityStatus(r.Status), Priority: r.Priority,
 		RootID: r.RootID.String(), Depth: r.Depth, IdempotencyKey: r.IdempotencyKey,
 		Attempt: r.Attempt, MaxAttempts: r.MaxAttempts, CreatedAt: ts(r.CreatedAt),
 		ScheduledFor: tsp(r.ScheduledFor), StartedAt: tsp(r.StartedAt), CompletedAt: tsp(r.CompletedAt),
@@ -208,29 +212,29 @@ func toActivity(r storage.ActivityRecord) activityView {
 		v.ParentID = r.ParentID.String()
 	}
 	if r.Wait != nil {
-		v.Wait = &wait{Kind: r.Wait.Kind, Name: r.Wait.Name, Until: tsp(r.Wait.Until)}
+		v.Wait = &wire.Wait{Kind: wire.WaitKind(r.Wait.Kind), Name: r.Wait.Name, Until: tsp(r.Wait.Until)}
 	}
 	if r.LastError != nil {
-		v.LastError = &errorInfo{Message: r.LastError.Message, Kind: r.LastError.Kind, At: tsp(r.LastError.At)}
+		v.LastError = &wire.ErrorInfo{Message: r.LastError.Message, Kind: r.LastError.Kind, At: tsp(r.LastError.At)}
 	}
 	return v
 }
 
-func toActivities(items []storage.ActivityRecord) []activityView {
-	out := make([]activityView, 0, len(items))
+func toActivities(items []storage.ActivityRecord) []wire.Activity {
+	out := make([]wire.Activity, 0, len(items))
 	for _, r := range items {
 		out = append(out, toActivity(r))
 	}
 	return out
 }
 
-func toStep(s storage.StepEntry) stepView {
-	v := stepView{
-		ID: s.ID.String(), ActivityID: s.ActivityID.String(), Name: s.Name, Kind: s.Kind,
-		Status: "completed", CreatedAt: ts(s.CreatedAt),
+func toStep(s storage.StepEntry) wire.Step {
+	v := wire.Step{
+		ID: s.ID.String(), ActivityID: s.ActivityID.String(), Name: s.Name, Kind: wire.StepKind(s.Kind),
+		Status: wire.StatusCompleted, CreatedAt: ts(s.CreatedAt),
 	}
 	if s.State != storage.ResultOk {
-		v.Status = "failed"
+		v.Status = wire.StatusFailed
 	}
 	if s.Data != nil {
 		v.Result = toResult(&storage.ActivityResult{State: s.State, Data: s.Data})
@@ -238,15 +242,15 @@ func toStep(s storage.StepEntry) stepView {
 	return v
 }
 
-func toEvent(e storage.EventRecord) eventView {
-	return eventView{
+func toEvent(e storage.EventRecord) wire.Event {
+	return wire.Event{
 		ID: e.Cursor, Cursor: e.Cursor, ActivityID: e.ActivityID.String(), Type: e.Type,
 		At: ts(e.At), ExecutorID: e.ExecutorID, Detail: e.Detail,
 	}
 }
 
 func (h *handlers) activitiesList(ctx context.Context, data json.RawMessage) (any, error) {
-	q, err := decode[query](data)
+	q, err := decode[wire.Query](data)
 	if err != nil {
 		return nil, err
 	}
@@ -268,30 +272,30 @@ func (h *handlers) activitiesList(ctx context.Context, data json.RawMessage) (an
 	if err != nil {
 		return nil, err
 	}
-	return page[activityView]{Items: toActivities(res.Items), NextCursor: res.NextCursor}, nil
+	return wire.ActivityPage{Items: toActivities(res.Items), NextCursor: res.NextCursor}, nil
 }
 
 // oneSort accepts at most one sort key (the backend adds the tiebreaker).
-func oneSort(sorts []wireSort) (*storage.QuerySort, error) {
+func oneSort(sorts []wire.Sort) (*storage.QuerySort, error) {
 	switch len(sorts) {
 	case 0:
 		return nil, nil
 	case 1:
 	default:
-		return nil, fieldError(codeUnsupported, "sort", "only one sort key is supported")
+		return nil, fieldError(wire.CodeUnsupported, "sort", "only one sort key is supported")
 	}
 	s := sorts[0]
 	switch s.Order {
-	case "", "desc":
+	case "", wire.OrderDesc:
 		return &storage.QuerySort{Field: s.Field, Desc: true}, nil
-	case "asc":
+	case wire.OrderAsc:
 		return &storage.QuerySort{Field: s.Field}, nil
 	}
-	return nil, fieldError(codeInvalidArgument, "sort", "order must be asc or desc")
+	return nil, fieldError(wire.CodeInvalidArgument, "sort", "order must be asc or desc")
 }
 
 func (h *handlers) activitiesGet(ctx context.Context, data json.RawMessage) (any, error) {
-	req, err := decode[getRequest](data)
+	req, err := decode[wire.GetRequest](data)
 	if err != nil {
 		return nil, err
 	}
@@ -301,7 +305,7 @@ func (h *handlers) activitiesGet(ctx context.Context, data json.RawMessage) (any
 	}
 	id, ok := parseID(req.ID)
 	if !ok {
-		return nil, errorf(codeNotFound, "activity %q not found", req.ID)
+		return nil, errorf(wire.CodeNotFound, "activity %q not found", req.ID)
 	}
 	res, err := h.qs.QueryActivities(ctx, storage.ActivityQuery{
 		Filter:  &storage.QueryFilter{Field: "id", Op: storage.OpEq, Value: id.String()},
@@ -311,7 +315,7 @@ func (h *handlers) activitiesGet(ctx context.Context, data json.RawMessage) (any
 		return nil, err
 	}
 	if len(res.Items) == 0 {
-		return nil, errorf(codeNotFound, "activity %q not found", req.ID)
+		return nil, errorf(wire.CodeNotFound, "activity %q not found", req.ID)
 	}
 	v := toActivity(res.Items[0])
 	if inc["steps"] {
@@ -319,7 +323,7 @@ func (h *handlers) activitiesGet(ctx context.Context, data json.RawMessage) (any
 		if err != nil {
 			return nil, err
 		}
-		list := make([]stepView, 0, len(steps.Items))
+		list := make([]wire.Step, 0, len(steps.Items))
 		for _, s := range steps.Items {
 			list = append(list, toStep(s))
 		}
@@ -333,7 +337,7 @@ func (h *handlers) activitiesGet(ctx context.Context, data json.RawMessage) (any
 		if err != nil {
 			return nil, err
 		}
-		list := make([]eventView, 0, len(events.Items))
+		list := make([]wire.Event, 0, len(events.Items))
 		for _, e := range events.Items {
 			list = append(list, toEvent(e))
 		}
@@ -343,7 +347,7 @@ func (h *handlers) activitiesGet(ctx context.Context, data json.RawMessage) (any
 }
 
 func (h *handlers) activitiesCount(ctx context.Context, data json.RawMessage) (any, error) {
-	req, err := decode[countRequest](data)
+	req, err := decode[wire.CountRequest](data)
 	if err != nil {
 		return nil, err
 	}
@@ -355,7 +359,7 @@ func (h *handlers) activitiesCount(ctx context.Context, data json.RawMessage) (a
 	if err != nil {
 		return nil, err
 	}
-	return countResult{Count: n, Exact: exact}, nil
+	return wire.CountResult{Count: n, Exact: exact}, nil
 }
 
 func parseTime(field, s string) (*time.Time, error) {
@@ -364,13 +368,13 @@ func parseTime(field, s string) (*time.Time, error) {
 	}
 	t, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil {
-		return nil, fieldError(codeInvalidArgument, field, "expected an RFC 3339 timestamp")
+		return nil, fieldError(wire.CodeInvalidArgument, field, "expected an RFC 3339 timestamp")
 	}
 	return &t, nil
 }
 
 func (h *handlers) activitiesAggregate(ctx context.Context, data json.RawMessage) (any, error) {
-	req, err := decode[aggregateRequest](data)
+	req, err := decode[wire.AggregateRequest](data)
 	if err != nil {
 		return nil, err
 	}
@@ -381,12 +385,12 @@ func (h *handlers) activitiesAggregate(ctx context.Context, data json.RawMessage
 	q := storage.AggregateQuery{Filter: filter, GroupBy: req.GroupBy, Limit: req.Limit}
 	for _, m := range req.Metrics {
 		switch m.Name {
-		case "count":
+		case wire.MetricCount:
 			q.Count = true
-		case "duration":
-			q.Durations = append(q.Durations, storage.DurationMetric{Field: m.Field, Percentiles: m.Percentiles})
+		case wire.MetricDuration:
+			q.Durations = append(q.Durations, storage.DurationMetric{Field: string(m.Field), Percentiles: m.Percentiles})
 		default:
-			return nil, fieldError(codeUnsupported, "metrics", "unknown metric %q", m.Name)
+			return nil, fieldError(wire.CodeUnsupported, "metrics", "unknown metric %q", m.Name)
 		}
 	}
 	if b := req.Bucket; b != nil {
@@ -404,9 +408,9 @@ func (h *handlers) activitiesAggregate(ctx context.Context, data json.RawMessage
 	if err != nil {
 		return nil, err
 	}
-	out := aggregateResult{Groups: make([]aggregateGroup, 0, len(rows.Rows)), Truncated: rows.Truncated}
+	out := wire.AggregateResult{Groups: make([]wire.AggregateGroup, 0, len(rows.Rows)), Truncated: rows.Truncated}
 	for _, r := range rows.Rows {
-		g := aggregateGroup{Key: r.Key, Bucket: tsp(r.Bucket), Durations: r.Durations}
+		g := wire.AggregateGroup{Key: r.Key, Bucket: tsp(r.Bucket), Durations: r.Durations}
 		if q.Count {
 			n := r.Count
 			g.Count = &n
@@ -417,7 +421,7 @@ func (h *handlers) activitiesAggregate(ctx context.Context, data json.RawMessage
 }
 
 func (h *handlers) stepsList(ctx context.Context, data json.RawMessage) (any, error) {
-	req, err := decode[stepsRequest](data)
+	req, err := decode[wire.StepsRequest](data)
 	if err != nil {
 		return nil, err
 	}
@@ -427,13 +431,13 @@ func (h *handlers) stepsList(ctx context.Context, data json.RawMessage) (any, er
 	}
 	id, ok := parseID(req.ActivityID)
 	if !ok {
-		return page[stepView]{Items: []stepView{}}, nil
+		return wire.StepPage{Items: []wire.Step{}}, nil
 	}
 	res, err := h.qs.ListStepEntries(ctx, id, inc["result"], req.Limit, req.Cursor)
 	if err != nil {
 		return nil, err
 	}
-	out := page[stepView]{Items: make([]stepView, 0, len(res.Items)), NextCursor: res.NextCursor}
+	out := wire.StepPage{Items: make([]wire.Step, 0, len(res.Items)), NextCursor: res.NextCursor}
 	for _, s := range res.Items {
 		out.Items = append(out.Items, toStep(s))
 	}
@@ -441,7 +445,7 @@ func (h *handlers) stepsList(ctx context.Context, data json.RawMessage) (any, er
 }
 
 func (h *handlers) eventsList(ctx context.Context, data json.RawMessage) (any, error) {
-	q, err := decode[query](data)
+	q, err := decode[wire.Query](data)
 	if err != nil {
 		return nil, err
 	}
@@ -458,7 +462,7 @@ func (h *handlers) eventsList(ctx context.Context, data json.RawMessage) (any, e
 		return nil, err
 	} else if sort != nil {
 		if sort.Field != "at" {
-			return nil, fieldError(codeUnsupported, "sort", "events sort by at only")
+			return nil, fieldError(wire.CodeUnsupported, "sort", "events sort by at only")
 		}
 		eq.Desc = sort.Desc
 	}
@@ -466,7 +470,7 @@ func (h *handlers) eventsList(ctx context.Context, data json.RawMessage) (any, e
 	if err != nil {
 		return nil, err
 	}
-	out := page[eventView]{Items: make([]eventView, 0, len(res.Items)), NextCursor: res.NextCursor}
+	out := wire.EventPage{Items: make([]wire.Event, 0, len(res.Items)), NextCursor: res.NextCursor}
 	for _, e := range res.Items {
 		out.Items = append(out.Items, toEvent(e))
 	}
@@ -475,28 +479,28 @@ func (h *handlers) eventsList(ctx context.Context, data json.RawMessage) (any, e
 
 func (h *handlers) resultsGet(ctx context.Context, data json.RawMessage) (any, error) {
 	if h.metadataOnly() {
-		return nil, errorf(codeForbidden, "results are not sent in metadata-only mode")
+		return nil, errorf(wire.CodeForbidden, "results are not sent in metadata-only mode")
 	}
-	req, err := decode[resultRequest](data)
+	req, err := decode[wire.ResultRequest](data)
 	if err != nil {
 		return nil, err
 	}
 	id, ok := parseID(req.ActivityID)
 	if !ok {
-		return nil, errorf(codeNotFound, "no result for activity %q", req.ActivityID)
+		return nil, errorf(wire.CodeNotFound, "no result for activity %q", req.ActivityID)
 	}
 	res, err := h.backend.GetResult(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	if res == nil {
-		return nil, errorf(codeNotFound, "no result for activity %q", req.ActivityID)
+		return nil, errorf(wire.CodeNotFound, "no result for activity %q", req.ActivityID)
 	}
 	return toResult(res), nil
 }
 
 func (h *handlers) treesGet(ctx context.Context, data json.RawMessage) (any, error) {
-	req, err := decode[treeRequest](data)
+	req, err := decode[wire.TreeRequest](data)
 	if err != nil {
 		return nil, err
 	}
@@ -506,51 +510,56 @@ func (h *handlers) treesGet(ctx context.Context, data json.RawMessage) (any, err
 	}
 	id, ok := parseID(req.ID)
 	if !ok {
-		return nil, errorf(codeNotFound, "activity %q not found", req.ID)
+		return nil, errorf(wire.CodeNotFound, "activity %q not found", req.ID)
 	}
 	tree, err := h.qs.GetActivityTree(ctx, id, recordInclude(inc), req.MaxNodes)
 	if err != nil {
 		return nil, err
 	}
-	return treeView{RootID: tree.RootID.String(), Items: toActivities(tree.Items), Truncated: tree.Truncated}, nil
+	return wire.Tree{RootID: tree.RootID.String(), Items: toActivities(tree.Items), Truncated: tree.Truncated}, nil
 }
 
 // state includes the in-flight list when withRunning (describe), not just
 // its size (periodic reports).
-func (h *handlers) state(withRunning bool) executorState {
+func (h *handlers) state(withRunning bool) wire.ExecutorState {
 	return stateOf(h.engine.Snapshot(), h.started, withRunning)
 }
 
 // stateOf counts uptime from started when the engine hasn't started.
-func stateOf(snap executor.Snapshot, started time.Time, withRunning bool) executorState {
+func stateOf(snap executor.Snapshot, started time.Time, withRunning bool) wire.ExecutorState {
 	if !snap.Info.StartedAt.IsZero() {
 		started = snap.Info.StartedAt
 	}
 	c := snap.Counters
-	st := executorState{
+	st := wire.ExecutorState{
 		ID:                snap.Info.ID,
 		UptimeMS:          snap.At.Sub(started).Milliseconds(),
 		MaxConcurrency:    snap.Info.MaxConcurrency,
 		InFlight:          len(snap.State.Running),
 		Draining:          snap.State.Draining,
 		ClaimLagMS:        c.LastClaimLag.Milliseconds(),
-		HeartbeatFailures: c.HeartbeatFailures,
-		Counters: &executorCounters{
-			Claimed: c.Claimed, Succeeded: c.Succeeded, Retried: c.Retried, Failed: c.Failed,
-			TimedOut: c.TimedOut, DeadLettered: c.DeadLettered, ClaimsLost: c.ClaimsLost,
+		HeartbeatFailures: int64(c.HeartbeatFailures),
+		Counters: wire.ExecutorCounters{
+			Claimed: int64(c.Claimed), Succeeded: int64(c.Succeeded), Retried: int64(c.Retried), Failed: int64(c.Failed),
+			TimedOut: int64(c.TimedOut), DeadLettered: int64(c.DeadLettered), ClaimsLost: int64(c.ClaimsLost),
 		},
 	}
 	if withRunning {
+		running := make([]wire.RunningActivity, 0, len(snap.State.Running))
 		for _, a := range snap.State.Running {
-			st.Running = append(st.Running, runningActivity{
+			running = append(running, wire.RunningActivity{
 				ActivityID: a.ID.String(), Type: a.Type, Attempt: a.Attempt, StartedAt: ts(a.StartedAt),
 			})
 		}
+		st.Running = &running
 	}
 	return st
 }
 
-func (h *handlers) executorDescribe(context.Context, json.RawMessage) (any, error) {
+func (h *handlers) executorDescribe(_ context.Context, data json.RawMessage) (any, error) {
+	if _, err := decode[wire.Empty](data); err != nil {
+		return nil, err
+	}
 	return h.state(true), nil
 }
 
@@ -564,17 +573,17 @@ func toWireError(err error) *wireError {
 		var e *wireError
 		switch se.Kind {
 		case storage.ErrInvalidArgument:
-			e = errorf(codeInvalidArgument, "%s", se.Message)
+			e = errorf(wire.CodeInvalidArgument, "%s", se.Message)
 		case storage.ErrUnsupported:
-			e = errorf(codeUnsupported, "%s", se.Message)
+			e = errorf(wire.CodeUnsupported, "%s", se.Message)
 		case storage.ErrNotFound:
-			e = errorf(codeNotFound, "%s", se.Message)
+			e = errorf(wire.CodeNotFound, "%s", se.Message)
 		case storage.ErrConflict:
-			e = errorf(codeConflict, "%s", se.Message)
+			e = errorf(wire.CodeConflict, "%s", se.Message)
 		case storage.ErrUnavailable, storage.ErrTimeout:
-			e = errorf(codeUnavailable, "%s", se.Message)
+			e = errorf(wire.CodeUnavailable, "%s", se.Message)
 		default:
-			e = errorf(codeInternal, "%s", errorMessage(err))
+			e = errorf(wire.CodeInternal, "%s", errorMessage(err))
 		}
 		if se.Field != "" {
 			e.Details = map[string]any{"field": se.Field}
@@ -582,9 +591,9 @@ func toWireError(err error) *wireError {
 		return e
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		return errorf(codeDeadlineExceeded, "the request ran past its deadline")
+		return errorf(wire.CodeDeadlineExceeded, "the request ran past its deadline")
 	}
-	return errorf(codeInternal, "%s", errorMessage(err))
+	return errorf(wire.CodeInternal, "%s", errorMessage(err))
 }
 
 // errorMessage keeps internal error text to one line on the wire.

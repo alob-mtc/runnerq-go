@@ -43,9 +43,10 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      # internal/spec is generated from the pinned runnerq-spec submodule.
-      - name: Spec constants are current
-        run: go generate ./internal/spec && git diff --exit-code
+      # internal/spec and the conductor's wire types are generated from the
+      # pinned runnerq-spec submodule.
+      - name: Generated spec code is current
+        run: go generate ./internal/spec ./conductor/internal/wire && git diff --exit-code
 
       # gofmt check — fails the job if any tracked .go file would be
       # rewritten. Cheap and catches accidental mis-formatting before review.

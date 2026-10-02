@@ -12,6 +12,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 	"github.com/google/uuid"
 
+	"github.com/alob-mtc/runnerq-go/conductor/internal/wire"
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
@@ -60,9 +61,9 @@ func (s *streams) close() {
 func (s *streams) subscribe(ctx context.Context, data json.RawMessage) (any, error) {
 	qs := s.a.h.qs
 	if qs == nil {
-		return nil, errorf(codeUnsupported, "this agent's storage cannot stream events")
+		return nil, errorf(wire.CodeUnsupported, "this agent's storage cannot stream events")
 	}
-	req, err := decode[subscribeRequest](data)
+	req, err := decode[wire.EventsSubscribe](data)
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +109,7 @@ func (s *streams) subscribe(ctx context.Context, data json.RawMessage) (any, err
 	s.mu.Lock()
 	if len(s.subs) >= maxSubscriptions {
 		s.mu.Unlock()
-		return nil, errorf(codeResourceExhausted, "at most %d event subscriptions per executor", maxSubscriptions)
+		return nil, errorf(wire.CodeResourceExhausted, "at most %d event subscriptions per executor", maxSubscriptions)
 	}
 	id := "sub_" + uuid.NewString()
 	sctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
@@ -127,15 +128,15 @@ func (s *streams) subscribe(ctx context.Context, data json.RawMessage) (any, err
 	go func() {
 		defer s.wg.Done()
 		if gap {
-			t.push(sctx, typeStreamGap, streamGap{SubscriptionID: id, SinceCursor: req.AfterCursor})
+			t.push(sctx, wire.TypeStreamGap, wire.StreamGap{SubscriptionID: id, SinceCursor: req.AfterCursor})
 		}
 		t.run(sctx)
 	}()
-	return subscription{SubscriptionID: id, Cursor: strconv.FormatInt(cursor, 10)}, nil
+	return wire.Subscription{SubscriptionID: id, Cursor: strconv.FormatInt(cursor, 10)}, nil
 }
 
 func (s *streams) unsubscribe(_ context.Context, data json.RawMessage) (any, error) {
-	req, err := decode[subscription](data)
+	req, err := decode[wire.EventsUnsubscribe](data)
 	if err != nil {
 		return nil, err
 	}
@@ -144,10 +145,10 @@ func (s *streams) unsubscribe(_ context.Context, data json.RawMessage) (any, err
 	delete(s.subs, req.SubscriptionID)
 	s.mu.Unlock()
 	if !ok {
-		return nil, errorf(codeNotFound, "no subscription %q", req.SubscriptionID)
+		return nil, errorf(wire.CodeNotFound, "no subscription %q", req.SubscriptionID)
 	}
 	cancel()
-	return struct{}{}, nil
+	return wire.Empty{}, nil
 }
 
 type tailer struct {
@@ -246,7 +247,7 @@ func (t *tailer) poll(ctx context.Context) (bool, error) {
 func (t *tailer) send(ctx context.Context, events []storage.EventRecord) error {
 	budget := int(t.s.a.peerFrameLimit.Load()) - 1024 // the margin serve leaves too
 	var (
-		items []eventView
+		items []wire.Event
 		ids   []int64
 		size  int
 	)
@@ -258,7 +259,7 @@ func (t *tailer) send(ctx context.Context, events []storage.EventRecord) error {
 		for _, id := range ids {
 			cursor = max(cursor, id)
 		}
-		if err := t.push(ctx, typeStreamEvents, streamEvents{SubscriptionID: t.id, Items: items, Cursor: strconv.FormatInt(cursor, 10)}); err != nil {
+		if err := t.push(ctx, wire.TypeStreamEvents, wire.StreamEvents{SubscriptionID: t.id, Items: items, Cursor: strconv.FormatInt(cursor, 10)}); err != nil {
 			return err
 		}
 		for _, id := range ids {

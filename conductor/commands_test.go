@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/alob-mtc/runnerq-go"
+	"github.com/alob-mtc/runnerq-go/conductor/internal/wire"
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
@@ -96,9 +97,9 @@ func spawn(t *testing.T, e *runnerq.WorkerEngine, activityType string, opts ...f
 
 func (g *fakeGateway) status(id uuid.UUID) string {
 	g.t.Helper()
-	var a activityView
-	g.ok(typeActivitiesGet, getRequest{ID: id.String()}, &a)
-	return a.Status
+	var a wire.Activity
+	g.ok(wire.TypeActivitiesGet, wire.GetRequest{ID: id.String()}, &a)
+	return string(a.Status)
 }
 
 func (g *fakeGateway) waitStatus(id uuid.UUID, want string) {
@@ -117,7 +118,7 @@ func (g *fakeGateway) waitStatus(id uuid.UUID, want string) {
 
 func TestCommandsNeedAllowControl(t *testing.T) {
 	e, _, _ := pgEngine(t)
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	startAgent(t, e, g, Config{})
 	h := g.waitHello()
 	for msgType := range commandKinds {
@@ -125,15 +126,15 @@ func TestCommandsNeedAllowControl(t *testing.T) {
 			t.Fatalf("%s advertised without AllowControl", msgType)
 		}
 	}
-	g.fails(typeActivitiesCancel, commandRequest{Target: commandTarget{IDs: []string{uuid.NewString()}}}, codeUnsupported)
+	g.fails(wire.TypeActivitiesCancel, wire.CancelRequest{Target: wire.Target{IDs: []string{uuid.NewString()}}}, wire.CodeUnsupported)
 }
 
 func TestCancelStopsRunningHandler(t *testing.T) {
 	e, blocker, _ := controlEngine(t)
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	startAgent(t, e, g, Config{AllowControl: true})
 	h := g.waitHello()
-	if c := h.Capabilities[typeActivitiesSignal]; len(c.Targets) != 3 {
+	if c := h.Capabilities[wire.TypeActivitiesSignal]; len(c.Targets) != 3 {
 		t.Fatalf("signal capability %+v", c)
 	}
 	runEngine(t, e)
@@ -145,8 +146,8 @@ func TestCancelStopsRunningHandler(t *testing.T) {
 		t.Fatal("blocker never started")
 	}
 
-	var res commandResult
-	g.ok(typeActivitiesCancel, commandRequest{CommandID: "c-1", Reason: "stuck", Target: commandTarget{IDs: []string{id.String()}}}, &res)
+	var res wire.CommandResult
+	g.ok(wire.TypeActivitiesCancel, wire.CancelRequest{CommandID: "c-1", Reason: "stuck", Target: wire.Target{IDs: []string{id.String()}}}, &res)
 	if res.Applied != 1 || res.Results[0].Status != storage.RecordStatusCancelled {
 		t.Fatalf("cancel %+v", res)
 	}
@@ -163,17 +164,17 @@ func TestCancelStopsRunningHandler(t *testing.T) {
 		t.Fatalf("status %q after the handler stopped", st)
 	}
 
-	var again commandResult
-	g.ok(typeActivitiesCancel, commandRequest{CommandID: "c-1", Reason: "stuck", Target: commandTarget{IDs: []string{id.String()}}}, &again)
+	var again wire.CommandResult
+	g.ok(wire.TypeActivitiesCancel, wire.CancelRequest{CommandID: "c-1", Reason: "stuck", Target: wire.Target{IDs: []string{id.String()}}}, &again)
 	if !again.Replayed || again.Applied != 1 {
 		t.Fatalf("replay %+v", again)
 	}
-	g.fails(typeActivitiesCancel, commandRequest{CommandID: "c-1", Reason: "different", Target: commandTarget{IDs: []string{id.String()}}}, codeConflict)
+	g.fails(wire.TypeActivitiesCancel, wire.CancelRequest{CommandID: "c-1", Reason: "different", Target: wire.Target{IDs: []string{id.String()}}}, wire.CodeConflict)
 }
 
 func TestCancelledChildFailsAwaitingParent(t *testing.T) {
 	e, blocker, _ := controlEngine(t)
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	startAgent(t, e, g, Config{AllowControl: true})
 	g.waitHello()
 	runEngine(t, e)
@@ -185,14 +186,14 @@ func TestCancelledChildFailsAwaitingParent(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("child never started")
 	}
-	var res commandResult
-	g.ok(typeActivitiesCancel, commandRequest{Cascade: "none", Target: commandTarget{IDs: []string{child.String()}}}, &res)
+	var res wire.CommandResult
+	g.ok(wire.TypeActivitiesCancel, wire.CancelRequest{Cascade: wire.CascadeNone, Target: wire.Target{IDs: []string{child.String()}}}, &res)
 	if res.Applied != 1 {
 		t.Fatalf("cancel %+v", res)
 	}
 	g.waitStatus(parent, storage.RecordStatusCompleted)
-	var r result
-	g.ok(typeResultsGet, resultRequest{ActivityID: parent.String()}, &r)
+	var r wire.Result
+	g.ok(wire.TypeResultsGet, wire.ResultRequest{ActivityID: parent.String()}, &r)
 	if !strings.Contains(string(r.Data), "cancelled") {
 		t.Fatalf("parent did not see the cancellation: %s", r.Data)
 	}
@@ -200,7 +201,7 @@ func TestCancelledChildFailsAwaitingParent(t *testing.T) {
 
 func TestSignalCommandByKey(t *testing.T) {
 	e, _, _ := controlEngine(t)
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	startAgent(t, e, g, Config{AllowControl: true})
 	g.waitHello()
 	runEngine(t, e)
@@ -208,15 +209,15 @@ func TestSignalCommandByKey(t *testing.T) {
 	id := spawn(t, e, "Approval", func(b *runnerq.ActivityBuilder) { b.IdempotencyKeyOption("order-9", runnerq.ReturnExisting) })
 	g.waitStatus(id, storage.RecordStatusWaiting)
 
-	var res commandResult
-	g.ok(typeActivitiesSignal, commandRequest{Name: "approve", Payload: json.RawMessage(`{"by":"ops"}`),
-		Target: commandTarget{IdempotencyKey: "order-9", Type: "Approval"}}, &res)
+	var res wire.CommandResult
+	g.ok(wire.TypeActivitiesSignal, wire.SignalRequest{Name: "approve", Payload: json.RawMessage(`{"by":"ops"}`),
+		Target: wire.Target{IdempotencyKey: "order-9", Type: "Approval"}}, &res)
 	if res.Applied != 1 {
 		t.Fatalf("signal %+v", res)
 	}
 	g.waitStatus(id, storage.RecordStatusCompleted)
-	var r result
-	g.ok(typeResultsGet, resultRequest{ActivityID: id.String()}, &r)
+	var r wire.Result
+	g.ok(wire.TypeResultsGet, wire.ResultRequest{ActivityID: id.String()}, &r)
 	if !strings.Contains(string(r.Data), "ops") {
 		t.Fatalf("workflow result %s", r.Data)
 	}
@@ -224,33 +225,33 @@ func TestSignalCommandByKey(t *testing.T) {
 
 func TestCommandValidation(t *testing.T) {
 	e, _, queue := controlEngine(t)
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	startAgent(t, e, g, Config{AllowControl: true})
 	g.waitHello()
 	id := spawn(t, e, "Blocker") // engine not running: stays pending
 
-	e1 := g.fails(typeActivitiesCancel, commandRequest{Priority: 3, Target: commandTarget{IDs: []string{id.String()}}}, codeInvalidArgument)
+	e1 := g.fails(wire.TypeActivitiesCancel, map[string]any{"priority": 3, "target": wire.Target{IDs: []string{id.String()}}}, wire.CodeInvalidArgument)
 	if e1.Details["field"] != "priority" {
 		t.Fatalf("details %+v", e1.Details)
 	}
-	g.fails(typeActivitiesCancel, commandRequest{Target: commandTarget{IDs: []string{id.String()}, Queue: queue + "-other"}}, codeFailedPrecondition)
-	g.fails(typeActivitiesCancel, commandRequest{Cascade: "sideways", Target: commandTarget{IDs: []string{id.String()}}}, codeInvalidArgument)
-	g.fails(typeActivitiesSignal, commandRequest{Name: "x", Target: commandTarget{IdempotencyKey: "k"}}, codeInvalidArgument)
-	g.fails(typeActivitiesReschedule, commandRequest{At: "tomorrow", Target: commandTarget{IDs: []string{id.String()}}}, codeInvalidArgument)
-	g.fails(typeActivitiesCancel, commandRequest{Target: commandTarget{Filter: mustFilter(map[string]any{"field": "type", "op": "eq", "value": "Blocker"})}}, codeInvalidArgument) // no max
-	g.fails(typeActivitiesCancel, json.RawMessage(`{"target":{"ids":["x"]},"surprise":true}`), codeInvalidArgument)
+	g.fails(wire.TypeActivitiesCancel, wire.CancelRequest{Target: wire.Target{IDs: []string{id.String()}, Queue: queue + "-other"}}, wire.CodeFailedPrecondition)
+	g.fails(wire.TypeActivitiesCancel, wire.CancelRequest{Cascade: "sideways", Target: wire.Target{IDs: []string{id.String()}}}, wire.CodeInvalidArgument)
+	g.fails(wire.TypeActivitiesSignal, wire.SignalRequest{Name: "x", Target: wire.Target{IdempotencyKey: "k"}}, wire.CodeInvalidArgument)
+	g.fails(wire.TypeActivitiesReschedule, wire.RescheduleRequest{At: "tomorrow", Target: wire.Target{IDs: []string{id.String()}}}, wire.CodeInvalidArgument)
+	g.fails(wire.TypeActivitiesCancel, wire.CancelRequest{Target: wire.Target{Filter: mustFilter(map[string]any{"field": "type", "op": "eq", "value": "Blocker"})}}, wire.CodeInvalidArgument) // no max
+	g.fails(wire.TypeActivitiesCancel, json.RawMessage(`{"target":{"ids":["x"]},"surprise":true}`), wire.CodeInvalidArgument)
 
-	var res commandResult
-	g.ok(typeActivitiesSetPriority, commandRequest{Priority: 4, DryRun: true, Target: commandTarget{IDs: []string{id.String(), "not-an-id"}}}, &res)
-	if len(res.Results) != 2 || res.Results[0].Outcome != storage.CommandWouldApply || res.Results[1].Error == nil || res.Results[1].Error.Code != codeNotFound {
+	var res wire.CommandResult
+	g.ok(wire.TypeActivitiesSetPriority, wire.SetPriorityRequest{Priority: 4, DryRun: true, Target: wire.Target{IDs: []string{id.String(), "not-an-id"}}}, &res)
+	if len(res.Results) != 2 || res.Results[0].Outcome != storage.CommandWouldApply || res.Results[1].Error == nil || res.Results[1].Error.Code != wire.CodeNotFound {
 		t.Fatalf("dry run with a foreign id %+v", res)
 	}
-	g.ok(typeActivitiesRetry, commandRequest{Target: commandTarget{IDs: []string{id.String()}}}, &res)
-	if res.Results[0].Error == nil || res.Results[0].Error.Code != codeFailedPrecondition || res.Results[0].Error.Details["status"] != "pending" {
+	g.ok(wire.TypeActivitiesRetry, wire.RetryRequest{Target: wire.Target{IDs: []string{id.String()}}}, &res)
+	if res.Results[0].Error == nil || res.Results[0].Error.Code != wire.CodeFailedPrecondition || res.Results[0].Error.Details["status"] != "pending" {
 		t.Fatalf("retry of pending work %+v", res.Results[0])
 	}
-	g.ok(typeActivitiesCancel, commandRequest{Target: commandTarget{IDs: []string{"only-foreign"}}}, &res)
-	if res.Matched != 0 || len(res.Results) != 1 || res.Results[0].Error.Code != codeNotFound {
+	g.ok(wire.TypeActivitiesCancel, wire.CancelRequest{Target: wire.Target{IDs: []string{"only-foreign"}}}, &res)
+	if res.Matched != 0 || len(res.Results) != 1 || res.Results[0].Error.Code != wire.CodeNotFound {
 		t.Fatalf("all-foreign ids %+v", res)
 	}
 }

@@ -161,9 +161,13 @@ type ActivityRecord struct {
 	ExecutorID string
 	Wait       *RecordWait
 	Metadata   map[string]string
-	LastError  *RecordError    // only with Include.LastError
-	Payload    json.RawMessage // only with Include.Payload
-	Result     *ActivityResult // only with Include.Result
+	LastError  *RecordError // only with Include.LastError
+	// Payload and Result's data (only with Include.Payload and
+	// Include.Result) are plain JSON, as is StepEntry.Data: backends unwrap
+	// other encodings, such as the "json" part of the TypeScript SDK's
+	// superjson-v1.
+	Payload json.RawMessage
+	Result  *ActivityResult
 }
 
 // ActivityRecordPage is one page of activities.

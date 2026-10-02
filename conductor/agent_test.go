@@ -3,6 +3,7 @@ package conductor
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/alob-mtc/runnerq-go"
+	"github.com/alob-mtc/runnerq-go/conductor/internal/wire"
 	"github.com/alob-mtc/runnerq-go/storage"
 	"github.com/alob-mtc/runnerq-go/storage/postgres"
 )
@@ -28,26 +30,37 @@ const testKey = "rqk_test"
 type fakeGateway struct {
 	t       *testing.T
 	srv     *httptest.Server
-	config  sessionConfig
+	config  wire.SessionConfig
 	frame   int
 	rejectN atomic.Int32 // answer this many dials with 401 first
-	hellos  chan hello
-	events  chan envelope
+	hellos  chan wire.Hello
+	events  chan wire.Envelope
 
 	mu      sync.Mutex
 	conn    *websocket.Conn
 	nextID  int
-	replies map[string]chan envelope
+	replies map[string]chan wire.Envelope
+	schema  *protocolSchema
+	// invalid lists frames from the agent that break the protocol schema.
+	invalid []string
 }
 
-func newFakeGateway(t *testing.T, cfg sessionConfig) *fakeGateway {
+func newFakeGateway(t *testing.T, cfg wire.SessionConfig) *fakeGateway {
 	g := &fakeGateway{
-		t: t, config: cfg,
-		hellos:  make(chan hello, 16),
-		events:  make(chan envelope, 64),
-		replies: map[string]chan envelope{},
+		t: t, config: cfg, schema: loadSchema(t),
+		hellos:  make(chan wire.Hello, 16),
+		events:  make(chan wire.Envelope, 64),
+		replies: map[string]chan wire.Envelope{},
 	}
 	g.srv = httptest.NewServer(http.HandlerFunc(g.handle))
+	// Runs after the connection closes below: cleanups run last first.
+	t.Cleanup(func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		for _, msg := range g.invalid {
+			t.Errorf("the agent sent a frame the schema rejects: %s", msg)
+		}
+	})
 	t.Cleanup(func() {
 		g.mu.Lock()
 		if g.conn != nil {
@@ -72,17 +85,17 @@ func (g *fakeGateway) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	conn.SetReadLimit(16 << 20)
 	ctx := context.Background()
-	var req envelope
-	if err := wsjson.Read(ctx, conn, &req); err != nil {
+	var req wire.Envelope
+	if err := g.read(ctx, conn, &req); err != nil {
 		return
 	}
-	var h hello
+	var h wire.Hello
 	_ = json.Unmarshal(req.Data, &h)
-	res, _ := json.Marshal(welcome{
-		Version: 1, SessionID: uuid.NewString(), App: appRef{ID: "app-1", Name: "test-app"},
-		Config: g.config, Limits: limits{MaxFrameBytes: g.frame},
+	res, _ := json.Marshal(wire.Welcome{
+		Version: 1, SessionID: uuid.NewString(), App: wire.AppRef{ID: "app-1", Name: "test-app"},
+		Config: g.config, Limits: wire.Limits{MaxFrameBytes: g.frame},
 	})
-	if err := wsjson.Write(ctx, conn, envelope{V: 1, Kind: kindResponse, ID: req.ID, Type: typeHello, Data: res}); err != nil {
+	if err := wsjson.Write(ctx, conn, wire.Envelope{V: 1, Kind: wire.KindResponse, ID: req.ID, Type: wire.TypeHello, Data: res}); err != nil {
 		return
 	}
 	g.mu.Lock()
@@ -91,25 +104,39 @@ func (g *fakeGateway) handle(w http.ResponseWriter, r *http.Request) {
 	g.hellos <- h
 
 	for {
-		var env envelope
-		if err := wsjson.Read(ctx, conn, &env); err != nil {
+		var env wire.Envelope
+		if err := g.read(ctx, conn, &env); err != nil {
 			return
 		}
 		switch env.Kind {
-		case kindResponse:
+		case wire.KindResponse:
 			g.mu.Lock()
 			ch := g.replies[env.ID]
 			g.mu.Unlock()
 			if ch != nil {
 				ch <- env
 			}
-		case kindEvent:
+		case wire.KindEvent:
 			select {
 			case g.events <- env:
 			default:
 			}
 		}
 	}
+}
+
+// read reads a frame from the agent, checking it against the schema.
+func (g *fakeGateway) read(ctx context.Context, conn *websocket.Conn, env *wire.Envelope) error {
+	_, raw, err := conn.Read(ctx)
+	if err != nil {
+		return err
+	}
+	if err := g.schema.checkFrame(raw); err != nil {
+		g.mu.Lock()
+		g.invalid = append(g.invalid, fmt.Sprintf("%v\n%s", err, raw))
+		g.mu.Unlock()
+	}
+	return json.Unmarshal(raw, env)
 }
 
 // send writes a one-way event to the agent.
@@ -119,19 +146,19 @@ func (g *fakeGateway) send(msgType string, data any) {
 	g.mu.Lock()
 	conn := g.conn
 	g.mu.Unlock()
-	if err := wsjson.Write(context.Background(), conn, envelope{V: 1, Kind: kindEvent, Type: msgType, Data: raw}); err != nil {
+	if err := wsjson.Write(context.Background(), conn, wire.Envelope{V: 1, Kind: wire.KindEvent, Type: msgType, Data: raw}); err != nil {
 		g.t.Fatalf("send %s: %v", msgType, err)
 	}
 }
 
 // callMeta sends a request with meta and waits for the reply.
-func (g *fakeGateway) callMeta(msgType string, data any, meta map[string]json.RawMessage) envelope {
+func (g *fakeGateway) callMeta(msgType string, data any, meta *wire.Meta) wire.Envelope {
 	g.t.Helper()
 	raw, _ := json.Marshal(data)
 	g.mu.Lock()
 	g.nextID++
 	id := strconv.Itoa(g.nextID)
-	ch := make(chan envelope, 1)
+	ch := make(chan wire.Envelope, 1)
 	g.replies[id] = ch
 	conn := g.conn
 	g.mu.Unlock()
@@ -140,7 +167,7 @@ func (g *fakeGateway) callMeta(msgType string, data any, meta map[string]json.Ra
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := wsjson.Write(ctx, conn, envelope{V: 1, Kind: kindRequest, ID: id, Type: msgType, Data: raw, Meta: meta}); err != nil {
+	if err := wsjson.Write(ctx, conn, wire.Envelope{V: 1, Kind: wire.KindRequest, ID: id, Type: msgType, Data: raw, Meta: meta}); err != nil {
 		g.t.Fatalf("send %s: %v", msgType, err)
 	}
 	select {
@@ -148,11 +175,13 @@ func (g *fakeGateway) callMeta(msgType string, data any, meta map[string]json.Ra
 		return res
 	case <-ctx.Done():
 		g.t.Fatalf("no reply to %s", msgType)
-		return envelope{}
+		return wire.Envelope{}
 	}
 }
 
-func (g *fakeGateway) call(msgType string, data any) envelope { return g.callMeta(msgType, data, nil) }
+func (g *fakeGateway) call(msgType string, data any) wire.Envelope {
+	return g.callMeta(msgType, data, nil)
+}
 
 // ok asserts a successful reply and decodes it into out.
 func (g *fakeGateway) ok(msgType string, data, out any) {
@@ -169,7 +198,7 @@ func (g *fakeGateway) ok(msgType string, data, out any) {
 }
 
 // fails asserts a failed reply with the given code and returns the error.
-func (g *fakeGateway) fails(msgType string, data any, code errorCode) *wireError {
+func (g *fakeGateway) fails(msgType string, data any, code wire.ErrorCode) *wire.Error {
 	g.t.Helper()
 	res := g.call(msgType, data)
 	if res.Error == nil || res.Error.Code != code {
@@ -178,19 +207,19 @@ func (g *fakeGateway) fails(msgType string, data any, code errorCode) *wireError
 	return res.Error
 }
 
-func (g *fakeGateway) waitHello() hello {
+func (g *fakeGateway) waitHello() wire.Hello {
 	g.t.Helper()
 	select {
 	case h := <-g.hellos:
 		return h
 	case <-time.After(10 * time.Second):
 		g.t.Fatal("agent never connected")
-		return hello{}
+		return wire.Hello{}
 	}
 }
 
 // waitEvent returns the next event of msgType.
-func (g *fakeGateway) waitEvent(msgType string) envelope {
+func (g *fakeGateway) waitEvent(msgType string) wire.Envelope {
 	g.t.Helper()
 	deadline := time.After(10 * time.Second)
 	for {
@@ -201,7 +230,7 @@ func (g *fakeGateway) waitEvent(msgType string) envelope {
 			}
 		case <-deadline:
 			g.t.Fatalf("no %s event", msgType)
-			return envelope{}
+			return wire.Envelope{}
 		}
 	}
 }
@@ -310,7 +339,7 @@ func TestConfigValidation(t *testing.T) {
 }
 
 func TestHelloDescribesExecutor(t *testing.T) {
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	e := runnerq.NewWorkerEngineWithBackend(nopStorage{}, runnerq.WorkerConfig{
 		QueueName: "q1", MaxConcurrentActivities: 3, Labels: map[string]string{"region": "us", "deploy": "v7"},
 	})
@@ -329,7 +358,7 @@ func TestHelloDescribesExecutor(t *testing.T) {
 		t.Fatalf("hello %+v", h)
 	}
 	// A backend without QueryStorage serves only executor-scoped messages.
-	if _, ok := h.Capabilities[typeExecutorDescribe]; !ok || len(h.Capabilities) != 1 {
+	if _, ok := h.Capabilities[wire.TypeExecutorDescribe]; !ok || len(h.Capabilities) != 1 {
 		t.Fatalf("capabilities %+v", h.Capabilities)
 	}
 	for deadline := time.Now().Add(5 * time.Second); !a.Connected() || a.SessionID() == ""; {
@@ -341,18 +370,18 @@ func TestHelloDescribesExecutor(t *testing.T) {
 }
 
 func TestExecutorDescribeAndReports(t *testing.T) {
-	g := newFakeGateway(t, sessionConfig{ReportIntervalMS: 60_000}) // the first report is sent on connect
+	g := newFakeGateway(t, wire.SessionConfig{ReportIntervalMS: 60_000}) // the first report is sent on connect
 	e := nopEngine(t)
 	startAgent(t, e, g, Config{})
 	g.waitHello()
 
-	var st executorState
-	g.ok(typeExecutorDescribe, struct{}{}, &st)
+	var st wire.ExecutorState
+	g.ok(wire.TypeExecutorDescribe, struct{}{}, &st)
 	if st.ID != e.InstanceID() || st.MaxConcurrency != 3 || st.InFlight != 0 || st.Draining ||
-		st.Counters == nil || *st.Counters != (executorCounters{}) {
+		st.Counters != (wire.ExecutorCounters{}) {
 		t.Fatalf("state %+v", st)
 	}
-	evt := g.waitEvent(typeExecutorReport)
+	evt := g.waitEvent(wire.TypeExecutorReport)
 	var report map[string]json.RawMessage
 	if err := json.Unmarshal(evt.Data, &report); err != nil || string(report["id"]) != `"`+e.InstanceID()+`"` {
 		t.Fatalf("report %s: %v", evt.Data, err)
@@ -367,38 +396,38 @@ func TestExecutorDescribeAndReports(t *testing.T) {
 }
 
 func TestReportsChanges(t *testing.T) {
-	g := newFakeGateway(t, sessionConfig{ReportIntervalMS: 60_000})
+	g := newFakeGateway(t, wire.SessionConfig{ReportIntervalMS: 60_000})
 	e := nopEngine(t)
 	startAgent(t, e, g, Config{})
 	g.waitHello()
-	g.waitEvent(typeExecutorReport) // on connect
+	g.waitEvent(wire.TypeExecutorReport) // on connect
 
 	// A drain beginning is reported without waiting out the interval.
 	e.Stop()
-	evt := g.waitEvent(typeExecutorReport)
-	var st executorState
+	evt := g.waitEvent(wire.TypeExecutorReport)
+	var st wire.ExecutorState
 	if err := json.Unmarshal(evt.Data, &st); err != nil || !st.Draining {
 		t.Fatalf("report after the stop: %s", evt.Data)
 	}
 }
 
 func TestProtocolErrors(t *testing.T) {
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	startAgent(t, nopEngine(t), g, Config{})
 	g.waitHello()
 
-	g.fails("launch_missiles", nil, codeUnsupported)
-	g.fails(typeActivitiesList, nil, codeUnsupported) // backend lacks QueryStorage
-	res := g.callMeta(typeExecutorDescribe, struct{}{}, map[string]json.RawMessage{
-		metaDeadline: json.RawMessage(`"` + time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano) + `"`),
+	g.fails("launch_missiles", nil, wire.CodeUnsupported)
+	g.fails(wire.TypeActivitiesList, nil, wire.CodeUnsupported) // backend lacks QueryStorage
+	res := g.callMeta(wire.TypeExecutorDescribe, struct{}{}, &wire.Meta{
+		Deadline: time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano),
 	})
-	if res.Error == nil || res.Error.Code != codeDeadlineExceeded {
+	if res.Error == nil || res.Error.Code != wire.CodeDeadlineExceeded {
 		t.Fatalf("expired deadline: %+v", res)
 	}
 }
 
 func TestReconnectsAfterRejectionAndDrop(t *testing.T) {
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	g.rejectN.Store(2) // two 401s before the key is accepted
 	startAgent(t, nopEngine(t), g, Config{})
 	first := g.waitHello()
@@ -413,7 +442,7 @@ func TestReconnectsAfterRejectionAndDrop(t *testing.T) {
 }
 
 func TestCloseSendsGoodbye(t *testing.T) {
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	a := startAgent(t, nopEngine(t), g, Config{})
 	g.waitHello()
 
@@ -422,8 +451,8 @@ func TestCloseSendsGoodbye(t *testing.T) {
 	if err := a.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	var gb goodbye
-	if err := json.Unmarshal(g.waitEvent(typeGoodbye).Data, &gb); err != nil || gb.Reason != "shutdown" {
+	var gb wire.Goodbye
+	if err := json.Unmarshal(g.waitEvent(wire.TypeGoodbye).Data, &gb); err != nil || gb.Reason != "shutdown" {
 		t.Fatalf("goodbye %+v %v", gb, err)
 	}
 	if a.Connected() {
@@ -437,7 +466,7 @@ func TestCloseSendsGoodbye(t *testing.T) {
 }
 
 func TestCancelledContextSaysGoodbye(t *testing.T) {
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	ctx, cancel := context.WithCancel(context.Background())
 	a, err := Start(ctx, nopEngine(t), Config{URL: g.url(), APIKey: testKey})
 	if err != nil {
@@ -445,7 +474,7 @@ func TestCancelledContextSaysGoodbye(t *testing.T) {
 	}
 	g.waitHello()
 	cancel() // e.g. a signal.NotifyContext firing on SIGTERM
-	if e := g.waitEvent(typeGoodbye); e.Type != typeGoodbye {
+	if e := g.waitEvent(wire.TypeGoodbye); e.Type != wire.TypeGoodbye {
 		t.Fatalf("got %s", e.Type)
 	}
 	cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -456,7 +485,7 @@ func TestCancelledContextSaysGoodbye(t *testing.T) {
 }
 
 func TestRequestLimit(t *testing.T) {
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	a := startAgent(t, nopEngine(t), g, Config{MaxConcurrentRequests: 1})
 	g.waitHello()
 
@@ -467,10 +496,10 @@ func TestRequestLimit(t *testing.T) {
 		<-release
 		return struct{}{}, nil
 	}
-	done := make(chan envelope, 1)
+	done := make(chan wire.Envelope, 1)
 	go func() { done <- g.call("block", nil) }()
 	<-started
-	g.fails(typeExecutorDescribe, nil, codeResourceExhausted)
+	g.fails(wire.TypeExecutorDescribe, nil, wire.CodeResourceExhausted)
 	close(release)
 	if res := <-done; res.Error != nil {
 		t.Fatalf("blocked request failed: %v", res.Error)
@@ -478,31 +507,31 @@ func TestRequestLimit(t *testing.T) {
 }
 
 func TestHandlerPanicAndOversizedReplies(t *testing.T) {
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	g.frame = 64 << 10
 	a := startAgent(t, nopEngine(t), g, Config{})
 	g.waitHello()
 	a.table["boom"] = func(context.Context, json.RawMessage) (any, error) { panic("boom") }
 	a.table["huge"] = func(context.Context, json.RawMessage) (any, error) { return strings.Repeat("x", 128<<10), nil }
-	g.fails("boom", nil, codeInternal)
-	g.fails("huge", nil, codeResourceExhausted)
-	g.ok(typeExecutorDescribe, struct{}{}, nil) // still serving
+	g.fails("boom", nil, wire.CodeInternal)
+	g.fails("huge", nil, wire.CodeResourceExhausted)
+	g.ok(wire.TypeExecutorDescribe, struct{}{}, nil) // still serving
 }
 
 // --- against Postgres ---
 
 func TestQueriesFromStorage(t *testing.T) {
 	e, b, queue := pgEngine(t)
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	startAgent(t, e, g, Config{})
 	h := g.waitHello()
-	for _, want := range []string{typeActivitiesList, typeActivitiesGet, typeActivitiesCount, typeActivitiesAggregate,
-		typeStepsList, typeEventsList, typeResultsGet, typeTreesGet} {
+	for _, want := range []string{wire.TypeActivitiesList, wire.TypeActivitiesGet, wire.TypeActivitiesCount, wire.TypeActivitiesAggregate,
+		wire.TypeStepsList, wire.TypeEventsList, wire.TypeResultsGet, wire.TypeTreesGet} {
 		if _, ok := h.Capabilities[want]; !ok {
 			t.Fatalf("capability %q missing", want)
 		}
 	}
-	if c := h.Capabilities[typeActivitiesList]; len(c.Filters) == 0 || len(c.Sorts) == 0 {
+	if c := h.Capabilities[wire.TypeActivitiesList]; len(c.Filters) == 0 || len(c.Sorts) == 0 {
 		t.Fatalf("list capability without sub-features: %+v", c)
 	}
 
@@ -512,37 +541,37 @@ func TestQueriesFromStorage(t *testing.T) {
 		enqueue(t, b, `{}`, func(a *storage.QueuedActivity) { a.ActivityType = "Other" })
 	}
 
-	var list page[activityView]
-	g.ok(typeActivitiesList, query{Filter: mustFilter(inQueue(queue, map[string]any{"field": "type", "op": "eq", "value": "Echo"})), Limit: 1}, &list)
+	var list wire.ActivityPage
+	g.ok(wire.TypeActivitiesList, wire.Query{Filter: mustFilter(inQueue(queue, map[string]any{"field": "type", "op": "eq", "value": "Echo"})), Limit: 1}, &list)
 	if len(list.Items) != 1 || list.NextCursor == "" || list.Items[0].Payload != nil {
 		t.Fatalf("first page %+v", list)
 	}
-	var second page[activityView]
-	g.ok(typeActivitiesList, query{Filter: mustFilter(inQueue(queue, map[string]any{"field": "type", "op": "eq", "value": "Echo"})), Limit: 1, Cursor: list.NextCursor}, &second)
+	var second wire.ActivityPage
+	g.ok(wire.TypeActivitiesList, wire.Query{Filter: mustFilter(inQueue(queue, map[string]any{"field": "type", "op": "eq", "value": "Echo"})), Limit: 1, Cursor: list.NextCursor}, &second)
 	if len(second.Items) != 1 || second.NextCursor != "" || second.Items[0].ID == list.Items[0].ID {
 		t.Fatalf("second page %+v", second)
 	}
 
-	var act activityView
-	g.ok(typeActivitiesGet, getRequest{ID: id.String(), Include: []string{"payload", "events", "steps"}}, &act)
+	var act wire.Activity
+	g.ok(wire.TypeActivitiesGet, wire.GetRequest{ID: id.String(), Include: []string{"payload", "events", "steps"}}, &act)
 	if act.ID != id.String() || act.Status != "pending" || act.Type != "Echo" || string(act.Payload) != `{"n": 1}` && string(act.Payload) != `{"n":1}` {
 		t.Fatalf("activity %+v (payload %s)", act, act.Payload)
 	}
 	if act.Events == nil || len(*act.Events) == 0 || (*act.Events)[0].Type != storage.RecordEventCreated || act.Steps == nil || len(*act.Steps) != 0 {
 		t.Fatalf("embedded events/steps %+v %+v", act.Events, act.Steps)
 	}
-	g.fails(typeActivitiesGet, getRequest{ID: uuid.NewString()}, codeNotFound)
-	g.fails(typeActivitiesGet, getRequest{ID: "not-an-id"}, codeNotFound)
+	g.fails(wire.TypeActivitiesGet, wire.GetRequest{ID: uuid.NewString()}, wire.CodeNotFound)
+	g.fails(wire.TypeActivitiesGet, wire.GetRequest{ID: "not-an-id"}, wire.CodeNotFound)
 
-	var count countResult
-	g.ok(typeActivitiesCount, countRequest{Filter: mustFilter(inQueue(queue))}, &count)
+	var count wire.CountResult
+	g.ok(wire.TypeActivitiesCount, wire.CountRequest{Filter: mustFilter(inQueue(queue))}, &count)
 	if count.Count != 5 || !count.Exact {
 		t.Fatalf("count %+v", count)
 	}
 
-	var agg aggregateResult
-	g.ok(typeActivitiesAggregate, aggregateRequest{Filter: mustFilter(inQueue(queue)), GroupBy: []string{"type"},
-		Metrics: []metric{{Name: "count"}}}, &agg)
+	var agg wire.AggregateResult
+	g.ok(wire.TypeActivitiesAggregate, wire.AggregateRequest{Filter: mustFilter(inQueue(queue)), GroupBy: []string{"type"},
+		Metrics: []wire.Metric{{Name: "count"}}}, &agg)
 	counts := map[string]int64{}
 	for _, gr := range agg.Groups {
 		counts[gr.Key["type"]] = *gr.Count
@@ -551,38 +580,38 @@ func TestQueriesFromStorage(t *testing.T) {
 		t.Fatalf("aggregate %+v", agg)
 	}
 
-	var tree treeView
-	g.ok(typeTreesGet, treeRequest{ID: child.String()}, &tree)
+	var tree wire.Tree
+	g.ok(wire.TypeTreesGet, wire.TreeRequest{ID: child.String()}, &tree)
 	if tree.RootID != id.String() || len(tree.Items) != 2 {
 		t.Fatalf("tree %+v", tree)
 	}
-	var events page[eventView]
-	g.ok(typeEventsList, query{Filter: mustFilter(map[string]any{"field": "root_id", "op": "eq", "value": id.String()}),
-		Sort: []wireSort{{Field: "at", Order: "desc"}}}, &events)
+	var events wire.EventPage
+	g.ok(wire.TypeEventsList, wire.Query{Filter: mustFilter(map[string]any{"field": "root_id", "op": "eq", "value": id.String()}),
+		Sort: []wire.Sort{{Field: "at", Order: "desc"}}}, &events)
 	if len(events.Items) != 2 || events.Items[0].ActivityID != child.String() {
 		t.Fatalf("events %+v", events)
 	}
-	g.fails(typeResultsGet, resultRequest{ActivityID: id.String()}, codeNotFound)
+	g.fails(wire.TypeResultsGet, wire.ResultRequest{ActivityID: id.String()}, wire.CodeNotFound)
 
 	// Errors carry the offending field.
-	e1 := g.fails(typeActivitiesList, query{Filter: mustFilter(map[string]any{"field": "colour", "op": "eq", "value": "red"})}, codeUnsupported)
+	e1 := g.fails(wire.TypeActivitiesList, wire.Query{Filter: mustFilter(map[string]any{"field": "colour", "op": "eq", "value": "red"})}, wire.CodeUnsupported)
 	if e1.Details["field"] != "colour" {
 		t.Fatalf("details %+v", e1.Details)
 	}
-	g.fails(typeActivitiesList, query{Filter: mustFilter(map[string]any{"field": "status", "op": "eq", "value": "exploded"})}, codeInvalidArgument)
-	g.fails(typeActivitiesList, query{Include: []string{"secrets"}}, codeUnsupported)
-	g.fails(typeActivitiesList, query{Sort: []wireSort{{Field: "created_at"}, {Field: "priority"}}}, codeUnsupported)
-	g.fails(typeActivitiesList, json.RawMessage(`{"filter":null,"surprise":1}`), codeInvalidArgument)
-	g.fails(typeActivitiesAggregate, aggregateRequest{Metrics: []metric{{Name: "vibes"}}}, codeUnsupported)
+	g.fails(wire.TypeActivitiesList, wire.Query{Filter: mustFilter(map[string]any{"field": "status", "op": "eq", "value": "exploded"})}, wire.CodeInvalidArgument)
+	g.fails(wire.TypeActivitiesList, wire.Query{Include: []string{"secrets"}}, wire.CodeUnsupported)
+	g.fails(wire.TypeActivitiesList, wire.Query{Sort: []wire.Sort{{Field: "created_at"}, {Field: "priority"}}}, wire.CodeUnsupported)
+	g.fails(wire.TypeActivitiesList, json.RawMessage(`{"filter":null,"surprise":1}`), wire.CodeInvalidArgument)
+	g.fails(wire.TypeActivitiesAggregate, wire.AggregateRequest{Metrics: []wire.Metric{{Name: "vibes"}}}, wire.CodeUnsupported)
 }
 
 func TestMetadataOnly(t *testing.T) {
 	for name, tc := range map[string]struct {
-		cloud sessionConfig
+		cloud wire.SessionConfig
 		local bool
 	}{
-		"cloud asks":   {cloud: sessionConfig{DataMode: dataModeMetadataOnly}},
-		"agent forces": {cloud: sessionConfig{DataMode: "full"}, local: true},
+		"cloud asks":   {cloud: wire.SessionConfig{DataMode: wire.DataModeMetadataOnly}},
+		"agent forces": {cloud: wire.SessionConfig{DataMode: "full"}, local: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e, b, _ := pgEngine(t)
@@ -591,12 +620,12 @@ func TestMetadataOnly(t *testing.T) {
 			g.waitHello()
 
 			id := enqueue(t, b, `{"secret":"pii"}`)
-			g.fails(typeActivitiesGet, getRequest{ID: id.String(), Include: []string{"payload"}}, codeForbidden)
-			g.fails(typeActivitiesList, query{Include: []string{"last_error"}}, codeForbidden)
-			g.fails(typeEventsList, query{Include: []string{"detail"}}, codeForbidden)
-			g.fails(typeResultsGet, resultRequest{ActivityID: id.String()}, codeForbidden)
-			var act activityView
-			g.ok(typeActivitiesGet, getRequest{ID: id.String(), Include: []string{"events"}}, &act)
+			g.fails(wire.TypeActivitiesGet, wire.GetRequest{ID: id.String(), Include: []string{"payload"}}, wire.CodeForbidden)
+			g.fails(wire.TypeActivitiesList, wire.Query{Include: []string{"last_error"}}, wire.CodeForbidden)
+			g.fails(wire.TypeEventsList, wire.Query{Include: []string{"detail"}}, wire.CodeForbidden)
+			g.fails(wire.TypeResultsGet, wire.ResultRequest{ActivityID: id.String()}, wire.CodeForbidden)
+			var act wire.Activity
+			g.ok(wire.TypeActivitiesGet, wire.GetRequest{ID: id.String(), Include: []string{"events"}}, &act)
 			if raw, _ := json.Marshal(act); strings.Contains(string(raw), "pii") {
 				t.Fatalf("customer data leaked: %s", raw)
 			}
@@ -606,16 +635,16 @@ func TestMetadataOnly(t *testing.T) {
 
 func TestConfigUpdateChangesDataMode(t *testing.T) {
 	e, b, _ := pgEngine(t)
-	g := newFakeGateway(t, sessionConfig{DataMode: "full"})
+	g := newFakeGateway(t, wire.SessionConfig{DataMode: "full"})
 	startAgent(t, e, g, Config{})
 	g.waitHello()
 	id := enqueue(t, b, `{}`)
 
-	g.ok(typeActivitiesGet, getRequest{ID: id.String(), Include: []string{"payload"}}, nil)
-	g.send(typeConfigUpdate, sessionConfig{DataMode: dataModeMetadataOnly})
+	g.ok(wire.TypeActivitiesGet, wire.GetRequest{ID: id.String(), Include: []string{"payload"}}, nil)
+	g.send(wire.TypeConfigUpdate, wire.SessionConfig{DataMode: wire.DataModeMetadataOnly})
 	for deadline := time.Now().Add(5 * time.Second); ; {
-		res := g.call(typeActivitiesGet, getRequest{ID: id.String(), Include: []string{"payload"}})
-		if res.Error != nil && res.Error.Code == codeForbidden {
+		res := g.call(wire.TypeActivitiesGet, wire.GetRequest{ID: id.String(), Include: []string{"payload"}})
+		if res.Error != nil && res.Error.Code == wire.CodeForbidden {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -625,9 +654,9 @@ func TestConfigUpdateChangesDataMode(t *testing.T) {
 	}
 }
 
-func mustFilter(m map[string]any) *wireFilter {
+func mustFilter(m map[string]any) *wire.Filter {
 	raw, _ := json.Marshal(m)
-	var f wireFilter
+	var f wire.Filter
 	if err := json.Unmarshal(raw, &f); err != nil {
 		panic(err)
 	}

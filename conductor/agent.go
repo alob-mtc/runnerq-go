@@ -17,7 +17,8 @@
 // Services that hold a backend themselves (RunnerQ Cloud's data plane)
 // answer the same requests with a Handler, without a worker or connection.
 //
-// The wire protocol is specified in runnerq-cloud's docs/protocol.md.
+// The wire protocol is runnerq-spec's conductor protocol
+// (protocol/conductor in github.com/runnerq/runnerq-spec).
 package conductor
 
 import (
@@ -39,6 +40,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 
 	"github.com/alob-mtc/runnerq-go"
+	"github.com/alob-mtc/runnerq-go/conductor/internal/wire"
 	"github.com/alob-mtc/runnerq-go/executor"
 )
 
@@ -207,7 +209,7 @@ func (a *Agent) goodbye(ctx context.Context) {
 }
 
 func sayGoodbye(ctx context.Context, conn *websocket.Conn) {
-	if evt, err := newEvent(typeGoodbye, goodbye{Reason: "shutdown"}); err == nil {
+	if evt, err := newEvent(wire.TypeGoodbye, wire.Goodbye{Reason: "shutdown"}); err == nil {
 		wctx, cancel := context.WithTimeout(ctx, writeTimeout)
 		_ = wsjson.Write(wctx, conn, evt)
 		cancel()
@@ -325,7 +327,7 @@ func (a *Agent) session(ctx context.Context) error {
 	return a.readLoop(sctx, conn, st)
 }
 
-func (a *Agent) handshake(ctx context.Context, conn *websocket.Conn) (welcome, error) {
+func (a *Agent) handshake(ctx context.Context, conn *websocket.Conn) (wire.Welcome, error) {
 	info := a.engine.Snapshot().Info
 	labels := info.Labels
 	if len(a.cfg.Labels) > 0 {
@@ -335,7 +337,7 @@ func (a *Agent) handshake(ctx context.Context, conn *websocket.Conn) (welcome, e
 		}
 		maps.Copy(labels, a.cfg.Labels)
 	}
-	ex := executorInfo{
+	ex := wire.ExecutorInfo{
 		ID:             info.ID,
 		Hostname:       info.Hostname,
 		Queues:         []string{info.Queue},
@@ -346,35 +348,35 @@ func (a *Agent) handshake(ctx context.Context, conn *websocket.Conn) (welcome, e
 	if !info.StartedAt.IsZero() {
 		ex.StartedAt = ts(info.StartedAt)
 	}
-	req, err := newRequest("hello", typeHello, hello{
-		ProtocolVersions: []int{protocolVersion},
-		SDK:              sdkInfo{Name: info.SDK.Name, Version: info.SDK.Version, Language: info.SDK.Language},
+	req, err := newRequest("hello", wire.TypeHello, wire.Hello{
+		ProtocolVersions: []int{wire.Version},
+		SDK:              wire.SDKInfo{Name: info.SDK.Name, Version: info.SDK.Version, Language: info.SDK.Language},
 		Executor:         ex,
 		Capabilities:     a.h.capabilities(),
-		Limits:           limits{MaxFrameBytes: maxMessageBytes, MaxConcurrentRequests: a.cfg.MaxConcurrentRequests},
+		Limits:           wire.Limits{MaxFrameBytes: maxMessageBytes, MaxConcurrentRequests: a.cfg.MaxConcurrentRequests},
 	})
 	if err != nil {
-		return welcome{}, err
+		return wire.Welcome{}, err
 	}
 	if err := wsjson.Write(ctx, conn, req); err != nil {
-		return welcome{}, err
+		return wire.Welcome{}, err
 	}
-	var res envelope
+	var res wire.Envelope
 	if err := wsjson.Read(ctx, conn, &res); err != nil {
-		return welcome{}, err
+		return wire.Welcome{}, err
 	}
 	if res.Error != nil {
-		return welcome{}, fmt.Errorf("the Cloud rejected the handshake: %w", res.Error)
+		return wire.Welcome{}, fmt.Errorf("the Cloud rejected the handshake: %w", (*wireError)(res.Error))
 	}
-	var w welcome
-	if res.Kind != kindResponse || res.Type != typeHello {
+	var w wire.Welcome
+	if res.Kind != wire.KindResponse || res.Type != wire.TypeHello {
 		return w, fmt.Errorf("unexpected handshake reply %s/%s", res.Kind, res.Type)
 	}
 	if err := json.Unmarshal(res.Data, &w); err != nil {
 		return w, fmt.Errorf("decode welcome: %w", err)
 	}
-	if w.Version != protocolVersion {
-		return w, fmt.Errorf("the Cloud chose protocol version %d; this SDK speaks %d", w.Version, protocolVersion)
+	if w.Version != wire.Version {
+		return w, fmt.Errorf("the Cloud chose protocol version %d; this SDK speaks %d", w.Version, wire.Version)
 	}
 	return w, nil
 }
@@ -401,9 +403,9 @@ func (a *Agent) pingLoop(ctx context.Context, conn *websocket.Conn) {
 
 // applyConfig applies the Cloud's session settings; the Cloud can tighten
 // data mode but never relax a local MetadataOnly.
-func (a *Agent) applyConfig(c sessionConfig) {
+func (a *Agent) applyConfig(c wire.SessionConfig) {
 	if c.DataMode != "" {
-		a.h.cloudMetadataOnly.Store(c.DataMode == dataModeMetadataOnly)
+		a.h.cloudMetadataOnly.Store(c.DataMode == wire.DataModeMetadataOnly)
 	}
 	if c.ReportIntervalMS > 0 {
 		a.reportEvery.Store(int64(max(time.Duration(c.ReportIntervalMS)*time.Millisecond, time.Second)))
@@ -414,7 +416,7 @@ func (a *Agent) applyConfig(c sessionConfig) {
 func (a *Agent) reportLoop(ctx context.Context, conn *websocket.Conn) {
 	every := func() time.Duration { return time.Duration(a.reportEvery.Load()) }
 	executor.Report(ctx, a.engine, every, reportMinGap, func() {
-		if evt, err := newEvent(typeExecutorReport, a.h.state(false)); err == nil {
+		if evt, err := newEvent(wire.TypeExecutorReport, a.h.state(false)); err == nil {
 			wctx, cancel := context.WithTimeout(ctx, writeTimeout)
 			_ = wsjson.Write(wctx, conn, evt)
 			cancel()
@@ -426,8 +428,8 @@ func (a *Agent) readLoop(ctx context.Context, conn *websocket.Conn, st *streams)
 	// Stream requests are bound to this session's connection.
 	session := map[string]handlerFunc{}
 	if a.h.qs != nil {
-		session[typeEventsSubscribe] = st.subscribe
-		session[typeEventsUnsubscribe] = st.unsubscribe
+		session[wire.TypeEventsSubscribe] = st.subscribe
+		session[wire.TypeEventsUnsubscribe] = st.unsubscribe
 	}
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -436,26 +438,26 @@ func (a *Agent) readLoop(ctx context.Context, conn *websocket.Conn, st *streams)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	for {
-		var req envelope
+		var req wire.Envelope
 		if err := wsjson.Read(ctx, conn, &req); err != nil {
 			return err
 		}
-		if req.Kind == kindEvent {
-			if req.Type == typeConfigUpdate {
-				var c sessionConfig
+		if req.Kind == wire.KindEvent {
+			if req.Type == wire.TypeConfigUpdate {
+				var c wire.SessionConfig
 				if json.Unmarshal(req.Data, &c) == nil {
 					a.applyConfig(c)
 				}
 			}
 			continue // unknown events are ignored
 		}
-		if req.Kind != kindRequest {
+		if req.Kind != wire.KindRequest {
 			continue
 		}
 		select {
 		case a.sem <- struct{}{}:
 		default:
-			a.reply(ctx, conn, errorResponse(req, errorf(codeResourceExhausted, "agent is at its request limit")))
+			a.reply(ctx, conn, errorResponse(req, errorf(wire.CodeResourceExhausted, "agent is at its request limit")))
 			continue
 		}
 		wg.Add(1)
@@ -469,11 +471,11 @@ func (a *Agent) readLoop(ctx context.Context, conn *websocket.Conn, st *streams)
 
 // serve recovers a panicking handler as an internal error so it never takes
 // down the worker.
-func (a *Agent) serve(ctx context.Context, req envelope, session map[string]handlerFunc) (res envelope) {
+func (a *Agent) serve(ctx context.Context, req wire.Envelope, session map[string]handlerFunc) (res wire.Envelope) {
 	defer func() {
 		if p := recover(); p != nil {
 			a.log.Error("Conductor request handler panicked", "type", req.Type, "panic", p)
-			res = errorResponse(req, errorf(codeInternal, "handler panicked"))
+			res = errorResponse(req, errorf(wire.CodeInternal, "handler panicked"))
 		}
 	}()
 	h, ok := a.table[req.Type]
@@ -481,19 +483,16 @@ func (a *Agent) serve(ctx context.Context, req envelope, session map[string]hand
 		h, ok = session[req.Type]
 	}
 	if !ok {
-		return errorResponse(req, errorf(codeUnsupported, "this agent does not serve %q", req.Type))
+		return errorResponse(req, errorf(wire.CodeUnsupported, "this agent does not serve %q", req.Type))
 	}
 	deadline := time.Now().Add(a.cfg.RequestTimeout)
-	if raw, ok := req.Meta[metaDeadline]; ok {
-		var s string
-		if json.Unmarshal(raw, &s) == nil {
-			if d, err := time.Parse(time.RFC3339Nano, s); err == nil && d.Before(deadline) {
-				deadline = d
-			}
+	if req.Meta != nil && req.Meta.Deadline != "" {
+		if d, err := time.Parse(time.RFC3339Nano, req.Meta.Deadline); err == nil && d.Before(deadline) {
+			deadline = d
 		}
 	}
 	if !time.Now().Before(deadline) {
-		return errorResponse(req, errorf(codeDeadlineExceeded, "the request expired before it started"))
+		return errorResponse(req, errorf(wire.CodeDeadlineExceeded, "the request expired before it started"))
 	}
 	rctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
@@ -503,16 +502,16 @@ func (a *Agent) serve(ctx context.Context, req envelope, session map[string]hand
 	}
 	data, err := json.Marshal(out)
 	if err != nil {
-		return errorResponse(req, errorf(codeInternal, "encode response: %v", err))
+		return errorResponse(req, errorf(wire.CodeInternal, "encode response: %v", err))
 	}
 	if limit := a.peerFrameLimit.Load(); limit > 0 && int64(len(data)) > limit-1024 {
-		return errorResponse(req, errorf(codeResourceExhausted,
+		return errorResponse(req, errorf(wire.CodeResourceExhausted,
 			"the reply is %d bytes, over the %d-byte frame limit; ask for fewer rows or fields", len(data), limit))
 	}
-	return envelope{V: req.V, Kind: kindResponse, ID: req.ID, Type: req.Type, Data: data}
+	return wire.Envelope{V: req.V, Kind: wire.KindResponse, ID: req.ID, Type: req.Type, Data: data}
 }
 
-func (a *Agent) reply(ctx context.Context, conn *websocket.Conn, res envelope) {
+func (a *Agent) reply(ctx context.Context, conn *websocket.Conn, res wire.Envelope) {
 	wctx, cancel := context.WithTimeout(ctx, writeTimeout)
 	defer cancel()
 	if err := wsjson.Write(wctx, conn, res); err != nil && ctx.Err() == nil {
@@ -520,24 +519,24 @@ func (a *Agent) reply(ctx context.Context, conn *websocket.Conn, res envelope) {
 	}
 }
 
-func newRequest(id, msgType string, data any) (envelope, error) {
+func newRequest(id, msgType string, data any) (wire.Envelope, error) {
 	raw, err := json.Marshal(data)
 	if err != nil {
-		return envelope{}, err
+		return wire.Envelope{}, err
 	}
-	return envelope{V: protocolVersion, Kind: kindRequest, ID: id, Type: msgType, Data: raw}, nil
+	return wire.Envelope{V: wire.Version, Kind: wire.KindRequest, ID: id, Type: msgType, Data: raw}, nil
 }
 
-func newEvent(msgType string, data any) (envelope, error) {
+func newEvent(msgType string, data any) (wire.Envelope, error) {
 	raw, err := json.Marshal(data)
 	if err != nil {
-		return envelope{}, err
+		return wire.Envelope{}, err
 	}
-	return envelope{V: protocolVersion, Kind: kindEvent, Type: msgType, Data: raw}, nil
+	return wire.Envelope{V: wire.Version, Kind: wire.KindEvent, Type: msgType, Data: raw}, nil
 }
 
-func errorResponse(req envelope, e *wireError) envelope {
-	return envelope{V: req.V, Kind: kindResponse, ID: req.ID, Type: req.Type, Error: e}
+func errorResponse(req wire.Envelope, e *wireError) wire.Envelope {
+	return wire.Envelope{V: req.V, Kind: wire.KindResponse, ID: req.ID, Type: req.Type, Error: (*wire.Error)(e)}
 }
 
 // SessionID is the current Cloud session id, or "" while disconnected.

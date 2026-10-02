@@ -17,15 +17,16 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/alob-mtc/runnerq-go/conductor/internal/wire"
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
 // nextStream returns the next stream.events batch (or fails on a gap unless
 // wantGap).
-func (g *fakeGateway) nextBatch(t *testing.T) streamEvents {
+func (g *fakeGateway) nextBatch(t *testing.T) wire.StreamEvents {
 	t.Helper()
-	var b streamEvents
-	if err := json.Unmarshal(g.waitEvent(typeStreamEvents).Data, &b); err != nil {
+	var b wire.StreamEvents
+	if err := json.Unmarshal(g.waitEvent(wire.TypeStreamEvents).Data, &b); err != nil {
 		t.Fatal(err)
 	}
 	return b
@@ -57,37 +58,37 @@ func (g *fakeGateway) collect(t *testing.T, want ...string) (map[string]bool, st
 	}
 }
 
-func queueFilter(queue string) *wireFilter {
+func queueFilter(queue string) *wire.Filter {
 	return mustFilter(map[string]any{"field": "queue", "op": "eq", "value": queue})
 }
 
 func TestStreamDeliversNewEventsAndResumes(t *testing.T) {
 	e, b, queue := pgEngine(t)
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	startAgent(t, e, g, Config{})
 	h := g.waitHello()
-	if _, ok := h.Capabilities[typeEventsSubscribe]; !ok {
+	if _, ok := h.Capabilities[wire.TypeEventsSubscribe]; !ok {
 		t.Fatal("events.subscribe not advertised")
 	}
 
 	before := enqueue(t, b, `{}`) // before the subscription: not streamed
-	var sub subscription
-	g.ok(typeEventsSubscribe, subscribeRequest{Filter: queueFilter(queue), MaxDelayMS: 50}, &sub)
+	var sub wire.Subscription
+	g.ok(wire.TypeEventsSubscribe, wire.EventsSubscribe{Filter: queueFilter(queue), MaxDelayMS: 50}, &sub)
 	if sub.SubscriptionID == "" || sub.Cursor == "" {
 		t.Fatalf("subscription %+v", sub)
 	}
 	first := enqueue(t, b, `{}`)
 	seen, cursor := g.collect(t, first.String()+"/"+storage.RecordEventCreated)
 	if seen[before.String()+"/"+storage.RecordEventCreated] {
-		t.Fatal("an event from before the subscription was streamed")
+		t.Fatal("an event from before the wire.Subscription was streamed")
 	}
-	g.ok(typeEventsUnsubscribe, subscription{SubscriptionID: sub.SubscriptionID}, nil)
-	g.fails(typeEventsUnsubscribe, subscription{SubscriptionID: sub.SubscriptionID}, codeNotFound)
+	g.ok(wire.TypeEventsUnsubscribe, wire.EventsUnsubscribe{SubscriptionID: sub.SubscriptionID}, nil)
+	g.fails(wire.TypeEventsUnsubscribe, wire.EventsUnsubscribe{SubscriptionID: sub.SubscriptionID}, wire.CodeNotFound)
 
-	// Events while nobody is subscribed are picked up by a subscription that
+	// Events while nobody is subscribed are picked up by a wire.Subscription that
 	// resumes after the last cursor; nothing already delivered is repeated.
 	missed := enqueue(t, b, `{}`)
-	g.ok(typeEventsSubscribe, subscribeRequest{Filter: queueFilter(queue), AfterCursor: cursor, MaxDelayMS: 50}, &sub)
+	g.ok(wire.TypeEventsSubscribe, wire.EventsSubscribe{Filter: queueFilter(queue), AfterCursor: cursor, MaxDelayMS: 50}, &sub)
 	again, _ := g.collect(t, missed.String()+"/"+storage.RecordEventCreated)
 	if again[first.String()+"/"+storage.RecordEventCreated] {
 		t.Fatal("a resumed stream repeated an event before its cursor")
@@ -96,11 +97,11 @@ func TestStreamDeliversNewEventsAndResumes(t *testing.T) {
 
 func TestStreamCatchesLateCommits(t *testing.T) {
 	e, b, queue := pgEngine(t)
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	startAgent(t, e, g, Config{})
 	g.waitHello()
-	var sub subscription
-	g.ok(typeEventsSubscribe, subscribeRequest{Filter: queueFilter(queue), MaxDelayMS: 50}, &sub)
+	var sub wire.Subscription
+	g.ok(wire.TypeEventsSubscribe, wire.EventsSubscribe{Filter: queueFilter(queue), MaxDelayMS: 50}, &sub)
 
 	// A transaction takes an event id, then commits after later events have
 	// already been streamed past it.
@@ -129,31 +130,31 @@ func TestStreamCatchesLateCommits(t *testing.T) {
 
 func TestStreamGapLimitsAndFilters(t *testing.T) {
 	e, b, queue := pgEngine(t)
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	startAgent(t, e, g, Config{})
 	g.waitHello()
 
-	var sub subscription
-	g.ok(typeEventsSubscribe, subscribeRequest{Filter: queueFilter(queue), AfterCursor: "not-a-cursor", MaxDelayMS: 50}, &sub)
-	var gap streamGap
-	if err := json.Unmarshal(g.waitEvent(typeStreamGap).Data, &gap); err != nil || gap.SubscriptionID != sub.SubscriptionID {
+	var sub wire.Subscription
+	g.ok(wire.TypeEventsSubscribe, wire.EventsSubscribe{Filter: queueFilter(queue), AfterCursor: "not-a-cursor", MaxDelayMS: 50}, &sub)
+	var gap wire.StreamGap
+	if err := json.Unmarshal(g.waitEvent(wire.TypeStreamGap).Data, &gap); err != nil || gap.SubscriptionID != sub.SubscriptionID {
 		t.Fatalf("gap %+v %v", gap, err)
 	}
 	if _, err := strconv.ParseInt(sub.Cursor, 10, 64); err != nil {
 		t.Fatalf("subscription after a bad cursor starts at %q", sub.Cursor)
 	}
 
-	g.fails(typeEventsSubscribe, subscribeRequest{Filter: mustFilter(map[string]any{"field": "colour", "op": "eq", "value": "x"})}, codeUnsupported)
+	g.fails(wire.TypeEventsSubscribe, wire.EventsSubscribe{Filter: mustFilter(map[string]any{"field": "colour", "op": "eq", "value": "x"})}, wire.CodeUnsupported)
 	for range maxSubscriptions - 1 {
-		g.ok(typeEventsSubscribe, subscribeRequest{Filter: queueFilter(queue)}, nil)
+		g.ok(wire.TypeEventsSubscribe, wire.EventsSubscribe{Filter: queueFilter(queue)}, nil)
 	}
-	g.fails(typeEventsSubscribe, subscribeRequest{Filter: queueFilter(queue)}, codeResourceExhausted)
+	g.fails(wire.TypeEventsSubscribe, wire.EventsSubscribe{Filter: queueFilter(queue)}, wire.CodeResourceExhausted)
 
 	// Filters apply to the stream: only this queue's "created" events, read
 	// from the start of the log.
-	g.ok(typeEventsUnsubscribe, subscription{SubscriptionID: sub.SubscriptionID}, nil)
+	g.ok(wire.TypeEventsUnsubscribe, wire.EventsUnsubscribe{SubscriptionID: sub.SubscriptionID}, nil)
 	id := enqueue(t, b, `{}`)
-	g.ok(typeEventsSubscribe, subscribeRequest{AfterCursor: "0", MaxDelayMS: 50,
+	g.ok(wire.TypeEventsSubscribe, wire.EventsSubscribe{AfterCursor: "0", MaxDelayMS: 50,
 		Filter: mustFilter(inQueue(queue, map[string]any{"field": "type", "op": "eq", "value": storage.RecordEventCreated}))}, nil)
 	for {
 		batch := g.nextBatch(t)
@@ -176,12 +177,12 @@ func TestStreamGapLimitsAndFilters(t *testing.T) {
 // stream.
 func TestStreamSplitsBatchesToTheFrameLimit(t *testing.T) {
 	e, _, queue := pgEngine(t)
-	g := newFakeGateway(t, sessionConfig{})
+	g := newFakeGateway(t, wire.SessionConfig{})
 	g.frame = 16 << 10
 	startAgent(t, e, g, Config{})
 	g.waitHello()
-	var sub subscription
-	g.ok(typeEventsSubscribe, subscribeRequest{Filter: queueFilter(queue), MaxDelayMS: 50}, &sub)
+	var sub wire.Subscription
+	g.ok(wire.TypeEventsSubscribe, wire.EventsSubscribe{Filter: queueFilter(queue), MaxDelayMS: 50}, &sub)
 
 	ctx := context.Background()
 	conn, err := pgx.Connect(ctx, os.Getenv("RUNNERQ_TEST_DSN"))
@@ -210,12 +211,12 @@ func TestStreamSplitsBatchesToTheFrameLimit(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("stream delivered %d of %d events", len(seen), len(want))
 		}
-		env := g.waitEvent(typeStreamEvents)
+		env := g.waitEvent(wire.TypeStreamEvents)
 		raw, _ := json.Marshal(env)
 		if len(raw) > g.frame {
 			t.Fatalf("a %d-byte frame is over the %d-byte limit", len(raw), g.frame)
 		}
-		var b streamEvents
+		var b wire.StreamEvents
 		if err := json.Unmarshal(env.Data, &b); err != nil {
 			t.Fatal(err)
 		}
@@ -247,7 +248,7 @@ func TestStreamSplitsBatchesToTheFrameLimit(t *testing.T) {
 	}
 }
 
-// A subscription can end while its tailer is writing a frame (the Cloud
+// A wire.Subscription can end while its tailer is writing a frame (the Cloud
 // unsubscribes when the last viewer leaves). That must not take the session
 // down: coder/websocket closes the whole connection when a write's context
 // ends mid-write, so pushes don't write under the subscription's context.
@@ -261,9 +262,9 @@ func TestStreamUnsubscribeMidWriteKeepsTheConnection(t *testing.T) {
 		}
 		defer c.CloseNow()
 		c.SetReadLimit(64 << 20)
-		<-read // hold the push mid-write until the subscription has ended
+		<-read // hold the push mid-write until the wire.Subscription has ended
 		for {
-			var env envelope
+			var env wire.Envelope
 			if err := wsjson.Read(context.Background(), c, &env); err != nil {
 				return
 			}
@@ -282,7 +283,7 @@ func TestStreamUnsubscribeMidWriteKeepsTheConnection(t *testing.T) {
 	pushed := make(chan error, 1)
 	go func() {
 		// Far more than the socket buffers hold, so the write blocks.
-		pushed <- tl.push(ctx, typeStreamEvents, map[string]string{"blob": strings.Repeat("x", 32<<20)})
+		pushed <- tl.push(ctx, wire.TypeStreamEvents, map[string]string{"blob": strings.Repeat("x", 32<<20)})
 	}()
 	time.Sleep(300 * time.Millisecond)
 	cancel() // the Cloud unsubscribed while the frame was being written
@@ -310,7 +311,7 @@ func TestStreamUnsubscribeMidWriteKeepsTheConnection(t *testing.T) {
 				return
 			}
 		case <-time.After(5 * time.Second):
-			t.Fatal("nothing arrived after the subscription ended")
+			t.Fatal("nothing arrived after the wire.Subscription ended")
 		}
 	}
 }

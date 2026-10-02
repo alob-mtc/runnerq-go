@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/alob-mtc/runnerq-go/conductor/internal/wire"
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
@@ -18,18 +19,18 @@ func TestHandlerServesStorage(t *testing.T) {
 	if err := json.Unmarshal(h.Capabilities(), &caps); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{typeActivitiesList, typeActivitiesGet, typeActivitiesAggregate, typeActivitiesCancel} {
+	for _, want := range []string{wire.TypeActivitiesList, wire.TypeActivitiesGet, wire.TypeActivitiesAggregate, wire.TypeActivitiesCancel} {
 		if _, ok := caps[want]; !ok {
 			t.Errorf("capabilities miss %s: %v", want, caps)
 		}
 	}
-	for _, not := range []string{typeExecutorDescribe, typeEventsSubscribe} {
+	for _, not := range []string{wire.TypeExecutorDescribe, wire.TypeEventsSubscribe} {
 		if _, ok := caps[not]; ok {
 			t.Errorf("capabilities include %s", not)
 		}
 	}
 
-	list, err := h.Serve(ctx, typeActivitiesList, mustJSON(t, map[string]any{"filter": inQueue(queue)}))
+	list, err := h.Serve(ctx, wire.TypeActivitiesList, mustJSON(t, map[string]any{"filter": inQueue(queue)}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +48,7 @@ func TestHandlerServesStorage(t *testing.T) {
 	}
 
 	cancel := map[string]any{"command_id": "c1", "target": map[string]any{"ids": []string{id.String()}, "queue": queue}}
-	res, err := h.Serve(ctx, typeActivitiesCancel, mustJSON(t, cancel))
+	res, err := h.Serve(ctx, wire.TypeActivitiesCancel, mustJSON(t, cancel))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,32 +60,32 @@ func TestHandlerServesStorage(t *testing.T) {
 	}
 
 	other := map[string]any{"command_id": "c2", "target": map[string]any{"ids": []string{id.String()}, "queue": "elsewhere"}}
-	if _, err := h.Serve(ctx, typeActivitiesCancel, mustJSON(t, other)); err == nil || err.Code != string(codeFailedPrecondition) {
+	if _, err := h.Serve(ctx, wire.TypeActivitiesCancel, mustJSON(t, other)); err == nil || err.Code != string(wire.CodeFailedPrecondition) {
 		t.Fatalf("another queue's command: %v", err)
 	}
-	if _, err := h.Serve(ctx, typeExecutorDescribe, nil); err == nil || err.Code != string(codeUnsupported) {
+	if _, err := h.Serve(ctx, wire.TypeExecutorDescribe, nil); err == nil || err.Code != string(wire.CodeUnsupported) {
 		t.Fatalf("executor.describe: %v", err)
 	}
-	if _, err := h.Serve(ctx, typeActivitiesGet, mustJSON(t, map[string]any{"id": "not-an-id"})); err == nil {
+	if _, err := h.Serve(ctx, wire.TypeActivitiesGet, mustJSON(t, map[string]any{"id": "not-an-id"})); err == nil {
 		t.Fatal("bad id accepted")
 	}
 
 	readOnly := NewHandler(b, HandlerConfig{})
-	if _, err := readOnly.Serve(ctx, typeActivitiesCancel, mustJSON(t, cancel)); err == nil || err.Code != string(codeUnsupported) {
+	if _, err := readOnly.Serve(ctx, wire.TypeActivitiesCancel, mustJSON(t, cancel)); err == nil || err.Code != string(wire.CodeUnsupported) {
 		t.Fatalf("command without AllowControl: %v", err)
 	}
 
 	// Commands act on the queue the backend reports: one that can't say
 	// which queue it acts on gets none, and still serves reads.
 	anonymous := NewHandler(unnamed{b, b, b}, HandlerConfig{AllowControl: true})
-	if _, err := anonymous.Serve(ctx, typeActivitiesCancel, mustJSON(t, cancel)); err == nil || err.Code != string(codeUnsupported) {
+	if _, err := anonymous.Serve(ctx, wire.TypeActivitiesCancel, mustJSON(t, cancel)); err == nil || err.Code != string(wire.CodeUnsupported) {
 		t.Fatalf("command on a backend with no queue: %v", err)
 	}
 	var anonCaps map[string]json.RawMessage
-	if json.Unmarshal(anonymous.Capabilities(), &anonCaps); anonCaps[typeActivitiesCancel] != nil || anonCaps[typeActivitiesList] == nil {
+	if json.Unmarshal(anonymous.Capabilities(), &anonCaps); anonCaps[wire.TypeActivitiesCancel] != nil || anonCaps[wire.TypeActivitiesList] == nil {
 		t.Fatalf("capabilities of a backend with no queue: %v", anonCaps)
 	}
-	if _, err := anonymous.Serve(ctx, typeActivitiesList, mustJSON(t, map[string]any{"filter": inQueue(queue)})); err != nil {
+	if _, err := anonymous.Serve(ctx, wire.TypeActivitiesList, mustJSON(t, map[string]any{"filter": inQueue(queue)})); err != nil {
 		t.Fatalf("read on a backend with no queue: %v", err)
 	}
 }
@@ -99,7 +100,7 @@ type unnamed struct {
 func TestHandlerRecoversPanics(t *testing.T) {
 	h := NewHandler(unnamed{}, HandlerConfig{})
 	h.table["boom"] = func(context.Context, json.RawMessage) (any, error) { panic("boom") }
-	if _, err := h.Serve(context.Background(), "boom", nil); err == nil || err.Code != string(codeInternal) {
+	if _, err := h.Serve(context.Background(), "boom", nil); err == nil || err.Code != string(wire.CodeInternal) {
 		t.Fatalf("panic: %v", err)
 	}
 }
