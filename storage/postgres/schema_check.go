@@ -5,59 +5,40 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"regexp"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/alob-mtc/runnerq-go/internal/spec"
 )
 
 // No-op DDL still locks: ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE and
 // CREATE INDEX IF NOT EXISTS takes SHARE before checking IF NOT EXISTS, so each
 // process start would stall live claims/acks/parks elsewhere and risk being a
 // deadlock victim. initSchema first checks the catalog and skips DDL entirely
-// when current. The expectation is parsed from schemaSql and dequeueIndexes,
-// so new objects extend the check automatically (TestSchemaExpectation guards
-// the parser).
+// when current. The expectation is runnerq-spec's catalog: what the migrations
+// and concurrent indexes produce.
 type schemaExpectation struct {
 	tables         []string
 	columns        []string // "table.column"
 	indexes        []string // must be valid
-	retired        []string // dequeueIndexes predecessors (must be gone)
-	retiredColumns []string // "table.column"; schemaSql moves their data and drops them
+	retired        []string // replaced concurrent indexes (must be gone)
+	retiredColumns []string // "table.column"; the migrations move their data and drop them
 }
 
-var (
-	schemaCommentRe = regexp.MustCompile(`(?m)--[^\n]*`)
-	schemaTableRe   = regexp.MustCompile(`(?i)CREATE TABLE IF NOT EXISTS (\w+)`)
-	schemaIndexRe   = regexp.MustCompile(`(?i)CREATE (?:UNIQUE )?INDEX (?:CONCURRENTLY )?IF NOT EXISTS (\w+)`)
-	schemaAlterRe   = regexp.MustCompile(`(?is)ALTER TABLE (\w+)(.*?);`)
-	schemaColumnRe  = regexp.MustCompile(`(?i)ADD COLUMN IF NOT EXISTS (\w+)`)
-)
-
 var expectedSchema = sync.OnceValue(func() schemaExpectation {
-	ddl := schemaCommentRe.ReplaceAllString(schemaSql, "")
-	var e schemaExpectation
-	for _, m := range schemaTableRe.FindAllStringSubmatch(ddl, -1) {
-		e.tables = append(e.tables, strings.ToLower(m[1]))
-	}
-	for _, m := range schemaIndexRe.FindAllStringSubmatch(ddl, -1) {
-		e.indexes = append(e.indexes, strings.ToLower(m[1]))
-	}
-	for _, alter := range schemaAlterRe.FindAllStringSubmatch(ddl, -1) {
-		table := strings.ToLower(alter[1])
-		for _, col := range schemaColumnRe.FindAllStringSubmatch(alter[2], -1) {
-			e.columns = append(e.columns, table+"."+strings.ToLower(col[1]))
+	c := spec.PostgresCatalog
+	e := schemaExpectation{retired: c.RetiredIndexes, retiredColumns: c.RetiredColumns}
+	for _, t := range c.Tables {
+		e.tables = append(e.tables, t.Name)
+		for _, col := range t.Columns {
+			e.columns = append(e.columns, t.Name+"."+col.Name)
 		}
 	}
-	e.retiredColumns = []string{"runnerq_activities.payload"}
-	for _, idx := range dequeueIndexes {
-		e.indexes = append(e.indexes, strings.ToLower(idx.name))
-		if idx.dropAfter != "" {
-			e.retired = append(e.retired, strings.ToLower(idx.dropAfter))
-		}
+	for _, idx := range c.Indexes {
+		e.indexes = append(e.indexes, idx.Name)
 	}
 	return e
 })
