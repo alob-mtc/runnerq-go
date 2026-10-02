@@ -277,6 +277,21 @@ durable sleep, crash recovery) is built and integration-tested against
 Postgres, but APIs may still change before 1.0. See [RELEASING.md](RELEASING.md)
 for the stability policy.
 
+## Development
+
+Values and rules shared with the TypeScript SDK (key formats, notification
+channels, error kinds) come from [runnerq-spec](https://github.com/runnerq/runnerq-spec),
+checked out as the `spec` submodule:
+
+```sh
+git submodule update --init
+go generate ./internal/spec   # after bumping spec: regenerate the constants
+RUNNERQ_TEST_DSN=postgres://... go test ./... -race
+```
+
+The vector tests (`TestSpec*`) need the submodule; the Postgres tests need
+`RUNNERQ_TEST_DSN`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

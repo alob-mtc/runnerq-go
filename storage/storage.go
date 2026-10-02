@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/alob-mtc/runnerq-go/internal/spec"
 )
 
 // ActivityPriority determines execution ordering.
@@ -61,7 +63,7 @@ type QueuedActivity struct {
 }
 
 // SerializationJSON is plain JSON, the encoding an empty Serialization means.
-const SerializationJSON = "json-v1"
+const SerializationJSON = spec.SerializationJSON
 
 // IdempotencyKeyConfig holds a key and its behavior.
 type IdempotencyKeyConfig struct {

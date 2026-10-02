@@ -3,29 +3,33 @@ package storage
 import (
 	"errors"
 	"fmt"
+
+	"github.com/alob-mtc/runnerq-go/internal/spec"
 )
 
+// StorageErrorKind numbers are stored and sent on the wire; runnerq-spec
+// fixes them.
 type StorageErrorKind int
 
 const (
-	ErrUnavailable StorageErrorKind = iota
-	ErrConflict
-	ErrNotFound
-	ErrInternal
-	ErrSerialization
-	ErrConfiguration
-	ErrTimeout
-	ErrDuplicateActivity
-	ErrIdempotencyConflict
+	ErrUnavailable         StorageErrorKind = spec.StorageErrorKindUnavailable
+	ErrConflict            StorageErrorKind = spec.StorageErrorKindConflict
+	ErrNotFound            StorageErrorKind = spec.StorageErrorKindNotFound
+	ErrInternal            StorageErrorKind = spec.StorageErrorKindInternal
+	ErrSerialization       StorageErrorKind = spec.StorageErrorKindSerialization
+	ErrConfiguration       StorageErrorKind = spec.StorageErrorKindConfiguration
+	ErrTimeout             StorageErrorKind = spec.StorageErrorKindTimeout
+	ErrDuplicateActivity   StorageErrorKind = spec.StorageErrorKindDuplicateActivity
+	ErrIdempotencyConflict StorageErrorKind = spec.StorageErrorKindIdempotencyConflict
 	// ErrClaimLost: the execution no longer owns the activity.
-	ErrClaimLost
+	ErrClaimLost StorageErrorKind = spec.StorageErrorKindClaimLost
 	// ErrCheckpointConflict: an immutable checkpoint has a different outcome.
-	ErrCheckpointConflict
+	ErrCheckpointConflict StorageErrorKind = spec.StorageErrorKindCheckpointConflict
 	// ErrInvalidArgument: malformed or out-of-range input named by Field.
-	ErrInvalidArgument
+	ErrInvalidArgument StorageErrorKind = spec.StorageErrorKindInvalidArgument
 	// ErrUnsupported: a query feature the backend cannot evaluate, named by
 	// Field.
-	ErrUnsupported
+	ErrUnsupported StorageErrorKind = spec.StorageErrorKindUnsupported
 )
 
 // StorageError is a backend-agnostic storage error.

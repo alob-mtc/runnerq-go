@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/alob-mtc/runnerq-go/internal/spec"
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
@@ -124,7 +125,7 @@ func validateQueueName(name string) error {
 
 // schemaAdvisoryLockKey is arbitrary but must stay stable forever: every
 // RunnerQ instance on the database must agree on it.
-const schemaAdvisoryLockKey int64 = 0x52554E4E45525121 // "RUNNERQ!"
+const schemaAdvisoryLockKey = spec.SchemaAdvisoryLockKey
 
 func (b *PostgresBackend) initSchema(ctx context.Context) error {
 	conn, err := b.pool.Acquire(ctx)

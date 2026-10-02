@@ -4,13 +4,24 @@ import (
 	"encoding/base64"
 	"strconv"
 	"strings"
+
+	"github.com/google/uuid"
+
+	"github.com/alob-mtc/runnerq-go/internal/spec"
 )
 
-const businessKeyPrefix = "rq:key:v2:"
+const businessKeyPrefix = spec.BusinessKeyPrefix
 
 // StepKeyPrefix starts the keys the engine derives for activities spawned by
 // a step; they are not application keys.
-const StepKeyPrefix = "rq:step:"
+const StepKeyPrefix = spec.StepKeyPrefix
+
+// StepIdempotencyKey is the key of the activity a step spawns under parent in
+// root's tree. A retried parent re-issuing the spawn derives the same key and
+// gets the existing child.
+func StepIdempotencyKey(root, parent uuid.UUID, step string) string {
+	return StepKeyPrefix + root.String() + ":" + parent.String() + ":" + step
+}
 
 // BusinessIdempotencyKey encodes (key, activityType) unambiguously. Base64
 // has no '-', so a v2 key never equals a legacy "<key>-<type>" key or an
