@@ -5,7 +5,7 @@
 package spec
 
 // Version is the runnerq-spec release these constants come from.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // SchemaAdvisoryLockKey is the Postgres advisory lock every implementation
 // holds while it creates, migrates or checks the schema (0x52554E4E45525121,
@@ -20,6 +20,10 @@ const WorkChannelPrefix = "rq_w_"
 // announcing committed results; the payload is comma-joined activity IDs. The
 // queue name follows.
 const ResultChannelPrefix = "rq_r_"
+
+// DefaultMaxRetryDelaySeconds is the cap on retry backoff when an activity
+// sets none (max_retry_delay_seconds 0); vectors/retry_delay.json.
+const DefaultMaxRetryDelaySeconds = 3600
 
 // BusinessKeyPrefix is the prefix of an encoded application idempotency key
 // (vectors/business_key.json).

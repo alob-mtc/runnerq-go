@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -963,27 +962,8 @@ func (b *PostgresBackend) AckFailure(ctx context.Context, activityID uuid.UUID, 
 	}
 
 	errorMessage := failure.Reason
-	canRetry := ar.maxRetries == 0 || (ar.retryCount+1) < ar.maxRetries
-
-	if failure.Retryable && canRetry {
-		const overflowCap = int64(math.MaxInt64 / int64(time.Second))
-		baseDelay := int64(ar.retryDelaySeconds)
-		shift := min(ar.retryCount+1, 62)
-		backoffMult := int64(1) << shift
-		retryDelay := overflowCap
-		if baseDelay > 0 && baseDelay <= overflowCap/backoffMult {
-			retryDelay = baseDelay * backoffMult
-		} else if baseDelay <= 0 {
-			retryDelay = 0
-		}
-		// 0 means the default cap of 3600s.
-		maxCap := ar.maxRetryDelaySeconds
-		if maxCap <= 0 {
-			maxCap = 3600
-		}
-		if retryDelay > maxCap {
-			retryDelay = maxCap
-		}
+	if failure.Retryable && storage.AttemptsRemain(int(ar.retryCount), int(ar.maxRetries)) {
+		retryDelay := storage.RetryDelaySeconds(int(ar.retryCount), ar.retryDelaySeconds, ar.maxRetryDelaySeconds)
 		// Event-detail estimate only: scheduled_at uses the database clock
 		// below, so retry timing is immune to app-clock skew.
 		scheduledAt := now.Add(time.Duration(retryDelay) * time.Second)
