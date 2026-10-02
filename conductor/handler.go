@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
+	"github.com/alob-mtc/runnerq-go/conductor/internal/wire"
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
@@ -56,7 +57,7 @@ func NewHandler(backend storage.Storage, cfg HandlerConfig) *Handler {
 		h.queue = named.QueueName()
 	}
 	t := h.table()
-	delete(t, typeExecutorDescribe)
+	delete(t, wire.TypeExecutorDescribe)
 	return &Handler{h: h, table: t}
 }
 
@@ -65,20 +66,20 @@ func NewHandler(backend storage.Storage, cfg HandlerConfig) *Handler {
 func (h *Handler) Serve(ctx context.Context, msgType string, data json.RawMessage) (res json.RawMessage, werr *Error) {
 	defer func() {
 		if p := recover(); p != nil {
-			res, werr = nil, wire(errorf(codeInternal, "handler panicked"))
+			res, werr = nil, public(errorf(wire.CodeInternal, "handler panicked"))
 		}
 	}()
 	serve, ok := h.table[msgType]
 	if !ok {
-		return nil, wire(errorf(codeUnsupported, "this handler does not serve %q", msgType))
+		return nil, public(errorf(wire.CodeUnsupported, "this handler does not serve %q", msgType))
 	}
 	out, err := serve(ctx, data)
 	if err != nil {
-		return nil, wire(toWireError(err))
+		return nil, public(toWireError(err))
 	}
 	encoded, err := json.Marshal(out)
 	if err != nil {
-		return nil, wire(errorf(codeInternal, "encode response: %v", err))
+		return nil, public(errorf(wire.CodeInternal, "encode response: %v", err))
 	}
 	return encoded, nil
 }
@@ -87,14 +88,14 @@ func (h *Handler) Serve(ctx context.Context, msgType string, data json.RawMessag
 // message type, as in an agent's hello.
 func (h *Handler) Capabilities() json.RawMessage {
 	caps := h.h.capabilities()
-	delete(caps, typeExecutorDescribe)
+	delete(caps, wire.TypeExecutorDescribe)
 	// Live events need a connection, which a Handler doesn't have.
-	delete(caps, typeEventsSubscribe)
-	delete(caps, typeEventsUnsubscribe)
+	delete(caps, wire.TypeEventsSubscribe)
+	delete(caps, wire.TypeEventsUnsubscribe)
 	b, _ := json.Marshal(caps)
 	return b
 }
 
-func wire(e *wireError) *Error {
+func public(e *wireError) *Error {
 	return &Error{Code: string(e.Code), Message: e.Message, Details: e.Details}
 }

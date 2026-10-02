@@ -19,16 +19,27 @@ type Case[In, Out any] struct {
 	Output Out    `json:"output"`
 }
 
+// Path is the path of a spec file, given relative to the spec root.
+func Path(rel string) string {
+	_, file, _, _ := runtime.Caller(0)
+	return filepath.Join(filepath.Dir(file), "..", "..", "spec", filepath.FromSlash(rel))
+}
+
+// Read reads a spec file, given relative to the spec root.
+func Read(t testing.TB, rel string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(Path(rel))
+	if err != nil {
+		t.Fatalf("%v (is the spec submodule checked out? git submodule update --init)", err)
+	}
+	return raw
+}
+
 // Load reads the cases of a vector file, given relative to the spec root
 // (e.g. "vectors/checkpoint_id.json").
 func Load[In, Out any](t testing.TB, rel string) []Case[In, Out] {
 	t.Helper()
-	_, file, _, _ := runtime.Caller(0)
-	path := filepath.Join(filepath.Dir(file), "..", "..", "spec", filepath.FromSlash(rel))
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("%v (is the spec submodule checked out? git submodule update --init)", err)
-	}
+	raw := Read(t, rel)
 	var f struct {
 		Description string          `json:"description"`
 		Cases       []Case[In, Out] `json:"cases"`

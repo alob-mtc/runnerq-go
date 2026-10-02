@@ -9,17 +9,18 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/alob-mtc/runnerq-go/conductor/internal/wire"
 	"github.com/alob-mtc/runnerq-go/storage"
 )
 
 var commandKinds = map[string]storage.CommandKind{
-	typeActivitiesCancel:      storage.CommandCancel,
-	typeActivitiesRetry:       storage.CommandRetry,
-	typeActivitiesRunNow:      storage.CommandRunNow,
-	typeActivitiesReschedule:  storage.CommandReschedule,
-	typeActivitiesSetPriority: storage.CommandSetPriority,
-	typeActivitiesDelete:      storage.CommandDelete,
-	typeActivitiesSignal:      storage.CommandSignal,
+	wire.TypeActivitiesCancel:      storage.CommandCancel,
+	wire.TypeActivitiesRetry:       storage.CommandRetry,
+	wire.TypeActivitiesRunNow:      storage.CommandRunNow,
+	wire.TypeActivitiesReschedule:  storage.CommandReschedule,
+	wire.TypeActivitiesSetPriority: storage.CommandSetPriority,
+	wire.TypeActivitiesDelete:      storage.CommandDelete,
+	wire.TypeActivitiesSignal:      storage.CommandSignal,
 }
 
 func (h *handlers) addCommands(t map[string]handlerFunc) {
@@ -31,16 +32,16 @@ func (h *handlers) addCommands(t map[string]handlerFunc) {
 	}
 }
 
-func (h *handlers) commandCapabilities(caps map[string]capability) {
+func (h *handlers) commandCapabilities(caps map[string]wire.Capability) {
 	if h.cs == nil || !h.allowControl {
 		return
 	}
 	for msgType, kind := range commandKinds {
-		targets := []string{"filter", "ids"}
+		targets := []wire.TargetKind{wire.TargetFilter, wire.TargetIDs}
 		if kind == storage.CommandSignal {
-			targets = []string{"filter", "idempotency_key", "ids"}
+			targets = []wire.TargetKind{wire.TargetFilter, wire.TargetIdempotencyKey, wire.TargetIDs}
 		}
-		caps[msgType] = capability{V: 1, Targets: targets}
+		caps[msgType] = wire.Capability{V: 1, Targets: targets}
 	}
 }
 
@@ -58,23 +59,26 @@ func fingerprint(data json.RawMessage) string {
 
 func (h *handlers) command(kind storage.CommandKind) handlerFunc {
 	return func(ctx context.Context, data json.RawMessage) (any, error) {
-		req, err := decode[commandRequest](data)
+		cmd, target, err := toCommand(kind, data)
 		if err != nil {
 			return nil, err
 		}
-		cmd, badIDs, err := h.toCommand(kind, req)
+		if q := target.Queue; q != "" && q != h.queue {
+			return nil, fieldError(wire.CodeFailedPrecondition, "target.queue", "this executor serves queue %q, not %q", h.queue, q)
+		}
+		badIDs, err := toTarget(&cmd, target)
 		if err != nil {
 			return nil, err
 		}
 		cmd.Fingerprint = fingerprint(data)
 
 		res := &storage.CommandResult{}
-		if len(req.Target.IDs) == 0 || len(cmd.Target.IDs) > 0 {
+		if len(target.IDs) == 0 || len(cmd.Target.IDs) > 0 {
 			res, err = h.cs.ApplyCommand(ctx, cmd)
 		} // else every id was foreign
 		if err != nil {
 			if se, ok := storage.IsStorageError(err); ok && se.Kind == storage.ErrConflict {
-				return nil, errorf(codeConflict, "%s", se.Message)
+				return nil, errorf(wire.CodeConflict, "%s", se.Message)
 			}
 			return nil, err
 		}
@@ -87,16 +91,16 @@ func (h *handlers) command(kind storage.CommandKind) handlerFunc {
 			}
 		}
 
-		out := commandResult{Matched: res.Matched, Applied: res.Applied, Cascaded: res.Cascaded,
-			More: res.More, Replayed: res.Replayed, Results: make([]commandItem, 0, len(res.Items)+len(badIDs))}
+		out := wire.CommandResult{Matched: res.Matched, Applied: res.Applied, Cascaded: res.Cascaded,
+			More: res.More, Replayed: res.Replayed, Results: make([]wire.CommandItem, 0, len(res.Items)+len(badIDs))}
 		for _, it := range res.Items {
-			ci := commandItem{ID: it.ID.String(), Outcome: it.Outcome, Status: it.Status}
+			ci := wire.CommandItem{ID: it.ID.String(), Outcome: wire.CommandOutcome(it.Outcome), Status: wire.ActivityStatus(it.Status)}
 			switch {
 			case it.ErrMessage == "":
 			case it.ErrKind == storage.ErrNotFound:
-				ci.Error = errorf(codeNotFound, "%s", it.ErrMessage)
+				ci.Error = (*wire.Error)(errorf(wire.CodeNotFound, "%s", it.ErrMessage))
 			default:
-				ci.Error = errorf(codeFailedPrecondition, "%s", it.ErrMessage)
+				ci.Error = (*wire.Error)(errorf(wire.CodeFailedPrecondition, "%s", it.ErrMessage))
 				if it.Status != "" {
 					ci.Error.Details = map[string]any{"status": it.Status}
 				}
@@ -105,70 +109,90 @@ func (h *handlers) command(kind storage.CommandKind) handlerFunc {
 		}
 		// Ids this backend could not have issued do not exist.
 		for _, id := range badIDs {
-			out.Results = append(out.Results, commandItem{ID: id, Outcome: storage.CommandSkipped,
-				Error: errorf(codeNotFound, "no such activity")})
+			out.Results = append(out.Results, wire.CommandItem{ID: id, Outcome: wire.OutcomeSkipped,
+				Error: (*wire.Error)(errorf(wire.CodeNotFound, "no such activity"))})
 		}
 		return out, nil
 	}
 }
 
-// toCommand also returns the target ids this backend could not have issued.
-func (h *handlers) toCommand(kind storage.CommandKind, req commandRequest) (storage.Command, []string, error) {
-	cmd := storage.Command{ID: req.CommandID, Kind: kind, DryRun: req.DryRun, Reason: req.Reason}
-	if q := req.Target.Queue; q != "" && q != h.queue {
-		e := fieldError(codeFailedPrecondition, "target.queue", "this executor serves queue %q, not %q", h.queue, q)
-		return cmd, nil, e
+// toCommand decodes the command's own request type strictly, so each command
+// accepts only its own fields.
+func toCommand(kind storage.CommandKind, data json.RawMessage) (storage.Command, wire.Target, error) {
+	cmd := storage.Command{Kind: kind}
+	var target wire.Target
+	common := func(id string, t wire.Target, dryRun bool, reason string) {
+		cmd.ID, target, cmd.DryRun, cmd.Reason = id, t, dryRun, reason
 	}
-
-	// Each command accepts only its own fields.
-	unexpected := func(field string, set bool) error {
-		if set {
-			return fieldError(codeInvalidArgument, field, "%s does not apply to %s", field, kind)
-		}
-		return nil
-	}
-	for field, set := range map[string]bool{
-		"cascade":        req.Cascade != "" && kind != storage.CommandCancel && kind != storage.CommandDelete,
-		"reset_attempts": req.ResetAttempts && kind != storage.CommandRetry,
-		"at":             req.At != "" && kind != storage.CommandReschedule,
-		"priority":       req.Priority != 0 && kind != storage.CommandSetPriority,
-		"name":           req.Name != "" && kind != storage.CommandSignal,
-		"payload":        len(req.Payload) > 0 && kind != storage.CommandSignal,
-	} {
-		if err := unexpected(field, set); err != nil {
-			return cmd, nil, err
-		}
-	}
-
 	switch kind {
 	case storage.CommandCancel:
-		switch req.Cascade {
-		case "", "children":
-			cmd.CascadeChildren = true // cascading is the default
-		case "none":
-		default:
-			return cmd, nil, fieldError(codeInvalidArgument, "cascade", "cascade must be children or none")
+		req, err := decode[wire.CancelRequest](data)
+		if err != nil {
+			return cmd, target, err
 		}
-	case storage.CommandDelete:
-		if req.Cascade != "" && req.Cascade != "tree" {
-			return cmd, nil, fieldError(codeInvalidArgument, "cascade", "delete always removes the whole tree")
+		common(req.CommandID, req.Target, req.DryRun, req.Reason)
+		switch req.Cascade {
+		case "", wire.CascadeChildren:
+			cmd.CascadeChildren = true // cascading is the default
+		case wire.CascadeNone:
+		default:
+			return cmd, target, fieldError(wire.CodeInvalidArgument, "cascade", "cascade must be children or none")
 		}
 	case storage.CommandRetry:
+		req, err := decode[wire.RetryRequest](data)
+		if err != nil {
+			return cmd, target, err
+		}
+		common(req.CommandID, req.Target, req.DryRun, req.Reason)
 		cmd.ResetAttempts = req.ResetAttempts
+	case storage.CommandRunNow:
+		req, err := decode[wire.RunNowRequest](data)
+		if err != nil {
+			return cmd, target, err
+		}
+		common(req.CommandID, req.Target, req.DryRun, req.Reason)
 	case storage.CommandReschedule:
+		req, err := decode[wire.RescheduleRequest](data)
+		if err != nil {
+			return cmd, target, err
+		}
+		common(req.CommandID, req.Target, req.DryRun, req.Reason)
 		at, err := time.Parse(time.RFC3339Nano, req.At)
 		if err != nil {
-			return cmd, nil, fieldError(codeInvalidArgument, "at", "at must be an RFC 3339 timestamp")
+			return cmd, target, fieldError(wire.CodeInvalidArgument, "at", "at must be an RFC 3339 timestamp")
 		}
 		cmd.At = at
 	case storage.CommandSetPriority:
+		req, err := decode[wire.SetPriorityRequest](data)
+		if err != nil {
+			return cmd, target, err
+		}
+		common(req.CommandID, req.Target, req.DryRun, req.Reason)
 		cmd.Priority = storage.ActivityPriority(req.Priority)
+	case storage.CommandDelete:
+		req, err := decode[wire.DeleteRequest](data)
+		if err != nil {
+			return cmd, target, err
+		}
+		common(req.CommandID, req.Target, req.DryRun, req.Reason)
+		if req.Cascade != "" && req.Cascade != wire.CascadeTree {
+			return cmd, target, fieldError(wire.CodeInvalidArgument, "cascade", `delete removes the whole tree: cascade must be "tree"`)
+		}
 	case storage.CommandSignal:
+		req, err := decode[wire.SignalRequest](data)
+		if err != nil {
+			return cmd, target, err
+		}
+		common(req.CommandID, req.Target, req.DryRun, req.Reason)
 		cmd.SignalName, cmd.SignalPayload = req.Name, req.Payload
 	}
+	return cmd, target, nil
+}
 
+// toTarget sets cmd's target and returns the target ids this backend could
+// not have issued.
+func toTarget(cmd *storage.Command, t wire.Target) ([]string, error) {
 	var badIDs []string
-	t := req.Target
 	switch {
 	case len(t.IDs) > 0:
 		for _, s := range t.IDs {
@@ -181,14 +205,14 @@ func (h *handlers) toCommand(kind storage.CommandKind, req commandRequest) (stor
 	case t.Filter != nil:
 		f, err := toStorageFilter(t.Filter)
 		if err != nil {
-			return cmd, nil, err
+			return nil, err
 		}
 		cmd.Target.Filter, cmd.Target.Max = f, t.Max
 	case t.IdempotencyKey != "":
 		if t.Type == "" {
-			return cmd, nil, fieldError(codeInvalidArgument, "target.type", "an idempotency_key target needs the activity type")
+			return nil, fieldError(wire.CodeInvalidArgument, "target.type", "an idempotency_key target needs the activity type")
 		}
 		cmd.Target.IdempotencyKey = storage.BusinessIdempotencyKey(t.IdempotencyKey, t.Type)
 	}
-	return cmd, badIDs, nil
+	return badIDs, nil
 }
