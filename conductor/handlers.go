@@ -73,7 +73,7 @@ var (
 )
 
 func (h *handlers) capabilities() map[string]wire.Capability {
-	caps := map[string]wire.Capability{wire.TypeExecutorDescribe: {V: 1}}
+	caps := map[string]wire.Capability{wire.TypeExecutorDescribe: {V: 1}, wire.TypeActivityNotices: {V: 1}}
 	h.commandCapabilities(caps)
 	if h.qs == nil {
 		return caps

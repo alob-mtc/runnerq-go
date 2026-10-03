@@ -86,6 +86,35 @@ type Observer interface {
 	ExecutorStopped(id string)
 }
 
+// ChangeKind is a lifecycle change no event is stored for: the activity's
+// own times say it, so it can only be announced as it happens.
+type ChangeKind int
+
+const (
+	Created          ChangeKind = iota // submitted, runnable now
+	Scheduled                          // submitted to run later
+	AttemptStarted                     // claimed by this executor
+	AttemptSucceeded                   // completed by this executor
+)
+
+// Change is one lifecycle change this executor made.
+type Change struct {
+	Kind         ChangeKind
+	ActivityID   uuid.UUID
+	ActivityType string
+	// RootID is the activity's workflow root: its own id for a root.
+	RootID uuid.UUID
+	// Attempt is set for AttemptStarted and AttemptSucceeded.
+	Attempt int
+	At      time.Time
+}
+
+// Announcer hears every Change an engine makes, as it makes it, from the
+// goroutine that made it. Announce must not block.
+type Announcer interface {
+	Announce(Change)
+}
+
 // ThisSDK names the runnerq-go SDK in this binary; Version is "unknown"
 // without build information.
 func ThisSDK() SDK {

@@ -54,6 +54,12 @@ engine.Start(ctx)
   its event log (`events.subscribe`), resuming from the last cursor on
   another executor if that one goes away. Events whose transaction commits
   late are caught by rescanning just below the cursor.
+- **Live notices.** Submissions, claims and successes store no event (an
+  activity's own times record them). While someone is watching the app, each
+  agent announces the ones its engine makes instead: what it claims and
+  completes, and what its `ActivityExecutor`s submit (`engine.Announce` is the
+  hook). A process without an agent announces nothing. Best effort and never
+  stored.
 - **Metadata-only mode.** Set per app in the Cloud (applied live), or forced
   locally with `MetadataOnly: true`, which the Cloud cannot relax. Payloads,
   results, errors and event details are never sent.

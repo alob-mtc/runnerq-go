@@ -369,7 +369,7 @@ func TestHelloDescribesExecutor(t *testing.T) {
 		t.Fatalf("hello %+v", h)
 	}
 	// A backend without QueryStorage serves only executor-scoped messages.
-	if _, ok := h.Capabilities[wire.TypeExecutorDescribe]; !ok || len(h.Capabilities) != 1 {
+	if _, ok := h.Capabilities[wire.TypeExecutorDescribe]; !ok || len(h.Capabilities) != 2 {
 		t.Fatalf("capabilities %+v", h.Capabilities)
 	}
 	for deadline := time.Now().Add(5 * time.Second); !a.Connected() || a.SessionID() == ""; {

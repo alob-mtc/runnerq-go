@@ -306,6 +306,7 @@ type ActivityExecutor struct {
 	queue    activityQueue
 	maxDepth uint16
 	lineage  *lineageScope // nil outside a handler
+	announce *announcer
 }
 
 type lineageScope struct {
@@ -314,11 +315,11 @@ type lineageScope struct {
 	childDepth uint16 // parent.Depth + 1
 }
 
-func newActivityExecutor(queue activityQueue, maxDepth uint16) *ActivityExecutor {
+func newActivityExecutor(queue activityQueue, maxDepth uint16, announce *announcer) *ActivityExecutor {
 	if maxDepth == 0 {
 		maxDepth = DefaultMaxActivityDepth
 	}
-	return &ActivityExecutor{queue: queue, maxDepth: maxDepth}
+	return &ActivityExecutor{queue: queue, maxDepth: maxDepth, announce: announce}
 }
 
 func (w *ActivityExecutor) scopedForChild(parent *activity) *ActivityExecutor {
@@ -334,6 +335,7 @@ func (w *ActivityExecutor) scopedForChild(parent *activity) *ActivityExecutor {
 	return &ActivityExecutor{
 		queue:    w.queue,
 		maxDepth: w.maxDepth,
+		announce: w.announce,
 		lineage: &lineageScope{
 			parentID:   parent.ID,
 			rootID:     rootID,
@@ -397,6 +399,7 @@ func (w *ActivityExecutor) executeActivity(ctx context.Context, activityType str
 			return nil, WorkerErrorFromStorage(err)
 		}
 		if existing == nil {
+			w.announce.submitted(a)
 			return &ActivityFuture{queue: w.queue, activityID: activityID}, nil
 		}
 		// Another parent reusing an existing child: the row keeps its original
@@ -419,6 +422,7 @@ func (w *ActivityExecutor) executeActivity(ctx context.Context, activityType str
 	if err := w.queue.Enqueue(ctx, a); err != nil {
 		return nil, WorkerErrorFromStorage(err)
 	}
+	w.announce.submitted(a)
 
 	return &ActivityFuture{queue: w.queue, activityID: activityID}, nil
 }
