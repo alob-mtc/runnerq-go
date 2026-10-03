@@ -168,9 +168,6 @@ func TestDequeueBatchClaimsInDequeueOrderWithFencedTokens(t *testing.T) {
 		if status, _ := activityStatus(t, b, c.Activity.ID); status != "processing" {
 			t.Fatalf("status = %q, want processing", status)
 		}
-		if !hasEvent(t, b, c.Activity.ID, storage.EventDequeued) {
-			t.Fatalf("activity %s has no dequeue event", c.Activity.ID)
-		}
 	}
 
 	// Rows claimed together are still fenced apart: a sibling's token is
@@ -276,7 +273,7 @@ func TestEnqueueIdempotentRepairsOrphanedKey(t *testing.T) {
 	}
 }
 
-// Tier 0.5: lease deadlines come from the database clock and ExtendLease
+// Tier 0.5: lease deadlines come from the database clock and a renewal
 // pushes them forward; a non-processing activity cannot have its lease
 // extended.
 func TestLeaseUsesDBClockAndExtends(t *testing.T) {
@@ -302,7 +299,7 @@ func TestLeaseUsesDBClockAndExtends(t *testing.T) {
 		t.Fatalf("fresh lease %d is not in the database's future (db now %d)", leaseMS, dbNowMS)
 	}
 
-	ok, err := b.ExtendLease(ctx, a.ID, 10*time.Minute)
+	ok, err := b.ExtendLeaseForWorker(ctx, a.ID, "w1", 10*time.Minute)
 	if err != nil || !ok {
 		t.Fatalf("extend lease: ok=%v err=%v", ok, err)
 	}
@@ -318,7 +315,7 @@ func TestLeaseUsesDBClockAndExtends(t *testing.T) {
 	if err := b.AckSuccess(ctx, a.ID, nil, "w1"); err != nil {
 		t.Fatalf("ack: %v", err)
 	}
-	ok, err = b.ExtendLease(ctx, a.ID, time.Minute)
+	ok, err = b.ExtendLeaseForWorker(ctx, a.ID, "w1", time.Minute)
 	if err != nil {
 		t.Fatalf("extend after complete: %v", err)
 	}
@@ -476,13 +473,13 @@ func TestClaimSentBeforeCancelIsDelivered(t *testing.T) {
 	if err := b.Enqueue(ctx, a); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	// Hold the claim statement mid-flight: its Dequeued insert waits on this lock.
+	// Hold the claim statement mid-flight: its input read waits on this lock.
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `LOCK TABLE runnerq_events IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+	if _, err := tx.Exec(ctx, `LOCK TABLE runnerq_inputs IN ACCESS EXCLUSIVE MODE`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -499,7 +496,7 @@ func TestClaimSentBeforeCancelIsDelivered(t *testing.T) {
 	waitUntil(t, func() bool {
 		var n int
 		_ = b.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
-			WHERE wait_event_type = 'Lock' AND query LIKE '%WITH claimed%'`).Scan(&n)
+			WHERE wait_event_type = 'Lock' AND query LIKE '%SET status = ''processing''%'`).Scan(&n)
 		return n > 0
 	})
 	cancel()

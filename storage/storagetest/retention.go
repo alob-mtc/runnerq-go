@@ -19,6 +19,7 @@ var retentionTests = []conformanceTest{
 	{"CompletedAndFailedAgeSeparately", testRetentionSeparateTTLs},
 	{"RespectsBatchSize", testRetentionBatchSize},
 	{"ConcurrentSweepersDoNotDoubleCount", testRetentionConcurrentSweepers},
+	{"EventsWindowTrimsFinishedActivities", testRetentionEventsWindow},
 }
 
 // retentionTTL is the shortest TTL the suite relies on. Backends may resolve
@@ -89,17 +90,20 @@ func (s *suite) wantTree(tr tree, present bool) {
 		if (snap != nil) != present {
 			s.t.Fatalf("activity %s present=%v, want %v", id, snap != nil, present)
 		}
-		if evs := s.events(id); (len(evs) > 0) != present {
-			s.t.Fatalf("activity %s has %d events, want present=%v", id, len(evs), present)
+	}
+	// The root's park is its event; the child's success stores none.
+	if evs := s.events(tr.root); (len(evs) > 0) != present {
+		s.t.Fatalf("root %s has %d events, want present=%v", tr.root, len(evs), present)
+	}
+	for _, id := range []uuid.UUID{tr.child, tr.checkpoint} {
+		if evs := s.events(id); !present && len(evs) > 0 {
+			s.t.Fatalf("%s kept %d events with its tree gone", id, len(evs))
 		}
 	}
 	for _, id := range []uuid.UUID{tr.child, tr.checkpoint} {
 		if res := s.result(id); (res != nil) != present {
 			s.t.Fatalf("result %s present=%v, want %v", id, res != nil, present)
 		}
-	}
-	if evs := s.events(tr.checkpoint); (len(evs) > 0) != present {
-		s.t.Fatalf("checkpoint %s has %d events, want present=%v", tr.checkpoint, len(evs), present)
 	}
 	_, err := s.b.LookupIdempotencyActivityID(s.ctx, tr.key)
 	if (err == nil) != present {
@@ -153,6 +157,26 @@ func testRetentionSeparateTTLs(t *testing.T, h Harness) {
 	s.wantTree(completed, true)
 	s.sweep(storage.RetentionPolicy{Completed: retentionTTL}, 1)
 	s.wantTree(completed, false)
+}
+
+// An events window trims the events of finished activities and keeps their
+// trees; a waiting activity keeps its park, which says why it waits.
+func testRetentionEventsWindow(t *testing.T, h Harness) {
+	s := newSuite(t, h)
+	done := s.finishTree("completed")
+	waiting := s.enqueueClaimed("w", activity(withType("waiter")))
+	if err := s.b.Yield(s.ctx, waiting.ID, time.Now().UTC().Add(time.Hour), "w", "sleep", "sleep:long"); err != nil {
+		t.Fatal(err)
+	}
+	s.age()
+	s.sweep(storage.RetentionPolicy{Events: retentionTTL}, 0)
+	if evs := s.events(done.root); len(evs) != 0 {
+		t.Fatalf("finished root kept %d events", len(evs))
+	}
+	if snap, err := s.r.GetActivity(s.ctx, done.root); err != nil || snap == nil {
+		t.Fatalf("events window removed the tree: %v", err)
+	}
+	s.wantEvent(waiting.ID, storage.EventYielded)
 }
 
 func testRetentionBatchSize(t *testing.T, h Harness) {

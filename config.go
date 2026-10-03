@@ -17,6 +17,10 @@ type RetentionConfig struct {
 	// Failed is how long trees whose root failed or dead-lettered are kept,
 	// so failures can be held longer for inspection; zero is forever.
 	Failed time.Duration `json:"failed,omitempty"`
+	// Events is how long the events of finished activities are kept, when
+	// that should be shorter than their tree; zero keeps them with the tree.
+	// Events of unfinished activities are always kept.
+	Events time.Duration `json:"events,omitempty"`
 	// Interval is the sweep cadence (default 10 minutes).
 	Interval time.Duration `json:"interval,omitempty"`
 	// BatchSize is the most trees deleted per sweep transaction (default 100).

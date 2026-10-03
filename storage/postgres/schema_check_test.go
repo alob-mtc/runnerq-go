@@ -28,13 +28,45 @@ func TestSchemaExpectationCoversCatalog(t *testing.T) {
 			t.Fatalf("columns %v missing %s", e.columns, want)
 		}
 	}
-	for _, want := range []string{"idx_runnerq_root_status", "idx_runnerq_dequeue_order_v2", "idx_runnerq_dequeue_effective_v2", "idx_runnerq_query_created"} {
+	for _, want := range []string{"idx_runnerq_parent_id", "idx_runnerq_root_terminal", "idx_runnerq_dequeue_order_v2", "idx_runnerq_dequeue_effective_v2", "idx_runnerq_query_created"} {
 		if !slices.Contains(e.indexes, want) {
 			t.Fatalf("indexes %v missing %s", e.indexes, want)
 		}
 	}
-	if !slices.Contains(e.retired, "idx_runnerq_dequeue_order") {
-		t.Fatalf("retired %v missing the superseded dequeue index", e.retired)
+	for _, want := range []string{"idx_runnerq_dequeue_order", "idx_runnerq_root_status"} {
+		if !slices.Contains(e.retired, want) {
+			t.Fatalf("retired %v missing %s", e.retired, want)
+		}
+	}
+}
+
+// A retired index left by an older version disables the fast path, and init
+// drops it.
+func TestSchemaInitDropsRetiredIndex(t *testing.T) {
+	b := testBackend(t)
+	ctx := context.Background()
+	if _, err := b.pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_runnerq_root_status
+		ON runnerq_activities(queue_name, status) WHERE parent_activity_id IS NULL`); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := b.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := schemaCurrent(ctx, conn)
+	conn.Release()
+	if err != nil || current {
+		t.Fatalf("schema reported current with a retired index: %v, %v", current, err)
+	}
+
+	testBackendNamed(t, "t_retired").Close()
+
+	var lingering bool
+	if err := b.pool.QueryRow(ctx, `SELECT to_regclass('idx_runnerq_root_status') IS NOT NULL`).Scan(&lingering); err != nil {
+		t.Fatal(err)
+	}
+	if lingering {
+		t.Fatal("init kept a retired index")
 	}
 }
 
@@ -78,17 +110,18 @@ func TestSchemaInitSkipsDDLWhenCurrent(t *testing.T) {
 func TestSchemaInitMigratesWhenObjectMissing(t *testing.T) {
 	b := testBackend(t)
 	ctx := context.Background()
-	if _, err := b.pool.Exec(ctx, `DROP INDEX IF EXISTS idx_runnerq_root_status`); err != nil {
+	if _, err := b.pool.Exec(ctx, `DROP INDEX IF EXISTS idx_runnerq_parent_id`); err != nil {
 		t.Fatal(err)
 	}
 	conn, err := b.pool.Acquire(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current, err := schemaCurrent(ctx, conn); err != nil || current {
+	current, err := schemaCurrent(ctx, conn)
+	conn.Release()
+	if err != nil || current {
 		t.Fatalf("schema reported current with an index missing: %v, %v", current, err)
 	}
-	conn.Release()
 
 	testBackendNamed(t, "t_migrate").Close()
 
@@ -149,7 +182,7 @@ func TestSchemaInitIgnoresSameNamedIndexInOtherSchema(t *testing.T) {
 func TestSchemaInitWaitsForLockWithoutPinningSnapshot(t *testing.T) {
 	b := testBackend(t)
 	ctx := context.Background()
-	if _, err := b.pool.Exec(ctx, `DROP INDEX IF EXISTS idx_runnerq_root_status`); err != nil {
+	if _, err := b.pool.Exec(ctx, `DROP INDEX IF EXISTS idx_runnerq_parent_id`); err != nil {
 		t.Fatal(err)
 	}
 

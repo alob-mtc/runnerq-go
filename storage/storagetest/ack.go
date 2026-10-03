@@ -24,7 +24,6 @@ var ackTests = []conformanceTest{
 	{"YieldParksWithoutConsumingARetry", testYield},
 	{"YieldIsFencedAndRetryable", testYieldFenced},
 	{"WakeWaitingOnlyWakesParkedRows", testWakeWaiting},
-	{"ExtendLeaseOnlyWhileProcessing", testExtendLease},
 }
 
 // Completion and its result commit together, even for a nil result, so an
@@ -40,7 +39,7 @@ func testAckSuccess(t *testing.T, h Harness) {
 		t.Fatalf("after success: %+v", snap)
 	}
 	s.wantResult(a.ID, storage.ResultOk)
-	s.wantEvent(a.ID, storage.EventCompleted)
+	s.wantNoEvents(a.ID)
 	s.claimNothing()
 
 	b := s.enqueueClaimed("w2", activity())
@@ -52,9 +51,8 @@ func testAckSuccess(t *testing.T, h Harness) {
 	}
 }
 
-// Retrying a completion (lost reply) with the same token and result succeeds
-// without a second Completed event; a different result conflicts and leaves
-// the row unchanged.
+// Retrying a completion (lost reply) with the same token and result succeeds;
+// a different result conflicts and leaves the row unchanged.
 func testAckSuccessRetry(t *testing.T, h Harness) {
 	s := newSuite(t, h)
 	a := s.enqueueClaimed("w", activity())
@@ -67,15 +65,6 @@ func testAckSuccessRetry(t *testing.T, h Harness) {
 		t.Fatalf("semantically equal retry rejected: %v", err)
 	}
 	wantKind(t, s.b.AckSuccess(s.ctx, a.ID, raw(false), "w"), storage.ErrCheckpointConflict, "different result, same token")
-	n := 0
-	for _, ev := range s.events(a.ID) {
-		if ev.EventType == storage.EventCompleted {
-			n++
-		}
-	}
-	if n != 1 {
-		t.Fatalf("%d Completed events, want 1", n)
-	}
 	if res := s.wantResult(a.ID, storage.ResultOk); string(res.Data) == "false" {
 		t.Fatal("conflicting retry overwrote the result")
 	}
@@ -295,24 +284,4 @@ func testWakeWaiting(t *testing.T, h Harness) {
 		t.Fatalf("woke a pending row: %v %v", woke, err)
 	}
 	s.claim("w2", a)
-}
-
-// ExtendLease pushes the deadline out for a processing row and reports false
-// once the row is no longer processing.
-func testExtendLease(t *testing.T, h Harness) {
-	s := newSuite(t, h)
-	a := s.enqueueClaimed("w", activity())
-	before := *s.snapshot(a.ID).LeaseDeadlineMS
-	if ok, err := s.b.ExtendLease(s.ctx, a.ID, 10*time.Minute); err != nil || !ok {
-		t.Fatalf("extend: %v %v", ok, err)
-	}
-	if after := *s.snapshot(a.ID).LeaseDeadlineMS; after <= before {
-		t.Fatalf("lease %d not extended past %d", after, before)
-	}
-	if err := s.b.AckSuccess(s.ctx, a.ID, nil, "w"); err != nil {
-		t.Fatal(err)
-	}
-	if ok, err := s.b.ExtendLease(s.ctx, a.ID, time.Minute); err != nil || ok {
-		t.Fatalf("extended a completed row: %v %v", ok, err)
-	}
 }

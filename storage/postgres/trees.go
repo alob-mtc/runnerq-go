@@ -18,28 +18,25 @@ import (
 // then finds the key gone and claims it fresh. Order is root → keys here and
 // key only there, so no cycle.
 func (b *PostgresBackend) lockTreeForDeleteTx(ctx context.Context, tx pgx.Tx, root uuid.UUID) (pinned bool, err error) {
+	// A key's activity carries the key, so each key is a primary-key probe.
 	if _, err := tx.Exec(ctx, `
-		SELECT 1 FROM runnerq_idempotency
-		WHERE queue_name = $1
-		  AND activity_id IN (
-			SELECT id FROM runnerq_activities
-			WHERE queue_name = $1 AND (id = $2 OR root_activity_id = $2))
-		FOR UPDATE`, b.queueName, root); err != nil {
+		SELECT 1 FROM runnerq_idempotency k
+		JOIN (`+treeSQL+`) t ON k.queue_name = $1 AND k.idempotency_key = t.idempotency_key AND k.activity_id = t.id
+		FOR UPDATE OF k`, b.queueName, root); err != nil {
 		return false, databaseError(err, "failed to lock tree idempotency keys")
 	}
 	if err := tx.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1
-			FROM runnerq_dependencies d
-			JOIN runnerq_activities producer ON producer.id = d.producer_activity_id AND producer.queue_name = $1
+			FROM (`+treeSQL+`) t
+			JOIN runnerq_dependencies d ON d.queue_name = $1 AND d.result_id = t.id AND d.producer_activity_id = t.id
 			JOIN runnerq_activities waiter ON waiter.id = d.waiter_activity_id AND waiter.queue_name = $1
-			WHERE d.queue_name = $1
-			  AND COALESCE(producer.root_activity_id, producer.id) = $2
-			  AND COALESCE(waiter.root_activity_id, waiter.id) <> $2
+			WHERE waiter.root_activity_id <> $2
 			  AND EXISTS (
 				SELECT 1 FROM runnerq_activities live
 				WHERE live.queue_name = $1
-				  AND COALESCE(live.root_activity_id, live.id) = COALESCE(waiter.root_activity_id, waiter.id)
+				  AND (live.id = waiter.root_activity_id
+					OR (live.root_activity_id = waiter.root_activity_id AND live.parent_activity_id IS NOT NULL))
 				  AND live.status NOT IN ('completed', 'failed', 'dead_letter', 'cancelled'))
 		)`, b.queueName, root).Scan(&pinned); err != nil {
 		return false, databaseError(err, "failed to check tree dependencies")
@@ -50,14 +47,11 @@ func (b *PostgresBackend) lockTreeForDeleteTx(ctx context.Context, tx pgx.Tx, ro
 func (b *PostgresBackend) deleteTreeTx(ctx context.Context, tx pgx.Tx, root uuid.UUID) (int64, error) {
 	var deleted int64
 	err := tx.QueryRow(ctx, `
-		WITH tree AS (
-			SELECT a.id FROM runnerq_activities a
-			WHERE a.queue_name = $1
-			  AND (a.id = $2 OR a.root_activity_id = $2)
-		),
+		WITH tree AS (`+treeSQL+`),
 		del_dependencies AS (
 			DELETE FROM runnerq_dependencies WHERE queue_name = $1
-			  AND (waiter_activity_id IN (SELECT id FROM tree) OR producer_activity_id IN (SELECT id FROM tree))
+			  AND (waiter_activity_id IN (SELECT id FROM tree)
+				OR (result_id IN (SELECT id FROM tree) AND producer_activity_id IS NOT NULL))
 		),
 		del_results AS (
 			DELETE FROM runnerq_results
@@ -71,7 +65,8 @@ func (b *PostgresBackend) deleteTreeTx(ctx context.Context, tx pgx.Tx, root uuid
 			  AND (activity_id IN (SELECT id FROM tree) OR activity_id IN (SELECT activity_id FROM del_results))
 		),
 		del_idem AS (
-			DELETE FROM runnerq_idempotency WHERE queue_name = $1 AND activity_id IN (SELECT id FROM tree)
+			DELETE FROM runnerq_idempotency k USING tree
+			WHERE k.queue_name = $1 AND k.idempotency_key = tree.idempotency_key AND k.activity_id = tree.id
 		),
 		del_inputs AS (
 			DELETE FROM runnerq_inputs WHERE activity_id IN (SELECT id FROM tree)
@@ -83,3 +78,10 @@ func (b *PostgresBackend) deleteTreeTx(ctx context.Context, tx pgx.Tx, root uuid
 		SELECT count(*) FROM del_act`, b.queueName, root).Scan(&deleted)
 	return deleted, err
 }
+
+// treeSQL selects the workflow rooted at $2 in queue $1: the root by id, its
+// descendants through idx_runnerq_root_children.
+const treeSQL = `
+	SELECT a.id, a.idempotency_key FROM runnerq_activities a
+	WHERE a.queue_name = $1
+	  AND (a.id = $2 OR (a.root_activity_id = $2 AND a.parent_activity_id IS NOT NULL))`

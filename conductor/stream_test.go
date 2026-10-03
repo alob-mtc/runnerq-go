@@ -71,15 +71,15 @@ func TestStreamDeliversNewEventsAndResumes(t *testing.T) {
 		t.Fatal("events.subscribe not advertised")
 	}
 
-	before := enqueue(t, b, `{}`) // before the subscription: not streamed
+	before := signaled(t, b) // before the subscription: not streamed
 	var sub wire.Subscription
 	g.ok(wire.TypeEventsSubscribe, wire.EventsSubscribe{Filter: queueFilter(queue), MaxDelayMS: 50}, &sub)
 	if sub.SubscriptionID == "" || sub.Cursor == "" {
 		t.Fatalf("subscription %+v", sub)
 	}
-	first := enqueue(t, b, `{}`)
-	seen, cursor := g.collect(t, first.String()+"/"+storage.RecordEventCreated)
-	if seen[before.String()+"/"+storage.RecordEventCreated] {
+	first := signaled(t, b)
+	seen, cursor := g.collect(t, first.String()+"/"+storage.RecordEventSignalReceived)
+	if seen[before.String()+"/"+storage.RecordEventSignalReceived] {
 		t.Fatal("an event from before the wire.Subscription was streamed")
 	}
 	g.ok(wire.TypeEventsUnsubscribe, wire.EventsUnsubscribe{SubscriptionID: sub.SubscriptionID}, nil)
@@ -87,10 +87,10 @@ func TestStreamDeliversNewEventsAndResumes(t *testing.T) {
 
 	// Events while nobody is subscribed are picked up by a wire.Subscription that
 	// resumes after the last cursor; nothing already delivered is repeated.
-	missed := enqueue(t, b, `{}`)
+	missed := signaled(t, b)
 	g.ok(wire.TypeEventsSubscribe, wire.EventsSubscribe{Filter: queueFilter(queue), AfterCursor: cursor, MaxDelayMS: 50}, &sub)
-	again, _ := g.collect(t, missed.String()+"/"+storage.RecordEventCreated)
-	if again[first.String()+"/"+storage.RecordEventCreated] {
+	again, _ := g.collect(t, missed.String()+"/"+storage.RecordEventSignalReceived)
+	if again[first.String()+"/"+storage.RecordEventSignalReceived] {
 		t.Fatal("a resumed stream repeated an event before its cursor")
 	}
 }
@@ -117,15 +117,15 @@ func TestStreamCatchesLateCommits(t *testing.T) {
 	}
 	lateActivity := uuid.New()
 	if _, err := tx.Exec(ctx, `INSERT INTO runnerq_events (activity_id, queue_name, event_type, created_at)
-		VALUES ($1, $2, 'Enqueued', now())`, lateActivity, queue); err != nil {
+		VALUES ($1, $2, 'Signaled', now())`, lateActivity, queue); err != nil {
 		t.Fatal(err)
 	}
-	after := enqueue(t, b, `{}`)
-	g.collect(t, after.String()+"/"+storage.RecordEventCreated)
+	after := signaled(t, b)
+	g.collect(t, after.String()+"/"+storage.RecordEventSignalReceived)
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	g.collect(t, lateActivity.String()+"/"+storage.RecordEventCreated)
+	g.collect(t, lateActivity.String()+"/"+storage.RecordEventSignalReceived)
 }
 
 func TestStreamGapLimitsAndFilters(t *testing.T) {
@@ -150,17 +150,17 @@ func TestStreamGapLimitsAndFilters(t *testing.T) {
 	}
 	g.fails(wire.TypeEventsSubscribe, wire.EventsSubscribe{Filter: queueFilter(queue)}, wire.CodeResourceExhausted)
 
-	// Filters apply to the stream: only this queue's "created" events, read
+	// Filters apply to the stream: only this queue's signal events, read
 	// from the start of the log.
 	g.ok(wire.TypeEventsUnsubscribe, wire.EventsUnsubscribe{SubscriptionID: sub.SubscriptionID}, nil)
-	id := enqueue(t, b, `{}`)
+	id := signaled(t, b)
 	g.ok(wire.TypeEventsSubscribe, wire.EventsSubscribe{AfterCursor: "0", MaxDelayMS: 50,
-		Filter: mustFilter(inQueue(queue, map[string]any{"field": "type", "op": "eq", "value": storage.RecordEventCreated}))}, nil)
+		Filter: mustFilter(inQueue(queue, map[string]any{"field": "type", "op": "eq", "value": storage.RecordEventSignalReceived}))}, nil)
 	for {
 		batch := g.nextBatch(t)
 		done := false
 		for _, ev := range batch.Items {
-			if ev.Type != storage.RecordEventCreated {
+			if ev.Type != storage.RecordEventSignalReceived {
 				t.Fatalf("filtered stream delivered %s", ev.Type)
 			}
 			done = done || ev.ActivityID == id.String()
@@ -199,7 +199,7 @@ func TestStreamSplitsBatchesToTheFrameLimit(t *testing.T) {
 		id := uuid.New()
 		want[id.String()] = size
 		if _, err := conn.Exec(ctx, `INSERT INTO runnerq_events (activity_id, queue_name, event_type, detail, created_at)
-			VALUES ($1, $2, 'Enqueued', jsonb_build_object('blob', repeat('x', $3::int)), now())`, id, queue, size); err != nil {
+			VALUES ($1, $2, 'Signaled', jsonb_build_object('blob', repeat('x', $3::int)), now())`, id, queue, size); err != nil {
 			t.Fatal(err)
 		}
 	}
