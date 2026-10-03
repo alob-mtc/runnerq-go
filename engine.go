@@ -59,7 +59,8 @@ type WorkerEngine struct {
 	observers   []executor.Observer // guarded by mu
 	servedTypes []string            // guarded by mu; set by Start
 
-	changes executor.Signal
+	changes  executor.Signal
+	announce *announcer
 }
 
 // Interrupt stops the handler running activityID here, as if its claim had
@@ -138,6 +139,13 @@ func (e *WorkerEngine) Changed() <-chan struct{} {
 	return e.changes.Changed()
 }
 
+// Announce sends a every lifecycle change this engine makes from now on:
+// submissions through its ActivityExecutors, claims and successes. nil stops.
+// Safe at any time; RunnerQ Cloud's agent uses it while someone is watching.
+func (e *WorkerEngine) Announce(a executor.Announcer) {
+	e.announce.set(a)
+}
+
 // Observe tells o when this engine starts and stops, so it can report the
 // engine's Snapshot while it runs. A backend that is an executor.Observer is
 // attached automatically. Call before Start.
@@ -193,6 +201,7 @@ func NewWorkerEngineWithBackend(backend storage.Storage, config WorkerConfig) *W
 		instanceID: uuid.New().String(),
 		hostname:   executor.Hostname(),
 		sdk:        executor.ThisSDK(),
+		announce:   &announcer{},
 	}
 }
 
@@ -289,7 +298,7 @@ func isNilHandler(handler ActivityHandler) bool {
 // GetActivityExecutor returns an executor for spawning root activities from
 // outside a handler.
 func (e *WorkerEngine) GetActivityExecutor() *ActivityExecutor {
-	return newActivityExecutor(e.queue, e.config.MaxActivityDepth)
+	return newActivityExecutor(e.queue, e.config.MaxActivityDepth, e.announce)
 }
 
 // Start runs the engine until ctx ends, Stop is called or the process gets
@@ -630,6 +639,7 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	e.metrics.IncCounter(metricStarted, 1)
 	e.metrics.ObserveDuration(metricClaimLag, claimLag(act, now))
 	e.changes.Notify()
+	e.announce.change(executor.AttemptStarted, act, now)
 	defer func() {
 		e.inflight.Delete(activityID)
 		e.changes.Notify()
@@ -638,7 +648,7 @@ func (e *WorkerEngine) processActivity(ctx context.Context, act *activity, worke
 	// yield-park this activity.
 	attemptQ := &attemptQueue{activityQueue: e.queue, backend: e.backend, owner: act.ID, worker: workerLabel, persistenceCtx: ctx, metrics: e.metrics, awaitGrace: e.awaitGrace}
 	timeoutCtx = context.WithValue(timeoutCtx, attemptQueueKey{}, attemptQ)
-	scopedExecutor := newActivityExecutor(attemptQ, e.config.MaxActivityDepth).scopedForChild(act)
+	scopedExecutor := newActivityExecutor(attemptQ, e.config.MaxActivityDepth, e.announce).scopedForChild(act)
 
 	actCtx := ActivityContext{
 		ActivityID:       activityID,
@@ -740,6 +750,7 @@ func (e *WorkerEngine) handleSuccess(ctx context.Context, act *activity, result 
 		return
 	}
 	e.metrics.IncCounter(metricCompleted, 1)
+	e.announce.change(executor.AttemptSucceeded, act, time.Now().UTC())
 	slog.Info("Activity completed successfully", "worker_id", workerID, "activity_id", activityID, "activity_type", activityType)
 }
 
@@ -851,7 +862,7 @@ func (e *WorkerEngine) callDeadLetter(ctx context.Context, act *activity, handle
 		RetryCount:       0,
 		Metadata:         make(map[string]string),
 		Ctx:              ctx,
-		ActivityExecutor: newActivityExecutor(e.queue, e.config.MaxActivityDepth).scopedForChild(act),
+		ActivityExecutor: newActivityExecutor(e.queue, e.config.MaxActivityDepth, e.announce).scopedForChild(act),
 		ParentActivityID: act.ParentActivityID,
 		RootActivityID:   act.RootActivityID,
 		Depth:            act.Depth,

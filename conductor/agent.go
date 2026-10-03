@@ -145,6 +145,11 @@ type Agent struct {
 	connected      atomic.Bool
 	reportEvery    atomic.Int64
 	peerFrameLimit atomic.Int64
+
+	// The session's notices, and whether the Cloud wants them; the engine
+	// announces to them only while both are set. Guarded by mu.
+	notices     *notices
+	wantNotices bool
 }
 
 // Start validates cfg and connects in the background, so an unreachable
@@ -284,7 +289,6 @@ func (a *Agent) session(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	a.applyConfig(w.Config)
 	frame := int64(maxMessageBytes)
 	if w.Limits.MaxFrameBytes > 0 {
 		frame = min(frame, int64(w.Limits.MaxFrameBytes))
@@ -299,13 +303,19 @@ func (a *Agent) session(ctx context.Context) error {
 		return nil
 	}
 	a.conn, a.sessionID = conn, w.SessionID
+	info := a.engine.Snapshot().Info
+	sessionNotices := &notices{queue: info.Queue, executor: info.ID}
+	// A welcome without notices means off, unlike a config.update.
+	a.notices, a.wantNotices = sessionNotices, false
 	a.mu.Unlock()
+	a.applyConfig(w.Config)
 	a.connected.Store(true)
 	a.log.Info("Connected to RunnerQ Cloud", "app", w.App.Name, "session", w.SessionID, "metadata_only", a.h.metadataOnly())
 	defer func() {
 		a.connected.Store(false)
 		a.mu.Lock()
-		a.conn = nil
+		a.conn, a.notices = nil, nil
+		a.syncNotices()
 		a.mu.Unlock()
 	}()
 
@@ -322,6 +332,7 @@ func (a *Agent) session(ctx context.Context) error {
 	}()
 	go a.pingLoop(sctx, conn)
 	go a.reportLoop(sctx, conn)
+	go sessionNotices.run(sctx, conn, a.peerFrameLimit.Load)
 	st := newStreams(a, conn)
 	defer st.close()
 	return a.readLoop(sctx, conn, st)
@@ -409,6 +420,22 @@ func (a *Agent) applyConfig(c wire.SessionConfig) {
 	}
 	if c.ReportIntervalMS > 0 {
 		a.reportEvery.Store(int64(max(time.Duration(c.ReportIntervalMS)*time.Millisecond, time.Second)))
+	}
+	if c.Notices != nil {
+		a.mu.Lock()
+		a.wantNotices = *c.Notices
+		a.syncNotices()
+		a.mu.Unlock()
+	}
+}
+
+// syncNotices points the engine's announcements at the session's notices
+// while the Cloud wants them. Call with mu held.
+func (a *Agent) syncNotices() {
+	if a.wantNotices && a.notices != nil {
+		a.engine.Announce(a.notices)
+	} else {
+		a.engine.Announce(nil)
 	}
 }
 

@@ -37,6 +37,8 @@ const (
 	TypeStreamGap             = "stream.gap"
 	// Every config.report_interval_ms, without running.
 	TypeExecutorReport = "executor.report"
+	// Only while config.notices is on; at most every 250 ms.
+	TypeActivityNotices = "activity.notices"
 	// The fields that change; the agent applies them at once.
 	TypeConfigUpdate = "config.update"
 )
@@ -200,6 +202,17 @@ const (
 	OutcomeWouldApply CommandOutcome = "would_apply"
 )
 
+// NoticeType is a lifecycle change no event is stored for: the activity's own
+// times say it.
+type NoticeType string
+
+const (
+	NoticeCreated          NoticeType = "activity.created"
+	NoticeScheduled        NoticeType = "activity.scheduled"
+	NoticeAttemptStarted   NoticeType = "attempt.started"
+	NoticeAttemptSucceeded NoticeType = "attempt.succeeded"
+)
+
 // Envelope is one frame on the wire: one JSON object per WebSocket text frame.
 type Envelope struct {
 	// The protocol version the sender speaks; 1.
@@ -300,6 +313,10 @@ type SessionConfig struct {
 	DataMode DataMode `json:"data_mode,omitempty"`
 	// How often to send executor.report.
 	ReportIntervalMS int64 `json:"report_interval_ms,omitempty"`
+	// Send activity.notices. The gateway turns it on while someone is watching
+	// the app and off when no one is. Absent in a welcome is off; absent in a
+	// config.update is unchanged.
+	Notices *bool `json:"notices,omitempty"`
 }
 
 // Welcome is the gateway's answer to hello.
@@ -785,4 +802,29 @@ type StreamEvents struct {
 type StreamGap struct {
 	SubscriptionID string `json:"subscription_id"`
 	SinceCursor    string `json:"since_cursor"`
+}
+
+// Notice is a lifecycle change an executor made, announced live. Never stored
+// and never resent: it has no cursor, and a consumer that missed it reads the
+// activity instead.
+type Notice struct {
+	ActivityID   string     `json:"activity_id"`
+	Type         NoticeType `json:"type"`
+	At           string     `json:"at"`
+	Queue        string     `json:"queue"`
+	ActivityType string     `json:"activity_type"`
+	// The activity's workflow root; the activity's own id for a root.
+	RootID string `json:"root_id"`
+	// For attempt.started and attempt.succeeded.
+	Attempt int `json:"attempt,omitempty"`
+	// The executor that made the change, when it was one.
+	ExecutorID string `json:"executor_id,omitempty"`
+}
+
+// ActivityNotices is a batch of notices, oldest first.
+type ActivityNotices struct {
+	Items []Notice `json:"items"`
+	// Notices this agent discarded since its last batch, when it produced them
+	// faster than it could send.
+	Dropped int64 `json:"dropped,omitempty"`
 }
