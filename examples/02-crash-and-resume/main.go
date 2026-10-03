@@ -127,7 +127,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("workflow failed: %v", err)
 	}
-	fmt.Printf("\n✓ ORDER COMPLETE: %s — the card was charged exactly once.\n", result)
+	fmt.Printf("\n✓ ORDER COMPLETE: %s — the card wasn't charged again.\n", result)
 }
 
 func databaseURL() string {

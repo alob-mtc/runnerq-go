@@ -17,8 +17,8 @@ resumes from where it left off without redoing completed work.
 
 ```go
 func (h *Checkout) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) (json.RawMessage, error) {
-    // Each step is checkpointed. Crash after the charge and restart —
-    // the charge is NOT repeated; the workflow resumes at shipping.
+    // Each step is checkpointed. Crash after the charge is recorded and
+    // restart — it isn't repeated; the workflow resumes at shipping.
     receipt, err := ctx.RunStep("charge-card", func(c context.Context) (Receipt, error) {
         return chargeCard(c, payload)   // at most once per recorded success
     })
@@ -33,6 +33,11 @@ func (h *Checkout) Handle(ctx runnerq.ActivityContext, payload json.RawMessage) 
     return ship.GetResult(ctx.Ctx)   // parent parks here — frees the worker, survives deploys
 }
 ```
+
+> **The guarantee:** steps run at least once, and a step whose result is
+> recorded never runs again. A crash after `chargeCard` returns but before its
+> checkpoint commits runs it again, so pass an idempotency key to your payment
+> provider. See [the contract](docs/durable-execution.md#the-contract-read-this-once).
 
 > See it for real: [`examples/02-crash-and-resume`](examples/02-crash-and-resume/)
 > charges an order, lets you `Ctrl-C` it, and resumes on restart without
@@ -123,14 +128,15 @@ RunnerQ gives you durable execution as a **library**:
 - **A workflow is just a Go function.** Orchestration is normal control flow —
   loops, conditionals, error handling — not a DSL or a DAG.
 - **Steps are checkpointed.** Completed work is skipped on replay, so retries
-  and restarts are cheap and side effects don't repeat.
+  and restarts are cheap and recorded steps don't run again.
 - **Workflows pause for free.** Sleep for days or wait for a webhook while
   holding zero workers — paused workflows are just stored state.
 - **Pluggable storage.** PostgreSQL is built in; implement the storage
   interface to use anything else. No orchestrator cluster, no broker, no
   control-plane bill. Scale by adding stateless worker processes.
 
-**Good fits:** charging a card exactly once, processing each webhook once,
+**Good fits:** payment flows that must not redo completed steps, processing
+each webhook once,
 approval flows that wait days for a human, and fanning a batch out across
 workers. The [examples](#examples) cover each of these.
 
@@ -145,7 +151,7 @@ return their stored results instead of re-executing.
 
 ```go
 receipt, err := ctx.RunStep("charge-card", func(c context.Context) (Receipt, error) {
-    return chargeCard(c, payload)   // at most once, even across retries and restarts
+    return chargeCard(c, payload)   // at most once per recorded success
 })
 ```
 
@@ -250,7 +256,7 @@ own README. `docker compose up -d` once, then `go run .` in any of them.
 | 01 | [hello-workflow](examples/01-hello-workflow/) | a durable two-step workflow |
 | 02 | [crash-and-resume](examples/02-crash-and-resume/) | **kill it mid-flight; it resumes without redoing work** |
 | 03 | [steps-and-retries](examples/03-steps-and-retries/) | child activities memoized across a retry |
-| 04 | [checkpoint-side-effects](examples/04-checkpoint-side-effects/) | charge once, even when the handler retries |
+| 04 | [checkpoint-side-effects](examples/04-checkpoint-side-effects/) | a recorded charge isn't repeated when the handler retries |
 | 05 | [durable-sleep](examples/05-durable-sleep/) | timers that survive restarts |
 | 06 | [human-approval](examples/06-human-approval/) | pause for an approval, delivered over HTTP |
 | 07 | [fan-out](examples/07-fan-out/) | spawn many children, run them in parallel |

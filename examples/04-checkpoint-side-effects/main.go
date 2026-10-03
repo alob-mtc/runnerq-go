@@ -118,7 +118,7 @@ func main() {
 
 	fmt.Printf("\n✓ done: %s\n", result)
 	fmt.Printf("  charge ran %d time(s); send ran %d time(s).\n", chargeRuns.Load(), sendRuns.Load())
-	fmt.Println("  → the charge happened exactly once despite the retries.")
+	fmt.Println("  → the charge ran once despite the retries.")
 }
 
 func databaseURL() string {

@@ -10,7 +10,7 @@ An order workflow runs three steps: reserve inventory → charge the card →
 ship. Each `ctx.Run` step prints `▶ EXECUTING` **only when its side effect
 actually runs**. Kill the process after it charges, run it again, and the
 reserve and charge lines do not reappear — they're replayed from their
-Postgres checkpoints. Only shipping runs. The card is charged exactly once.
+Postgres checkpoints. Only shipping runs. The card isn't charged again.
 
 ## Run it
 
@@ -41,7 +41,7 @@ go run .
   ✓ charge-card                ← no "EXECUTING" line: NOT re-charged
   ▶ EXECUTING ship-order          (real side effect)
   ✓ ship-order
-✓ ORDER COMPLETE: {"status":"fulfilled"} — the card was charged exactly once.
+✓ ORDER COMPLETE: {"status":"fulfilled"} — the card wasn't charged again.
 ```
 
 The absence of `▶ EXECUTING charge-card` on the second run is the whole point:
