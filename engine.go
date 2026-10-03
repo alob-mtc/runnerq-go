@@ -922,12 +922,12 @@ func (e *WorkerEngine) runRetentionProcessor(ctx context.Context) {
 	if batchSize <= 0 {
 		batchSize = 100
 	}
-	policy := storage.RetentionPolicy{Completed: cfg.Completed, Failed: cfg.Failed}
+	policy := storage.RetentionPolicy{Completed: cfg.Completed, Failed: cfg.Failed, Events: cfg.Events}
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	slog.Debug("Starting retention sweeper", "completed_ttl", cfg.Completed, "failed_ttl", cfg.Failed, "interval", interval)
+	slog.Debug("Starting retention sweeper", "completed_ttl", cfg.Completed, "failed_ttl", cfg.Failed, "events_ttl", cfg.Events, "interval", interval)
 	for e.running.Load() {
 		select {
 		case <-ctx.Done():

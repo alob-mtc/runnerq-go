@@ -405,10 +405,13 @@ func testQueryEvents(t *testing.T, h Harness) {
 	s := newSuite(t, h)
 	qs := s.query()
 	parent := s.enqueueClaimed("exec-9:w", activity())
-	if err := s.b.AckSuccess(s.ctx, parent.ID, nil, "exec-9:w"); err != nil {
+	if _, err := s.b.AckFailure(s.ctx, parent.ID, storage.NewRetryableFailure("boom"), "exec-9:w"); err != nil {
 		t.Fatal(err)
 	}
 	child := s.enqueue(activity(withParent(parent)))
+	if err := s.b.SignalActivity(s.ctx, child.ID, storage.CheckpointID(child.ID, "signal", "go"), "go", raw("x")); err != nil {
+		t.Fatal(err)
+	}
 
 	page, err := qs.QueryEvents(s.ctx, storage.EventQuery{Filter: &storage.QueryFilter{Field: "activity_id", Op: storage.OpEq, Value: parent.ID.String()}})
 	if err != nil {
@@ -418,33 +421,34 @@ func testQueryEvents(t *testing.T, h Harness) {
 	for _, e := range page.Items {
 		types = append(types, e.Type)
 	}
-	want := []string{storage.RecordEventCreated, storage.RecordEventAttemptStarted, storage.RecordEventAttemptOK}
-	if len(types) != 3 || types[0] != want[0] || types[1] != want[1] || types[2] != want[2] {
-		t.Fatalf("event types %v, want %v", types, want)
+	// Submission, claims and success store no events: the failed attempt is
+	// the parent's only one.
+	if len(types) != 1 || types[0] != storage.RecordEventAttemptFailed {
+		t.Fatalf("event types %v, want [%s]", types, storage.RecordEventAttemptFailed)
 	}
-	if page.Items[1].ExecutorID != "exec-9" || page.Items[0].Detail != nil {
-		t.Fatalf("event fields %+v", page.Items[1])
+	if page.Items[0].ExecutorID != "exec-9" || page.Items[0].Detail != nil {
+		t.Fatalf("event fields %+v", page.Items[0])
 	}
 
 	tree, err := qs.QueryEvents(s.ctx, storage.EventQuery{Filter: &storage.QueryFilter{Field: "root_id", Op: storage.OpEq, Value: parent.ID.String()}, Desc: true})
-	if err != nil || len(tree.Items) != 4 || tree.Items[0].ActivityID != child.ID {
+	if err != nil || len(tree.Items) != 2 || tree.Items[0].ActivityID != child.ID {
 		t.Fatalf("tree events: %+v %v", tree, err)
 	}
 
 	byType, err := qs.QueryEvents(s.ctx, storage.EventQuery{Filter: &storage.QueryFilter{And: []storage.QueryFilter{
 		{Field: "root_id", Op: storage.OpEq, Value: parent.ID.String()},
-		{Field: "type", Op: storage.OpEq, Value: storage.RecordEventCreated},
+		{Field: "type", Op: storage.OpEq, Value: storage.RecordEventAttemptFailed},
 	}}, IncludeDetail: true})
-	if err != nil || len(byType.Items) != 2 {
-		t.Fatalf("created events: %+v %v", byType, err)
+	if err != nil || len(byType.Items) != 1 || byType.Items[0].Detail == nil {
+		t.Fatalf("failed-attempt events: %+v %v", byType, err)
 	}
 
-	first, err := qs.QueryEvents(s.ctx, storage.EventQuery{Filter: &storage.QueryFilter{Field: "root_id", Op: storage.OpEq, Value: parent.ID.String()}, Limit: 3})
+	first, err := qs.QueryEvents(s.ctx, storage.EventQuery{Filter: &storage.QueryFilter{Field: "root_id", Op: storage.OpEq, Value: parent.ID.String()}, Limit: 1})
 	if err != nil || first.NextCursor == "" {
 		t.Fatalf("first page: %+v %v", first, err)
 	}
 	rest, err := qs.QueryEvents(s.ctx, storage.EventQuery{Filter: &storage.QueryFilter{Field: "root_id", Op: storage.OpEq, Value: parent.ID.String()}, Cursor: first.NextCursor})
-	if err != nil || len(rest.Items) != 1 || rest.Items[0].ID <= first.Items[2].ID {
+	if err != nil || len(rest.Items) != 1 || rest.Items[0].ID <= first.Items[0].ID {
 		t.Fatalf("second page: %+v %v", rest, err)
 	}
 }

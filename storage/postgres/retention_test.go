@@ -37,16 +37,16 @@ func plantTree(t *testing.T, b *PostgresBackend, rootStatus, childStatus string,
 	tree.idemKey = "rq:step:" + tree.root.String() + ":" + tree.root.String() + ":reserve"
 	completedAt := time.Now().UTC().Add(-terminalAge)
 
-	insert := func(id uuid.UUID, status string, parent *uuid.UUID) {
+	insert := func(id uuid.UUID, status string, parent *uuid.UUID, key *string) {
 		var cAt *time.Time
 		if status == "completed" || status == "failed" || status == "dead_letter" {
 			cAt = &completedAt
 		}
 		if _, err := b.pool.Exec(ctx, `
 			INSERT INTO runnerq_activities (id, queue_name, activity_type, priority, status,
-				created_at, completed_at, parent_activity_id, root_activity_id, depth)
-			VALUES ($1, $2, 'tree_member', 2, $3, $4, $5, $6, $7, $8)`,
-			id, b.queueName, status, completedAt.Add(-time.Minute), cAt, parent, tree.root, 0); err != nil {
+				created_at, completed_at, parent_activity_id, root_activity_id, depth, idempotency_key)
+			VALUES ($1, $2, 'tree_member', 2, $3, $4, $5, $6, $7, $8, $9)`,
+			id, b.queueName, status, completedAt.Add(-time.Minute), cAt, parent, tree.root, 0, key); err != nil {
 			t.Fatalf("insert activity: %v", err)
 		}
 		if _, err := b.pool.Exec(ctx, `
@@ -56,12 +56,12 @@ func plantTree(t *testing.T, b *PostgresBackend, rootStatus, childStatus string,
 		}
 		if _, err := b.pool.Exec(ctx, `
 			INSERT INTO runnerq_events (activity_id, queue_name, event_type, created_at)
-			VALUES ($1, $2, 'Enqueued', $3)`, id, b.queueName, completedAt.Add(-time.Minute)); err != nil {
+			VALUES ($1, $2, 'Yielded', $3)`, id, b.queueName, completedAt.Add(-time.Minute)); err != nil {
 			t.Fatalf("insert event: %v", err)
 		}
 	}
-	insert(tree.root, rootStatus, nil)
-	insert(tree.child, childStatus, &tree.root)
+	insert(tree.root, rootStatus, nil, nil)
+	insert(tree.child, childStatus, &tree.root, &tree.idemKey)
 
 	if _, err := b.pool.Exec(ctx, `
 		INSERT INTO runnerq_results (activity_id, queue_name, state, data, created_at, owner_activity_id)
@@ -69,10 +69,10 @@ func plantTree(t *testing.T, b *PostgresBackend, rootStatus, childStatus string,
 		tree.child, b.queueName, completedAt, tree.checkpointID, tree.root); err != nil {
 		t.Fatalf("insert results: %v", err)
 	}
-	// Event recorded under the checkpoint's synthetic ID, as StoreResult does.
+	// An event under the checkpoint's synthetic ID goes with its result.
 	if _, err := b.pool.Exec(ctx, `
 		INSERT INTO runnerq_events (activity_id, queue_name, event_type, created_at)
-		VALUES ($1, $2, 'ResultStored', $3)`, tree.checkpointID, b.queueName, completedAt); err != nil {
+		VALUES ($1, $2, 'Signaled', $3)`, tree.checkpointID, b.queueName, completedAt); err != nil {
 		t.Fatalf("insert checkpoint event: %v", err)
 	}
 	if _, err := b.pool.Exec(ctx, `

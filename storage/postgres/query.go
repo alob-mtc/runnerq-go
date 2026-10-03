@@ -58,7 +58,7 @@ var activityFields = map[string]queryField{
 	"queue":           {expr: "a.queue_name", kind: kindString},
 	"status":          {expr: "a.status", kind: kindStatus},
 	"priority":        {expr: "a.priority", kind: kindInt},
-	"root_id":         {expr: "COALESCE(a.root_activity_id, a.id)", kind: kindUUID},
+	"root_id":         {expr: "a.root_activity_id", kind: kindUUID},
 	"parent_id":       {expr: "a.parent_activity_id", kind: kindUUID, nullable: true},
 	"depth":           {expr: "a.depth", kind: kindInt},
 	"idempotency_key": {expr: "a.idempotency_key", kind: kindString, nullable: true},
@@ -124,18 +124,12 @@ func canonicalStatus(internal string) string {
 }
 
 var canonicalEvents = map[string]string{
-	storage.EventEnqueued:        storage.RecordEventCreated,
-	storage.EventScheduled:       storage.RecordEventScheduled,
-	storage.EventDequeued:        storage.RecordEventAttemptStarted,
-	storage.EventCompleted:       storage.RecordEventAttemptOK,
 	storage.EventFailed:          storage.RecordEventAttemptFailed,
 	storage.EventRetrying:        storage.RecordEventAttemptFailed,
 	storage.EventDeadLetter:      storage.RecordEventDeadLetter,
 	storage.EventRequeued:        storage.RecordEventLeaseExpired,
 	storage.EventYielded:         storage.RecordEventWaitParked,
 	storage.EventSignaled:        storage.RecordEventSignalReceived,
-	storage.EventLeaseExtended:   storage.RecordEventLeaseExtended,
-	storage.EventResultStored:    storage.RecordEventResultStored,
 	storage.EventSpawnLinked:     storage.RecordEventChildLinked,
 	storage.EventCancelled:       storage.RecordEventCancelled,
 	storage.EventRetried:         storage.RecordEventRetried,
@@ -312,7 +306,20 @@ func (sb *sqlBuilder) predicate(f storage.QueryFilter, fields map[string]queryFi
 			// Nothing can match (e.g. an id that is not a UUID).
 			return strconv.FormatBool(negate), nil
 		}
-		cond := fd.expr + " = ANY(" + sb.arg(vals) + ")"
+		var cond string
+		switch {
+		case fd.kind == kindStatus:
+			// Literals, not a parameter: Postgres proves a partial index's
+			// predicate (idx_runnerq_query_status) only from constants. The
+			// values come from canonicalStatuses.
+			cond = fd.expr + " IN (" + quoteLiterals(vals.([]string)) + ")"
+		case f.Field == "root_id":
+			// Roots aren't in idx_runnerq_root_children; they're found by id.
+			p := sb.arg(vals)
+			cond = "(a.id = ANY(" + p + ") OR (a.root_activity_id = ANY(" + p + ") AND a.parent_activity_id IS NOT NULL))"
+		default:
+			cond = fd.expr + " = ANY(" + sb.arg(vals) + ")"
+		}
 		if negate {
 			return "(NOT COALESCE(" + cond + ", false))", nil
 		}
@@ -422,7 +429,15 @@ func (sb *sqlBuilder) eventRootPredicate(f storage.QueryFilter) (string, error) 
 		return "false", nil
 	}
 	p := sb.arg(vals)
-	return "e.activity_id IN (SELECT x.id FROM runnerq_activities x WHERE x.id = ANY(" + p + ") OR x.root_activity_id = ANY(" + p + "))", nil
+	return "e.activity_id IN (SELECT x.id FROM runnerq_activities x WHERE x.id = ANY(" + p + ") OR (x.root_activity_id = ANY(" + p + ") AND x.parent_activity_id IS NOT NULL))", nil
+}
+
+func quoteLiterals(vals []string) string {
+	quoted := make([]string, len(vals))
+	for i, v := range vals {
+		quoted[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'"
+	}
+	return strings.Join(quoted, ", ")
 }
 
 // convertValues returns nil (no error) when no value can possibly match.
@@ -1072,7 +1087,7 @@ func (b *PostgresBackend) GetActivityTree(ctx context.Context, activityID uuid.U
 	}
 	cols, joins := activitySelect(inc)
 	rows, err := b.pool.Query(ctx, fmt.Sprintf(`SELECT %s FROM runnerq_activities a%s
-		WHERE a.id = $1 OR a.root_activity_id = $1
+		WHERE a.id = $1 OR (a.root_activity_id = $1 AND a.parent_activity_id IS NOT NULL)
 		ORDER BY a.depth, a.created_at, a.id LIMIT %d`, cols, joins, maxNodes+1), root)
 	if err != nil {
 		return nil, databaseError(err, fmt.Sprintf("Failed to load tree: %v", err))

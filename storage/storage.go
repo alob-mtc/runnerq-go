@@ -130,6 +130,10 @@ type RetentionPolicy struct {
 	// Failed applies to failed, dead_letter or cancelled roots, on a separate
 	// clock so failures can be held longer for inspection.
 	Failed time.Duration
+	// Events trims the events of finished activities older than this, before
+	// their tree goes. Events of unfinished activities are kept. 0 keeps events
+	// as long as their tree.
+	Events time.Duration
 }
 
 // FailureKind describes how an activity failed.
@@ -187,24 +191,19 @@ type ActivitySnapshot struct {
 	Depth             uint16            `json:"depth"`
 }
 
-// ActivityEventType classifies lifecycle events.
+// ActivityEventType classifies stored events: only what the activity row
+// can't say (runnerq-spec schema/postgres/events.schema.json).
 type ActivityEventType = string
 
 const (
-	EventEnqueued   ActivityEventType = "Enqueued"
-	EventScheduled  ActivityEventType = "Scheduled"
-	EventDequeued   ActivityEventType = "Dequeued"
-	EventCompleted  ActivityEventType = "Completed"
 	EventFailed     ActivityEventType = "Failed"
 	EventRetrying   ActivityEventType = "Retrying"
 	EventDeadLetter ActivityEventType = "DeadLetter"
 	// EventRequeued: the reaper returned an expired-lease activity to pending.
 	EventRequeued ActivityEventType = "Requeued"
 	// EventYielded: a durable wait parked the activity without consuming a retry.
-	EventYielded       ActivityEventType = "Yielded"
-	EventSignaled      ActivityEventType = "Signaled"
-	EventLeaseExtended ActivityEventType = "LeaseExtended"
-	EventResultStored  ActivityEventType = "ResultStored"
+	EventYielded  ActivityEventType = "Yielded"
+	EventSignaled ActivityEventType = "Signaled"
 	// EventSpawnLinked: idempotency reuse linked another parent to an existing
 	// activity.
 	EventSpawnLinked ActivityEventType = "SpawnLinked"
@@ -272,7 +271,6 @@ type QueueStorage interface {
 	// claim. kind ("sleep"/"signal"/"await") and step are recorded on the
 	// Yielded event only; either may be empty.
 	Yield(ctx context.Context, activityID uuid.UUID, wakeAt time.Time, workerID, kind, step string) error
-	ExtendLease(ctx context.Context, activityID uuid.UUID, extendBy time.Duration) (bool, error)
 	// StoreResult persists a result row. ownerActivityID governs its lifetime
 	// (retention deletes it with the owner's tree): the activity itself for its
 	// own result, or the handler's activity for a checkpoint with a synthetic

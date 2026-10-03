@@ -95,7 +95,9 @@ type args struct {
 
 	CompletedS float64 `json:"completed_s"`
 	FailedS    float64 `json:"failed_s"`
-	Batch      int     `json:"batch"`
+
+	EventsS float64 `json:"events_s"`
+	Batch   int     `json:"batch"`
 }
 
 var behaviors = map[string]storage.IdempotencyBehavior{
@@ -173,6 +175,7 @@ func (d *driver) do(ctx context.Context, op string, raw json.RawMessage) (any, e
 		n, err := d.b.CleanupExpired(ctx, storage.RetentionPolicy{
 			Completed: time.Duration(a.CompletedS * float64(time.Second)),
 			Failed:    time.Duration(a.FailedS * float64(time.Second)),
+			Events:    time.Duration(a.EventsS * float64(time.Second)),
 		}, max(a.Batch, 1))
 		return map[string]any{"count": n}, err
 	case "get_result":

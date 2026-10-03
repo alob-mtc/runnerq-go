@@ -88,7 +88,7 @@ func testCheckpoint(t *testing.T, h Harness) {
 	if res := s.wantResult(id, storage.ResultOk); string(res.Data) != `"original"` {
 		t.Fatalf("checkpoint changed: %s", res.Data)
 	}
-	s.wantEvent(id, storage.EventResultStored)
+	s.wantNoEvents(id)
 }
 
 // A parent parked on a child's result is woken by its terminal outcome —

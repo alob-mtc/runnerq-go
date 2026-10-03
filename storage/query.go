@@ -46,6 +46,9 @@ const (
 
 // Canonical event types. Backend events with no equivalent keep a namespaced
 // name of their own.
+//
+// Created, Scheduled, AttemptStarted and AttemptOK are never stored: an
+// activity's created_at, scheduled_at, started_at and completed_at say them.
 const (
 	RecordEventCreated         = "activity.created"
 	RecordEventScheduled       = "activity.scheduled"
@@ -55,10 +58,8 @@ const (
 	RecordEventAttemptFailed   = "attempt.failed"
 	RecordEventAttemptTimedOut = "attempt.timed_out"
 	RecordEventLeaseExpired    = "attempt.lease_expired"
-	RecordEventLeaseExtended   = "attempt.lease_extended"
 	RecordEventWaitParked      = "wait.parked"
 	RecordEventSignalReceived  = "signal.received"
-	RecordEventResultStored    = "result.stored"
 	RecordEventChildLinked     = "child.linked"
 	RecordEventDeadLetter      = "dead_letter.entered"
 	RecordEventRedriven        = "dead_letter.redriven"

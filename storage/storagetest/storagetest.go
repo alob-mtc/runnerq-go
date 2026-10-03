@@ -311,6 +311,15 @@ func (s *suite) wantEvent(id uuid.UUID, typ storage.ActivityEventType) {
 	}
 }
 
+// wantNoEvents checks nothing was stored for id: submission, claims, success
+// and results are the row's to say.
+func (s *suite) wantNoEvents(id uuid.UUID) {
+	s.t.Helper()
+	if evs := s.events(id); len(evs) > 0 {
+		s.t.Fatalf("activity %s has stored events %+v, want none", id, evs)
+	}
+}
+
 func (s *suite) expire(id uuid.UUID) {
 	s.t.Helper()
 	if err := s.h.ExpireLease(s.ctx, s.b, id); err != nil {

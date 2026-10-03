@@ -36,7 +36,6 @@ func testClaimRecordsOwnership(t *testing.T, h Harness) {
 	s.claimNothing()
 	a := s.enqueue(activity())
 	s.wantStatus(a.ID, "pending")
-	s.wantEvent(a.ID, storage.EventEnqueued)
 
 	s.claim("token-1", a)
 	snap := s.snapshot(a.ID)
@@ -49,7 +48,7 @@ func testClaimRecordsOwnership(t *testing.T, h Harness) {
 	if snap.StartedAt == nil {
 		t.Fatal("claim did not record started_at")
 	}
-	s.wantEvent(a.ID, storage.EventDequeued)
+	s.wantNoEvents(a.ID)
 	s.claimNothing() // a processing row is not claimable again
 }
 
@@ -99,7 +98,6 @@ func testClaimScheduled(t *testing.T, h Harness) {
 	s := newSuite(t, h)
 	later := s.enqueue(activity(withScheduledAt(time.Now().UTC().Add(time.Hour))))
 	s.wantStatus(later.ID, "scheduled")
-	s.wantEvent(later.ID, storage.EventScheduled)
 	s.claimNothing()
 
 	due := s.enqueue(activity(withScheduledAt(time.Now().UTC().Add(-time.Second))))
@@ -258,7 +256,6 @@ func testBatchClaim(t *testing.T, h Harness) {
 			t.Fatalf("claim %d attempt=%d deadline=%v", i, c.Attempt, c.LeaseDeadline)
 		}
 		s.wantStatus(c.Activity.ID, "processing")
-		s.wantEvent(c.Activity.ID, storage.EventDequeued)
 	}
 	// Siblings of one batch are fenced apart.
 	wantKind(t, s.b.AckSuccess(s.ctx, claims[0].Activity.ID, nil, claims[1].LeaseID), storage.ErrClaimLost, "ack with sibling token")

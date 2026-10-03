@@ -306,6 +306,17 @@ func enqueue(t *testing.T, b *postgres.PostgresBackend, payload string, opts ...
 	return id
 }
 
+// signaled enqueues an activity and signals it, which stores an event: a
+// submission stores none.
+func signaled(t *testing.T, b *postgres.PostgresBackend) uuid.UUID {
+	t.Helper()
+	id := enqueue(t, b, `{}`)
+	if err := b.SignalActivity(context.Background(), id, storage.CheckpointID(id, "signal", "go"), "go", json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+	return id
+}
+
 // inQueue scopes a query to the test's queue (queries span all queues).
 func inQueue(queue string, terms ...map[string]any) map[string]any {
 	and := []any{map[string]any{"field": "queue", "op": "eq", "value": queue}}
@@ -536,7 +547,13 @@ func TestQueriesFromStorage(t *testing.T) {
 	}
 
 	id := enqueue(t, b, `{"n":1}`)
+	if err := b.SignalActivity(context.Background(), id, storage.CheckpointID(id, "signal", "go"), "go", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
 	child := enqueue(t, b, `{"n":2}`, func(a *storage.QueuedActivity) { a.ParentActivityID, a.RootActivityID, a.Depth = &id, id, 1 })
+	if err := b.SignalActivity(context.Background(), child, storage.CheckpointID(child, "signal", "go"), "go", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
 	for range 3 {
 		enqueue(t, b, `{}`, func(a *storage.QueuedActivity) { a.ActivityType = "Other" })
 	}
@@ -557,7 +574,7 @@ func TestQueriesFromStorage(t *testing.T) {
 	if act.ID != id.String() || act.Status != "pending" || act.Type != "Echo" || string(act.Payload) != `{"n": 1}` && string(act.Payload) != `{"n":1}` {
 		t.Fatalf("activity %+v (payload %s)", act, act.Payload)
 	}
-	if act.Events == nil || len(*act.Events) == 0 || (*act.Events)[0].Type != storage.RecordEventCreated || act.Steps == nil || len(*act.Steps) != 0 {
+	if act.Events == nil || len(*act.Events) == 0 || (*act.Events)[0].Type != storage.RecordEventSignalReceived || act.Steps == nil || len(*act.Steps) != 1 {
 		t.Fatalf("embedded events/steps %+v %+v", act.Events, act.Steps)
 	}
 	g.fails(wire.TypeActivitiesGet, wire.GetRequest{ID: uuid.NewString()}, wire.CodeNotFound)

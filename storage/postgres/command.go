@@ -591,7 +591,8 @@ func (b *PostgresBackend) deleteRow(ctx context.Context, tx pgx.Tx, cmd storage.
 	}
 	var live bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM runnerq_activities
-		WHERE queue_name = $1 AND root_activity_id = $2 AND status NOT IN ('completed', 'failed', 'dead_letter', 'cancelled'))`,
+		WHERE queue_name = $1 AND root_activity_id = $2 AND parent_activity_id IS NOT NULL
+		  AND status NOT IN ('completed', 'failed', 'dead_letter', 'cancelled'))`,
 		b.queueName, row.id).Scan(&live); err != nil {
 		return storage.CommandItem{}, databaseError(err, "failed to check tree")
 	}

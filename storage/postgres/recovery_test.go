@@ -67,10 +67,6 @@ func TestCompletionReconcilesDuplicateAndRejectsConflict(t *testing.T) {
 			t.Fatal("conflicting completion accepted")
 		}
 	}
-	var n int
-	if err := b.pool.QueryRow(ctx, `SELECT count(*) FROM runnerq_events WHERE activity_id=$1 AND event_type='Completed'`, a.ID).Scan(&n); err != nil || n != 1 {
-		t.Fatalf("completion events=%d err=%v", n, err)
-	}
 }
 
 func TestChildCompletionWakesOnlyItsActiveWaiters(t *testing.T) {
